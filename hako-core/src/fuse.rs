@@ -61,8 +61,12 @@ pub fn mount_session(
     mountpoint: &Path,
 ) -> io::Result<fuser::BackgroundSession> {
     let fs = HakoFs::new(store, Arc::new(Mutex::new(root)), /* writable */ false);
-    let mut opts = ro_opts();
-    opts.push(MountOption::AllowOther);
+    // NOTE: no AllowOther here. The runtime mounts this inside a user namespace,
+    // and `allow_other` does not work in a non-initial userns (the kernel checks
+    // creds against the init namespace) — it makes the mount serve an empty tree.
+    // It is also unnecessary: every process in the container is the same
+    // mapped-root uid as the mounter.
+    let opts = ro_opts();
     let session = fuser::Session::new(fs, mountpoint, &opts).map_err(io::Error::other)?;
     session.spawn().map_err(io::Error::other)
 }
@@ -114,11 +118,12 @@ fn ro_opts() -> Vec<MountOption> {
 }
 
 fn rw_opts() -> Vec<MountOption> {
+    // No AllowOther: this is mounted inside a user namespace by the runtime,
+    // where allow_other makes the mount serve empty (see mount_session).
     vec![
         MountOption::RW,
         MountOption::FSName("hako".into()),
         MountOption::AutoUnmount,
-        MountOption::AllowOther,
     ]
 }
 

@@ -89,6 +89,29 @@ the run path (`run_inner` → inner fork → `run_fuse_server` vs
 during a run, and/or `hako-core/src/fuse.rs::mount_session`. This is the
 prerequisite bug to fix before isolation can be verified.
 
+### Final mechanism (2026-06-09)
+
+Narrowed to the exact trigger: **`fuse::mount_session` (background `Session::
+spawn`) serves an EMPTY tree when called inside `unshare(CLONE_NEWUSER)`** — even
+as real root (0→0 map) and even after removing `AllowOther`. The mounting
+process itself sees 0 entries. By contrast `hako mount` (foreground `mount2`, no
+userns) serves the identical tree correctly. So the run path's FUSE-in-userns is
+the blocker, not permissions, not the tree, not the fork.
+
+Two plausible explanations, in priority order to test next:
+1. **WSL2-specific FUSE/userns limitation.** Background FUSE serving inside a
+   user namespace may simply not work on the WSL2 kernel. If so, `hako run` is
+   fine on native Linux and the entire verification should move to a real Linux
+   host (cloud VM). **Test this first — it may mean nothing is actually broken.**
+2. **A real architectural constraint:** background FUSE must be mounted/served
+   from a process OUTSIDE the user namespace (mount before `unshare(NEWUSER)` and
+   pass the fd/mount in), then run the command in the userns against it. That's a
+   focused run-path restructuring.
+
+`AllowOther` was removed from the runtime mounts (`fuse.rs`) — correct on its own
+merits (allow_other is invalid in a non-init userns) but it did NOT resolve the
+empty mount, so the deeper userns issue above remains.
+
 ### Honest conclusion
 
 Production-grade isolation here is a multi-part **runtime** project, not a single
