@@ -1,0 +1,17 @@
+[workspace]
+members = ["hako-cli", "hako-core", "hako-runtime", "xtask"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+strip = true

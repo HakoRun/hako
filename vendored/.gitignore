@@ -1,0 +1,14 @@
+# Cross-compiled Linux hako binaries embedded in the Win/Mac wrappers
+# via `cargo build --features embedded`. Produced by:
+#
+#   cargo xtask build-linux           # x86_64-unknown-linux-musl → hako-linux-x64
+#   cargo xtask build-linux --arm64   # aarch64-unknown-linux-musl → hako-linux-arm64
+#
+# Not committed because they're large (~10MB) and platform-specific.
+# CI populates them as part of release builds.
+hako-linux-*
+
+# Stub files build.rs creates so include_bytes! always succeeds even
+# when no real binary has been cross-compiled yet. Recognized at
+# runtime by their tiny size + sentinel bytes.
+hako-linux-*.stub

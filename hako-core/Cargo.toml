@@ -1,0 +1,39 @@
+[package]
+name = "hako"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Content-addressed container runtime with version-controlled filesystems"
+
+[lib]
+name = "hako"
+path = "src/lib.rs"
+
+[dependencies]
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+tar = "0.4"
+flate2 = "1"
+# OCI registries serve blob/manifest digests as SHA-256. Hako uses blake3
+# internally, so we need sha2 for verification on the wire only.
+sha2 = "0.10"
+# Cross-platform file locks (flock on Unix, LockFileEx on Windows). Used to
+# guard read-modify-write sequences (commit, branch, etc.) so concurrent CLI
+# invocations don't clobber each other.
+fs2 = "0.4"
+# hako.toml parsing — declarative project config (image, setup, run, etc.).
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+fuser = "0.15"
+libc = "0.2"
+# hako-core is the storage / VC / OCI library. The user-facing binary lives
+# in hako-cli (which depends on this crate plus hako-runtime). The split
+# avoids a cyclic dependency: hako-runtime needs hako-core's types (Repo,
+# ChunkStore, FsStore, Hash), and hako-cli needs both.
+
+[dev-dependencies]
+tempfile = "3"

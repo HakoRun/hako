@@ -1,0 +1,5 @@
+# `cargo xtask <subcommand>` runs the xtask binary at workspace root.
+# Used to cross-compile the Linux hako binary that the Win/Mac wrappers
+# embed via `--features embedded`.
+[alias]
+xtask = "run --package xtask --release --quiet --"

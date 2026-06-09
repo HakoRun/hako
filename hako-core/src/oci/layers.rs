@@ -1,0 +1,303 @@
+//! Tar-layer application: decompress (gzip), normalize archive paths, and
+//! apply OverlayFS-style whiteouts on top of a hako tree.
+
+use crate::fs::ScopedFs;
+use crate::hash::Hash;
+use flate2::read::GzDecoder;
+use std::io::{self, Read};
+
+/// Decompress an OCI/Docker layer blob. Gzip is the overwhelmingly common
+/// case; zstd is recognized but not yet supported.
+pub(super) fn decompress(media_type: &str, blob: &[u8]) -> io::Result<Vec<u8>> {
+    if media_type.contains("+gzip") || media_type.contains(".gzip") || is_gzip(blob) {
+        let mut out = Vec::new();
+        GzDecoder::new(blob).read_to_end(&mut out)?;
+        Ok(out)
+    } else if media_type.contains("+zstd") || media_type.contains(".zstd") {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("zstd-compressed layers not yet supported: {}", media_type),
+        ))
+    } else {
+        Ok(blob.to_vec())
+    }
+}
+
+fn is_gzip(blob: &[u8]) -> bool {
+    blob.len() >= 2 && blob[0] == 0x1f && blob[1] == 0x8b
+}
+
+/// Apply a decompressed tar archive as an OverlayFS-style layer on top of
+/// `root`, honoring `.wh.*` whiteouts and `.wh..wh..opq` opaque markers.
+pub fn apply_tar_layer(
+    scoped: &ScopedFs<'_>,
+    mut root: Hash,
+    tar_bytes: &[u8],
+) -> io::Result<Hash> {
+    let mut archive = tar::Archive::new(tar_bytes);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let raw_path = entry.path_bytes().into_owned();
+        let norm = match normalize_archive_path(&raw_path) {
+            Some(p) => p,
+            None => continue, // skip `.` and path-escapes
+        };
+
+        // Whiteout handling. OverlayFS convention:
+        //   `foo/.wh..wh..opq` → opaque directory `foo` (drop lower content)
+        //   `foo/.wh.bar`       → delete `foo/bar`
+        let (parent, fname) = split_parent_name(&norm);
+        if fname == ".wh..wh..opq" {
+            if !parent.is_empty() && scoped.is_dir(&root, parent)? {
+                root = scoped.delete(&root, parent)?;
+                root = scoped.mkdir(&root, parent)?;
+            }
+            continue;
+        }
+        if let Some(name) = fname.strip_prefix(".wh.") {
+            let target = if parent.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}/{}", parent, name)
+            };
+            if scoped.is_file(&root, &target)?
+                || scoped.is_dir(&root, &target)?
+                || scoped.is_symlink(&root, &target)?
+            {
+                root = scoped.delete(&root, &target)?;
+            }
+            continue;
+        }
+
+        let header = entry.header();
+        let kind = header.entry_type();
+        let mode = header.mode().unwrap_or(0o644);
+        let mtime = header.mtime().unwrap_or(0);
+
+        if kind.is_dir() {
+            root = scoped.mkdir(&root, &norm)?;
+        } else if kind.is_symlink() {
+            let target = header
+                .link_name_bytes()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "symlink without target")
+                })?
+                .into_owned();
+            root = scoped.write_symlink(&root, &norm, &target, mode, mtime)?;
+        } else if kind.is_hard_link() {
+            // Hardlinks point to another path already placed in the tree.
+            let target = header
+                .link_name_bytes()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "hardlink without target")
+                })?;
+            let target_norm = normalize_archive_path(&target)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad hardlink path"))?;
+            root = scoped.cp_to(&root, &root, &target_norm, &norm)?;
+        } else if kind.is_file() || matches!(kind, tar::EntryType::Continuous) {
+            let mut buf = Vec::with_capacity(header.size().unwrap_or(0) as usize);
+            entry.read_to_end(&mut buf)?;
+            root = scoped.write_file_meta(&root, &norm, &buf, mode, mtime)?;
+        }
+        // char/block/fifo/socket: silently ignored
+    }
+    Ok(root)
+}
+
+/// Normalize a tar archive path (raw bytes, `/`-separated) to a hako vfs path.
+/// Drops `.`, leading `/`, and empty components; returns `None` for empty
+/// paths or anything containing `..`.
+fn normalize_archive_path(bytes: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(bytes).ok()?;
+    let mut parts = Vec::new();
+    for p in s.split('/') {
+        if p.is_empty() || p == "." {
+            continue;
+        }
+        if p == ".." {
+            return None;
+        }
+        parts.push(p);
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+/// Split a normalized path into `(parent, last_component)`. For a single-
+/// component path, returns `("", path)`.
+fn split_parent_name(path: &str) -> (&str, &str) {
+    match path.rfind('/') {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => ("", path),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::MemStore;
+    use crate::tree::empty;
+
+    #[test]
+    fn normalize_drops_leading_slash() {
+        assert_eq!(normalize_archive_path(b"./foo").as_deref(), Some("foo"));
+        assert_eq!(normalize_archive_path(b"a/b/c").as_deref(), Some("a/b/c"));
+        assert_eq!(normalize_archive_path(b"/a//b/").as_deref(), Some("a/b"));
+    }
+
+    #[test]
+    fn normalize_rejects_parent_dir() {
+        assert_eq!(normalize_archive_path(b"../escape"), None);
+        assert_eq!(normalize_archive_path(b"a/../b"), None);
+    }
+
+    #[test]
+    fn split_parent_name_cases() {
+        assert_eq!(split_parent_name("a/b/c"), ("a/b", "c"));
+        assert_eq!(split_parent_name("foo"), ("", "foo"));
+    }
+
+    /// Build a minimal tar archive on the fly and drive `apply_tar_layer`.
+    fn build_tar(entries: Vec<(&str, tar::EntryType, Vec<u8>, Option<&str>)>) -> Vec<u8> {
+        let buf: Vec<u8> = Vec::new();
+        let mut b = tar::Builder::new(buf);
+        for (path, kind, data, linkname) in entries {
+            let mut h = tar::Header::new_gnu();
+            h.set_path(path).unwrap();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_mtime(0);
+            h.set_entry_type(kind);
+            if let Some(target) = linkname {
+                h.set_link_name(target).unwrap();
+            }
+            h.set_cksum();
+            b.append(&h, data.as_slice()).unwrap();
+        }
+        b.into_inner().unwrap()
+    }
+
+    #[test]
+    fn apply_layer_adds_file() {
+        let s = MemStore::new();
+        let fs = ScopedFs::new(&s);
+        let tar = build_tar(vec![(
+            "bin/sh",
+            tar::EntryType::Regular,
+            b"#!/bin/sh\n".to_vec(),
+            None,
+        )]);
+        let root = apply_tar_layer(&fs, empty(), &tar).unwrap();
+        assert_eq!(fs.read_file(&root, "bin/sh").unwrap(), b"#!/bin/sh\n");
+    }
+
+    #[test]
+    fn apply_layer_creates_symlink() {
+        let s = MemStore::new();
+        let fs = ScopedFs::new(&s);
+        let tar = build_tar(vec![(
+            "lib/libc.so.6",
+            tar::EntryType::Symlink,
+            Vec::new(),
+            Some("libc-2.35.so"),
+        )]);
+        let root = apply_tar_layer(&fs, empty(), &tar).unwrap();
+        assert!(fs.is_symlink(&root, "lib/libc.so.6").unwrap());
+        assert_eq!(
+            fs.read_symlink(&root, "lib/libc.so.6").unwrap(),
+            b"libc-2.35.so"
+        );
+    }
+
+    #[test]
+    fn apply_layer_honors_whiteout() {
+        let s = MemStore::new();
+        let fs = ScopedFs::new(&s);
+        let base = fs.write_file(&empty(), "etc/secret", b"top").unwrap();
+        let base = fs.write_file(&base, "etc/keep", b"yes").unwrap();
+        let tar = build_tar(vec![(
+            "etc/.wh.secret",
+            tar::EntryType::Regular,
+            Vec::new(),
+            None,
+        )]);
+        let root = apply_tar_layer(&fs, base, &tar).unwrap();
+        assert!(!fs.exists(&root, "etc/secret").unwrap());
+        assert_eq!(fs.read_file(&root, "etc/keep").unwrap(), b"yes");
+    }
+
+    #[test]
+    fn apply_layer_honors_opaque() {
+        let s = MemStore::new();
+        let fs = ScopedFs::new(&s);
+        let base = fs.write_file(&empty(), "app/a.txt", b"a").unwrap();
+        let base = fs.write_file(&base, "app/b.txt", b"b").unwrap();
+        let base = fs.write_file(&base, "other/c.txt", b"c").unwrap();
+        // Opaque marker for `app/` wipes it before layer content is applied.
+        let tar = build_tar(vec![
+            (
+                "app/.wh..wh..opq",
+                tar::EntryType::Regular,
+                Vec::new(),
+                None,
+            ),
+            ("app/fresh.txt", tar::EntryType::Regular, b"new".to_vec(), None),
+        ]);
+        let root = apply_tar_layer(&fs, base, &tar).unwrap();
+        assert!(!fs.exists(&root, "app/a.txt").unwrap());
+        assert!(!fs.exists(&root, "app/b.txt").unwrap());
+        assert_eq!(fs.read_file(&root, "app/fresh.txt").unwrap(), b"new");
+        assert_eq!(fs.read_file(&root, "other/c.txt").unwrap(), b"c");
+    }
+
+    #[test]
+    fn apply_layer_hardlink_duplicates_content() {
+        let s = MemStore::new();
+        let fs = ScopedFs::new(&s);
+        let tar = build_tar(vec![
+            (
+                "bin/first",
+                tar::EntryType::Regular,
+                b"executable".to_vec(),
+                None,
+            ),
+            (
+                "bin/second",
+                tar::EntryType::Link,
+                Vec::new(),
+                Some("bin/first"),
+            ),
+        ]);
+        let root = apply_tar_layer(&fs, empty(), &tar).unwrap();
+        assert_eq!(fs.read_file(&root, "bin/first").unwrap(), b"executable");
+        assert_eq!(fs.read_file(&root, "bin/second").unwrap(), b"executable");
+    }
+
+    #[test]
+    fn apply_layer_preserves_mode_and_mtime() {
+        use tar::{Builder, Header};
+        let buf: Vec<u8> = Vec::new();
+        let mut b = Builder::new(buf);
+        let data = b"script\n";
+        let mut h = Header::new_gnu();
+        h.set_path("run.sh").unwrap();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o755);
+        h.set_mtime(12345);
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_cksum();
+        b.append(&h, data.as_slice()).unwrap();
+        let tar = b.into_inner().unwrap();
+
+        let s = MemStore::new();
+        let fs = ScopedFs::new(&s);
+        let root = apply_tar_layer(&fs, empty(), &tar).unwrap();
+        let children = fs.ls(&root, "").unwrap();
+        let run = children.iter().find(|c| c.name == "run.sh").unwrap();
+        assert_eq!(run.mode, Some(0o755));
+        assert_eq!(run.mtime, Some(12345));
+    }
+}

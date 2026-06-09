@@ -1,0 +1,38 @@
+[package]
+name = "hako-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for hako (the binary that ships as `hako`)"
+build = "build.rs"
+
+[[bin]]
+name = "hako"
+path = "src/main.rs"
+
+[dependencies]
+hako = { path = "../hako-core" }
+hako-runtime = { path = "../hako-runtime" }
+clap = { version = "4", features = ["derive"] }
+# Used by host_bridge::bootstrap_wsl to write the minimal rootfs.tar
+# imported via `wsl --import` when auto-bootstrapping the runtime distro.
+tar = "0.4"
+# Used by host_bridge::bootstrap_lima to stage the embedded Linux binary
+# in $TMP before `limactl copy` ships it into the VM. RAII cleanup so a
+# crash mid-copy doesn't leak a ~10 MiB file in /tmp.
+tempfile = "3"
+
+[features]
+default = []
+# Embeds a pre-built Linux hako binary into the host (Windows/macOS)
+# wrapper, so `hako apply` etc. can auto-bootstrap a WSL distro / Lima
+# VM without requiring the user to install hako separately inside.
+#
+# The Linux binary must exist at `../vendored/hako-linux-<arch>` before
+# building with this feature; produce it via `cargo xtask build-linux`
+# (which cross-compiles hako-cli for the linux-musl target).
+#
+# `cargo build` without this feature ships the host binary with an
+# empty embedded blob; `host_bridge` falls back to expecting hako on
+# PATH inside the user's WSL/Lima env. That's the dev-loop default.
+embedded = []
