@@ -6,12 +6,32 @@ use crate::hash::Hash;
 use flate2::read::GzDecoder;
 use std::io::{self, Read};
 
+/// Upper bound on the decompressed size of a single layer. Guards against
+/// gzip bombs: a small compressed blob can otherwise expand without limit.
+const MAX_DECOMPRESSED_LAYER: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
+/// Upper bound on a single extracted file's size.
+const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+/// Cap on how much we pre-allocate from an (attacker-controlled) tar header
+/// size hint before reading a byte, so a lying header can't trigger a huge
+/// up-front allocation.
+const MAX_PREALLOC: u64 = 1024 * 1024; // 1 MiB
+
 /// Decompress an OCI/Docker layer blob. Gzip is the overwhelmingly common
 /// case; zstd is recognized but not yet supported.
 pub(super) fn decompress(media_type: &str, blob: &[u8]) -> io::Result<Vec<u8>> {
     if media_type.contains("+gzip") || media_type.contains(".gzip") || is_gzip(blob) {
         let mut out = Vec::new();
-        GzDecoder::new(blob).read_to_end(&mut out)?;
+        // Read at most MAX+1 bytes; if we hit the cap the layer is oversized
+        // (or a decompression bomb) — fail rather than exhaust memory.
+        GzDecoder::new(blob)
+            .take(MAX_DECOMPRESSED_LAYER + 1)
+            .read_to_end(&mut out)?;
+        if out.len() as u64 > MAX_DECOMPRESSED_LAYER {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decompressed layer exceeds size limit",
+            ));
+        }
         Ok(out)
     } else if media_type.contains("+zstd") || media_type.contains(".zstd") {
         Err(io::Error::new(
@@ -73,6 +93,7 @@ pub fn apply_tar_layer(
         let kind = header.entry_type();
         let mode = header.mode().unwrap_or(0o644);
         let mtime = header.mtime().unwrap_or(0);
+        let declared_size = header.size().unwrap_or(0);
 
         if kind.is_dir() {
             root = scoped.mkdir(&root, &norm)?;
@@ -93,8 +114,21 @@ pub fn apply_tar_layer(
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad hardlink path"))?;
             root = scoped.cp_to(&root, &root, &target_norm, &norm)?;
         } else if kind.is_file() || matches!(kind, tar::EntryType::Continuous) {
-            let mut buf = Vec::with_capacity(header.size().unwrap_or(0) as usize);
-            entry.read_to_end(&mut buf)?;
+            // Pre-allocate only up to MAX_PREALLOC even if the header claims a
+            // larger size, then read at most MAX_FILE_BYTES+1 and reject if the
+            // real content exceeds the cap.
+            let prealloc = declared_size.min(MAX_PREALLOC) as usize;
+            let mut buf = Vec::with_capacity(prealloc);
+            entry
+                .by_ref()
+                .take(MAX_FILE_BYTES + 1)
+                .read_to_end(&mut buf)?;
+            if buf.len() as u64 > MAX_FILE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "tar entry exceeds file size limit",
+                ));
+            }
             root = scoped.write_file_meta(&root, &norm, &buf, mode, mtime)?;
         }
         // char/block/fifo/socket: silently ignored
@@ -190,6 +224,23 @@ mod tests {
         )]);
         let root = apply_tar_layer(&fs, empty(), &tar).unwrap();
         assert_eq!(fs.read_file(&root, "bin/sh").unwrap(), b"#!/bin/sh\n");
+    }
+
+    #[test]
+    fn apply_layer_reads_file_larger_than_prealloc_cap() {
+        // A legitimate file bigger than MAX_PREALLOC (1 MiB) must extract
+        // intact — the bounded read must not truncate real content.
+        let s = MemStore::new();
+        let fs = ScopedFs::new(&s);
+        let big = vec![0xABu8; (MAX_PREALLOC as usize) + 4096];
+        let tar = build_tar(vec![(
+            "data/blob.bin",
+            tar::EntryType::Regular,
+            big.clone(),
+            None,
+        )]);
+        let root = apply_tar_layer(&fs, empty(), &tar).unwrap();
+        assert_eq!(fs.read_file(&root, "data/blob.bin").unwrap(), big);
     }
 
     #[test]
