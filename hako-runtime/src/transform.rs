@@ -278,10 +278,20 @@ fn resolve_branch(
     let commit = repo.load_commit(&commit_hash)?;
     let tree_root = commit.tree;
 
-    // FUSE needs a `'static` store it can own across threads. Open a fresh
-    // FsStore pointed at the same objects directory. Mirrors what main.rs's
-    // Mount command does (see hako-core/src/main.rs Cmd::Mount).
-    let objs_path = repo.root().join(hako::state::OBJECTS);
+    // FUSE needs a `'static` store it can own across threads, so open a fresh
+    // FsStore at the objects directory. The chunk store is SHARED at the
+    // workspace level (`<ws>/.hako/objects`), NOT under the per-container dir —
+    // `repo.root()` is `<ws>/.hako/containers/<name>`, so the `.hako` dir is two
+    // levels up. (cmd::mount uses `<workdir>/.hako/objects` for the same reason;
+    // pointing at `repo.root()/objects` yields an empty store and an empty
+    // rootfs.)
+    let dot_hako = repo.root().parent().and_then(|p| p.parent()).ok_or_else(|| {
+        io_other(format!(
+            "cannot locate .hako objects from container root {}",
+            repo.root().display()
+        ))
+    })?;
+    let objs_path = dot_hako.join(hako::state::OBJECTS);
     let store: Arc<dyn ChunkStore + Send + Sync + 'static> = Arc::new(FsStore::new(objs_path)?);
     Ok((store, tree_root))
 }
@@ -328,7 +338,9 @@ fn run_inner(
 
     // `run` is the running-container boundary: isolate IPC + UTS alongside
     // user + mount. Network is isolated later, per-command, in
-    // run_command_setup — doing it here breaks fusermount3's FUSE mount.
+    // run_command_setup (doing it here breaks fusermount3's FUSE mount).
+    // PID-namespace isolation (a fresh procfs) is Increment 2 — it needs a
+    // fork-to-PID-1 restructure (CLONE_NEWPID here breaks the FUSE thread spawn).
     unshare(
         CloneFlags::CLONE_NEWUSER
             | CloneFlags::CLONE_NEWNS
@@ -572,14 +584,25 @@ fn run_command_setup(
         .map_err(|e| io_other(format!("await fuse ready: {}", e)))?;
     drop(sock);
 
-    // Stop our mounts from propagating to/from the host namespace. Done after
-    // the FUSE mount is established (making `/` rprivate before it interferes
-    // with fusermount3's mount becoming visible here).
+    // Give the command its OWN mount namespace — a copy of the shared one, which
+    // already contains the FUSE mount. All further mount setup and `pivot_root`
+    // then affect only this namespace, leaving the FUSE server's namespace (and
+    // its access to the absolute-path chunk store it must read to serve files)
+    // intact. Without this, `pivot_root` detaches the old root in the shared
+    // namespace and the server can no longer serve reads (exec fails ENOENT).
+    unshare(CloneFlags::CLONE_NEWNS).map_err(|e| io_other(format!("unshare mntns: {}", e)))?;
+
+    // Stop our mounts from propagating to/from the host namespace.
     make_rprivate()?;
 
-    setup_bind_mounts(MOUNTPOINT, net_isolated)?;
-    setup_special_mounts(MOUNTPOINT)?;
-    setup_user_volumes(MOUNTPOINT, volumes)?;
+    // The container root is the read-only FUSE tree mounted at MOUNTPOINT.
+    // (overlayfs-over-FUSE was tried for a writable root but is broken for exec
+    // on this kernel — stat works, mmap/exec of the lower file does not.)
+    let root = MOUNTPOINT;
+
+    setup_bind_mounts(root, net_isolated)?;
+    setup_special_mounts(root)?;
+    setup_user_volumes(root, volumes)?;
 
     // For detached mode, redirect stdout/stderr to log files BEFORE pivot_root
     // (the log paths are on the host filesystem, not the new root).
@@ -597,7 +620,7 @@ fn run_command_setup(
             .map_err(|e| io_other(format!("unshare netns: {}", e)))?;
     }
 
-    pivot_into(MOUNTPOINT)?;
+    pivot_into(root)?;
 
     // For interactive use, chdir to /workspace if it exists (the default
     // auto-mount), else fall back to /home/$USER. This makes `hako is alpine`
@@ -712,7 +735,8 @@ fn setup_special_mounts(root: &str) -> Result<(), RuntimeError> {
     fs::create_dir_all(&shm)?;
     mount_kind("tmpfs", &shm, "tmpfs", MsFlags::empty(), Some("mode=1777"))?;
 
-    // === /proc: bind from host (can't mount fresh procfs without PID ns) ===
+    // === /proc: bind from host for now. A fresh procfs (hiding host PIDs)
+    // requires a PID namespace — that's Increment 2 (fork-to-PID-1). ===
     let proc_path = format!("{}/proc", root);
     fs::create_dir_all(&proc_path)?;
     bind_mount("/proc", &proc_path, MsFlags::MS_BIND | MsFlags::MS_REC)?;
@@ -777,19 +801,18 @@ fn setup_user_volumes(root: &str, volumes: &[VolumeMount]) -> Result<(), Runtime
 }
 
 fn pivot_into(new_root: &str) -> Result<(), RuntimeError> {
-    // pivot_root requires the new root to be a mount point.
+    // pivot_root requires the new root to be a mount point. Safe to do here
+    // because command_setup runs in its own mount namespace (see run_command_
+    // setup), so detaching the old root doesn't affect the FUSE server.
     bind_mount(new_root, new_root, MsFlags::MS_BIND | MsFlags::MS_REC)?;
-
     env::set_current_dir(new_root)?;
-    fs::create_dir_all("oldroot")?;
 
-    pivot_root(".", "oldroot").map_err(|e| io_other(format!("pivot_root: {}", e)))?;
-
+    // pivot_root(".", ".") — put_old == new_root, avoiding the need to create an
+    // `oldroot` dir inside the read-only rootfs (which would EROFS). The old root
+    // is overmounted on "." and detached below.
+    pivot_root(".", ".").map_err(|e| io_other(format!("pivot_root: {}", e)))?;
+    umount2(".", MntFlags::MNT_DETACH).map_err(|e| io_other(format!("umount old root: {}", e)))?;
     env::set_current_dir("/")?;
-    umount2("/oldroot", MntFlags::MNT_DETACH)
-        .map_err(|e| io_other(format!("umount oldroot: {}", e)))?;
-    let _ = fs::remove_dir("/oldroot");
-
     Ok(())
 }
 

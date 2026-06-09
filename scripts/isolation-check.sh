@@ -12,7 +12,8 @@
 
 set -u
 HAKO="${HAKO:-hako}"
-CONTAINER="${HAKO_CONTAINER:-hako}" # the default toybox container created by `hako init`
+# `hako run` takes a BRANCH name; a fresh `hako init` container's branch is `main`.
+BRANCH="${HAKO_BRANCH:-main}"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -28,7 +29,7 @@ echo "hako isolation check  (binary: $HAKO)"
 
 # HAKO_RUN_FLAGS lets callers pass extra `run` flags (e.g. --no-workspace while
 # writable-rootfs/volume support is still landing).
-run() { "$HAKO" run ${HAKO_RUN_FLAGS:-} "$CONTAINER" sh -c "$1" 2>/dev/null; }
+run() { "$HAKO" run ${HAKO_RUN_FLAGS:-} "$BRANCH" sh -c "$1" 2>/dev/null; }
 
 # 1. PID namespace — the container must NOT see host processes. With a private
 #    PID namespace the highest visible pid is tiny (its own pid 1 + the probe).

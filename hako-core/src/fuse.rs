@@ -61,12 +61,17 @@ pub fn mount_session(
     mountpoint: &Path,
 ) -> io::Result<fuser::BackgroundSession> {
     let fs = HakoFs::new(store, Arc::new(Mutex::new(root)), /* writable */ false);
-    // NOTE: no AllowOther here. The runtime mounts this inside a user namespace,
-    // and `allow_other` does not work in a non-initial userns (the kernel checks
-    // creds against the init namespace) — it makes the mount serve an empty tree.
-    // It is also unnecessary: every process in the container is the same
-    // mapped-root uid as the mounter.
-    let opts = ro_opts();
+    // The runtime mounts this INSIDE a user namespace. Two options that are fine
+    // for `hako mount` (foreground, no userns) break it here:
+    //   * AllowOther — invalid in a non-initial userns (serves an empty tree).
+    //   * AutoUnmount — forces libfuse to mount via the `fusermount3` helper
+    //     child process; that child's mount does not propagate back to the FUSE
+    //     server when `/`'s propagation isn't shared (the WSL2 default), so the
+    //     server sees an empty mount. Without it, fuser mounts via `mount(2)`
+    //     directly in-process (we hold CAP_SYS_ADMIN in the userns), which is
+    //     immediately visible. The mount is unmounted on session drop and the
+    //     old root is detached by pivot_root, so AutoUnmount isn't needed.
+    let opts = vec![MountOption::RO, MountOption::FSName("hako".into())];
     let session = fuser::Session::new(fs, mountpoint, &opts).map_err(io::Error::other)?;
     session.spawn().map_err(io::Error::other)
 }

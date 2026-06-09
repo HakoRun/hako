@@ -49,7 +49,37 @@ Plus: mount propagation `private`; `/sys` mounted safely; workspace honored
 Each increment is gated on `scripts/isolation-check.sh` in WSL2, then CI, then
 the README's `[safety]` section is restored honestly.
 
-## Status (2026-06-08) — Increment 1 written, NOT YET VERIFIED
+## RESOLVED (2026-06-09) — `hako run` works in WSL2; Increment 1 verified
+
+The "blocked" conclusion below was wrong: it was **not** a WSL2/userns quirk but
+**two real, platform-independent bugs** that made `hako run` fail everywhere:
+
+1. **`resolve_branch` opened the chunk store at the wrong path** —
+   `repo.root()/objects` (the per-container dir, which has no `objects/`) instead
+   of the SHARED `<ws>/.hako/objects`. The store was empty → FUSE served an empty
+   rootfs → every run failed. Fixed to mirror `cmd::mount`.
+2. **`pivot_root` detached the store from the FUSE server.** `FsStore` reads
+   objects by absolute path, and `command_setup` shared a mount namespace with
+   the FUSE server; pivoting detached the old root, so the server could no longer
+   read objects to serve (exec → ENOENT). Fixed by giving `command_setup` its
+   **own** mount namespace (a copy that already has the FUSE mount) before
+   `pivot_root`, leaving the server's namespace intact.
+
+Also: `overlayfs`-over-FUSE is broken for exec on this kernel (stat works,
+mmap/exec doesn't) — so the rootfs is the RO FUSE directly, with
+`pivot_root(".", ".")` (no writable `oldroot` needed). `AllowOther` is invalid in
+a non-init userns and `AutoUnmount` forces the fusermount3 helper; both removed
+from the runtime mounts so fuser mounts via `mount(2)` in-process.
+
+**Verified in WSL2 (`scripts/isolation-check.sh`, real running container):**
+host `$HOME` not exposed ✅, private `/tmp` ✅, network isolated ✅. PID isolation
+is the one remaining check — that's **Increment 2** (`CLONE_NEWPID` needs a
+fork-to-PID-1 restructure; adding it to the shared unshare breaks the FUSE
+thread spawn). `/workspace` volumes still need a writable-rootfs approach.
+
+---
+
+## Status (2026-06-08) — Increment 1 written, NOT YET VERIFIED (superseded above)
 
 Increment 1 isolation code is implemented (`transform.rs`): IPC+UTS namespaces
 for `run`/`apply`, deferred per-command network namespace for `run` (created in
