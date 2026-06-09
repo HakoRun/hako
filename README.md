@@ -34,9 +34,9 @@ hako run alpine sh               # run it for real (Linux / WSL2 / Lima)
 - **Container runtime** — `hako run` is the execution boundary: FUSE serves the
   tree as a real filesystem, namespaces provide isolation. Native on Linux;
   transparently bridged into WSL2 (Windows) or Lima (macOS).
-- **Declarative config** — a `hako.toml` defines the image, setup steps,
-  services, and safety constraints; `hako apply` materializes it, each setup
-  step becoming a commit.
+- **Declarative config** — a `hako.toml` defines the image, setup steps, run
+  command, workspace mode, env, and named profiles; `hako apply` materializes
+  it, each setup step becoming a commit.
 - **Distributed** — `fetch` and `push` copy branches between workspaces,
   transferring only the chunks the remote is missing.
 
@@ -85,25 +85,33 @@ you switch again. It is a metadata operation — instant, no shell, no mount —
 image = "python:3.12-slim"
 name  = "myproject"
 
-setup = [
-    "pip install flask",
-]
+setup = ["pip install -r /workspace/requirements.txt"]
+run   = "python -m myapp"
 
-run = "python app.py"
+# Workspace bind-mount mode: "rw" (default), "ro", or "none".
+workspace  = "rw"
+env        = { LOG_LEVEL = "info" }
+env_pass   = ["OPENAI_API_KEY"]   # host env vars to forward in
+autocommit = false                # snapshot the tree after each exec
 
-[safety]
-network         = false
-workspace       = "ro"
-max_runtime_sec = 30
+# Named profiles overlay the base config: `hako apply --profile prod`.
+[prod]
+workspace = "none"
 
-[containers.tests]
-image = "python:3.12-slim"
-setup = ["pip install pytest"]
+[ci]
+autocommit = false
 ```
 
 `hako apply` ensures the container exists (pulling the image if needed) and runs
 each not-yet-applied setup step, recording a commit per step. Re-running is fast:
 already-applied steps are skipped via a hash recorded in `.hako/applied`.
+
+> **Isolation, honestly.** `hako run` today uses user + mount namespaces and a
+> `pivot_root` rootfs; it is **not** a strong security sandbox. It does not yet
+> use network or PID namespaces, and it bind-mounts the host `$HOME` and `/tmp`
+> into the container. Treat `hako run`/`hako apply` as you would running the
+> image's commands on your host — do not run untrusted images or `hako.toml`
+> setup steps. Stronger isolation is on the roadmap.
 
 ## Architecture
 
