@@ -72,5 +72,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p hako-cli
+      - name: Diagnose runtime environment
+        continue-on-error: true
+        run: |
+          set +e
+          echo "kernel: $(uname -r)"
+          ls -l /dev/fuse
+          echo "apparmor userns sysctl: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)"
+          unshare -Urn echo "unshare -Urn: OK"; echo "unshare rc=$?"
+          W=$(mktemp -d); cd "$W"
+          "$GITHUB_WORKSPACE/target/debug/hako" init
+          echo "--- verbose run probe (stderr visible) ---"
+          "$GITHUB_WORKSPACE/target/debug/hako" run --no-workspace main /bin/sh -c 'echo RUN_PROBE_OK'
+          echo "run rc=$?"
       - name: Verify container isolation
         run: HAKO=target/debug/hako HAKO_RUN_FLAGS=--no-workspace bash scripts/isolation-check.sh
