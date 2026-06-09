@@ -127,13 +127,31 @@ in a read-write container, and commits the result. Verified the committed tree
   `id=$(hako run -d …)` blocked until the workload exited. The supervisor now
   detaches its stdio.
 
+### Seccomp syscall filter — DONE
+
+The workload (only — PID 1 stays unfiltered so it can reap) gets a seccomp-BPF
+filter installed immediately before `exec`, after all mounts/pivot. It's a
+denylist returning `EPERM` for syscalls a container never legitimately needs and
+that widen the host kernel attack surface: module loading
+(`init_module`/`finit_module`/`delete_module`), `kexec_load`/`reboot`,
+`swapon`/`swapoff`, `mount`/`umount2`/`pivot_root`/`chroot`, host clock changes
+(`settimeofday`/`clock_settime`/`adjtimex`/`clock_adjtime`), `acct`/`quotactl`,
+the kernel keyring (`add_key`/`request_key`/`keyctl`), and `bpf`/`perf_event_open`.
+Everything else is allowed, so normal programs are unaffected. Built with the
+pure-Rust `seccompiler` crate (no libseccomp C dependency); installs via the
+userns `CAP_SYS_ADMIN` without `no_new_privs` (so in-container setuid still
+works). `HAKO_NO_SECCOMP` skips it. Verified: `mount` inside a container returns
+`EPERM` with the filter on and runs (different errno) with it off, while the full
+isolation check still passes.
+
 ### Still open
-- Hardening: seccomp filter, cgroup resource limits, a fresh read-only `/sys`
-  (currently a recursive host bind), recursive read-only for `:ro` volumes.
+- Hardening: cgroup v2 resource limits (pids/memory — needs delegation), a fresh
+  read-only `/sys` (currently a recursive host bind), recursive read-only for
+  `:ro` volumes.
 - Ephemeral `run` writes create orphan store objects until `gc`; consider a
   scratch overlay or a dedicated ephemeral chunk area.
-- CI now runs `scripts/isolation-check.sh` on a Linux runner (the `isolation`
-  job) as the automated gate for the runtime.
+- CI runs `scripts/isolation-check.sh` on a Linux runner (the `isolation` job)
+  as the automated gate for the runtime.
 
 ---
 

@@ -747,13 +747,105 @@ fn container_init(
     // any processes the workload orphans), fork: the child execs the workload
     // and we stay as a minimal init that reaps and returns the workload's code.
     match unsafe { fork() }.map_err(|e| io_other(format!("init fork: {}", e)))? {
-        ForkResult::Child => match command {
-            // execvp — never returns on success.
-            Some(cmd) => exec_command(cmd),
-            None => exec_shell(),
-        },
+        ForkResult::Child => {
+            // Final in-process hardening, applied to the workload only (PID 1
+            // stays unfiltered so it can reap). All privileged setup is done.
+            if let Err(e) = harden_workload() {
+                eprintln!("hako: sandbox hardening failed: {}", e);
+                std::process::exit(126);
+            }
+            match command {
+                // execvp — never returns on success.
+                Some(cmd) => exec_command(cmd),
+                None => exec_shell(),
+            }
+        }
         ForkResult::Parent { child } => reap_as_init(child),
     }
+}
+
+/// Final hardening applied to the workload child immediately before exec, after
+/// all mounts/pivot are done: resource limits and a seccomp syscall filter.
+/// `HAKO_NO_SECCOMP` skips the filter (debugging, or a workload that genuinely
+/// needs one of the blocked syscalls).
+fn harden_workload() -> Result<(), RuntimeError> {
+    // No core dumps — a crash shouldn't spill memory into the writable rootfs.
+    let no_core = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // Safe: setrlimit with a valid resource + rlimit pointer.
+    unsafe {
+        libc::setrlimit(libc::RLIMIT_CORE, &no_core);
+    }
+    if std::env::var_os("HAKO_NO_SECCOMP").is_none() {
+        apply_seccomp()?;
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+const SECCOMP_ARCH: seccompiler::TargetArch = seccompiler::TargetArch::x86_64;
+#[cfg(target_arch = "aarch64")]
+const SECCOMP_ARCH: seccompiler::TargetArch = seccompiler::TargetArch::aarch64;
+
+/// Install a seccomp-BPF filter that returns `EPERM` for syscalls a container
+/// workload never legitimately needs and that widen the host kernel attack
+/// surface (module loading, kexec/reboot, swap, mount/pivot, host clock
+/// changes, kernel keyring, bpf/perf). Everything else is allowed, so normal
+/// programs are unaffected. The runtime's own mounts run earlier in PID 1,
+/// before this filter exists. Relies on the userns CAP_SYS_ADMIN to install
+/// without `no_new_privs` (which would break in-container setuid).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn apply_seccomp() -> Result<(), RuntimeError> {
+    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
+    use std::collections::BTreeMap;
+
+    let denied: &[libc::c_long] = &[
+        libc::SYS_init_module,
+        libc::SYS_finit_module,
+        libc::SYS_delete_module,
+        libc::SYS_kexec_load,
+        libc::SYS_reboot,
+        libc::SYS_swapon,
+        libc::SYS_swapoff,
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_pivot_root,
+        libc::SYS_chroot,
+        libc::SYS_settimeofday,
+        libc::SYS_clock_settime,
+        libc::SYS_adjtimex,
+        libc::SYS_clock_adjtime,
+        libc::SYS_acct,
+        libc::SYS_quotactl,
+        libc::SYS_add_key,
+        libc::SYS_request_key,
+        libc::SYS_keyctl,
+        libc::SYS_bpf,
+        libc::SYS_perf_event_open,
+    ];
+    let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
+        denied.iter().map(|&n| (n, Vec::new())).collect();
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,                     // default: allow
+        SeccompAction::Errno(libc::EPERM as u32), // denied: EPERM
+        SECCOMP_ARCH,
+    )
+    .map_err(|e| io_other(format!("seccomp build: {}", e)))?;
+    let program: BpfProgram = filter
+        .try_into()
+        .map_err(|e| io_other(format!("seccomp compile: {}", e)))?;
+    seccompiler::apply_filter(&program).map_err(|e| io_other(format!("seccomp apply: {}", e)))?;
+    Ok(())
+}
+
+/// Architectures without a known syscall table here run without the filter
+/// rather than failing the workload.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn apply_seccomp() -> Result<(), RuntimeError> {
+    Ok(())
 }
 
 /// The container workload's pid (in the container's PID namespace), for the
