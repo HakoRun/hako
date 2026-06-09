@@ -212,7 +212,7 @@ impl<'s> Repo<'s> {
             }
             out.push((h, c));
         }
-        out.sort_by(|a, b| b.1.timestamp.cmp(&a.1.timestamp));
+        out.sort_by_key(|x| std::cmp::Reverse(x.1.timestamp));
         Ok(out)
     }
 

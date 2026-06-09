@@ -251,7 +251,7 @@ pub fn list(workdir: &Path) -> Result<Vec<Instance>, RuntimeError> {
         }
     }
     // Sort by start time (newest first, like `docker ps`).
-    out.sort_by(|a, b| b.config.started_unix.cmp(&a.config.started_unix));
+    out.sort_by_key(|b| std::cmp::Reverse(b.config.started_unix));
     Ok(out)
 }
 
