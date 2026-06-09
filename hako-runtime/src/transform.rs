@@ -3,22 +3,28 @@
 //! Linux-only. The non-Linux stub lives in `lib.rs` under
 //! `#[cfg(not(target_os = "linux"))]`.
 //!
-//! # The double-fork architecture
+//! # The fork architecture
 //!
-//! `become_container` forks twice. Why:
+//! `become_container` forks three times. Why:
 //!
 //! 1. **Outer fork**: lets the caller's process keep running (the CLI returns
 //!    after the child completes). It also gives us a clean single-threaded
 //!    process for `unshare()`, which only affects the calling thread.
 //! 2. **Inner fork** (after `unshare`): one process runs the FUSE server in a
-//!    background thread; the other does mount setup, `pivot_root`, and
-//!    `execvp`. The split is required because `execvp` replaces the process
-//!    image and destroys all threads — including a FUSE thread — which would
-//!    leave the mount unresponsive.
+//!    background thread; the other (`command_setup`) does mount setup,
+//!    `pivot_root`, and `execvp`. The split is required because `execvp`
+//!    replaces the process image and destroys all threads — including the FUSE
+//!    thread — which would leave the mount unresponsive. The FUSE server keeps
+//!    the original mount namespace and thus access to the absolute-path chunk
+//!    store it must read to serve files.
+//! 3. **PID fork** (inside `command_setup`, after it unshares its own mount and
+//!    PID namespaces): the child (`container_init`) becomes PID 1 of the new PID
+//!    namespace and execs the command; the parent waits and propagates its exit
+//!    code. This gives the container a fresh procfs / its own process view.
 //!
-//! Both inner processes share the unshared mount namespace (forked from the
-//! same child after `unshare`), so the FUSE mount in one process is visible
-//! in the other.
+//! `command_setup` unshares its **own** mount namespace before `pivot_root`, so
+//! detaching the old root there doesn't disturb the FUSE server's namespace.
+//! The FUSE mount, made before that unshare, is copied into it and stays usable.
 //!
 //! # Sequence
 //!
@@ -401,10 +407,14 @@ fn run_fuse_server(
     detached: bool,
     detached_state: Option<(PathBuf, String)>,
 ) -> Result<i32, RuntimeError> {
-    // Mount FUSE in the background. The session handle keeps it live; when
-    // dropped (at function return / process exit), the mount is unmounted.
-    let _session = hako::fuse::mount_session(store, root, Path::new(MOUNTPOINT))
-        .map_err(|e| io_other(format!("mount FUSE: {}", e)))?;
+    // Mount FUSE in the background, READ-WRITE so the container has a writable
+    // root: it can create mountpoints (e.g. /workspace) and write ephemeral
+    // scratch. Writes flow into the content-addressed store as new objects but
+    // are never committed for `run` (we don't read `current_root()`), so they're
+    // discarded — `docker run`-style ephemerality. The session handle keeps the
+    // mount live; dropping it (at return / process exit) unmounts.
+    let _session = hako::fuse::mount_session_rw(store, root, Path::new(MOUNTPOINT))
+        .map_err(|e| io_other(format!("mount FUSE rw: {}", e)))?;
 
     // For detached mode, become a session leader after FUSE is set up so we
     // detach cleanly from the controlling terminal.
