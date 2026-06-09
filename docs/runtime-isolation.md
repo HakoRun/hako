@@ -73,6 +73,22 @@ mount-propagation. It compiles. **It is not runtime-verified.**
    rootfs (RO FUSE lower + tmpfs upper) — confirmed working rootless in this
    WSL2. This is a prerequisite increment, not optional.
 
+### Root cause narrowed (2026-06-09)
+
+`hako mount <dir>` (the simple FUSE path, no fork/namespaces) **works** in WSL2
+Ubuntu — the mountpoint shows the full tree and is a real mountpoint. So FUSE
+itself is fine. The failure is specific to `hako run`'s architecture: the FUSE
+mount established by the **fuse_server** process is **not visible** in its
+sibling **command_setup** process (which sees an empty `/tmp/hako-transform`),
+so the subsequent mount/exec fail. Confirmed identical on `main`, as **root and
+rootless**, and the `hako-runtime` distro is the same Ubuntu 24.04 (not a
+different env). So the bug is the FUSE-mount visibility across the
+fuse_server/command_setup fork — likely a mount-namespace/propagation issue in
+the run path (`run_inner` → inner fork → `run_fuse_server` vs
+`run_command_setup`). Next step: inspect `/proc/<pid>/ns/mnt` of both processes
+during a run, and/or `hako-core/src/fuse.rs::mount_session`. This is the
+prerequisite bug to fix before isolation can be verified.
+
 ### Honest conclusion
 
 Production-grade isolation here is a multi-part **runtime** project, not a single
