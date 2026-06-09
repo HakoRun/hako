@@ -40,6 +40,13 @@ const EINVAL: i32 = libc::EINVAL;
 const ENOTEMPTY: i32 = libc::ENOTEMPTY;
 const EISDIR: i32 = libc::EISDIR;
 const ENOSYS: i32 = libc::ENOSYS;
+const EFBIG: i32 = libc::EFBIG;
+
+/// Upper bound on a single file's size in the FUSE layer. A write past this
+/// offset, or a truncate to a larger size, is rejected with `EFBIG` rather than
+/// attempting the allocation: the write path is read-modify-write of the whole
+/// file, so an unbounded container-supplied size is an OOM / DoS vector.
+const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
 
 /// Mount `root` read-only at `mountpoint`. Blocks until the mount is
 /// unmounted (Ctrl+C → SIGTERM, `umount`, `fusermount -u`).
@@ -110,7 +117,7 @@ impl RwSession {
     /// after the mount user (e.g., `apt install` running in a container)
     /// has finished its work but before this `RwSession` is dropped.
     pub fn current_root(&self) -> Hash {
-        *self.root.lock().unwrap()
+        *self.root.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -160,7 +167,7 @@ impl HakoFs {
     }
 
     fn current_root(&self) -> Hash {
-        *self.root.lock().unwrap()
+        *self.root.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn lookup_entry(&self, path: &str) -> io::Result<Option<DirEntry>> {
@@ -198,7 +205,7 @@ impl HakoFs {
                 "read-only mount",
             ));
         }
-        let mut root = self.root.lock().unwrap();
+        let mut root = self.root.lock().unwrap_or_else(|e| e.into_inner());
         let scoped = ScopedFs::new(&*self.store);
         let new_root = f(&root, &scoped)?;
         *root = new_root;
@@ -289,7 +296,12 @@ impl Filesystem for HakoFs {
     // ========================================================================
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let parent_path = match self.inodes.lock().unwrap().path_of(parent) {
+        let parent_path = match self
+            .inodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .path_of(parent)
+        {
             Some(p) => p.to_string(),
             None => {
                 reply.error(ENOENT);
@@ -315,7 +327,11 @@ impl Filesystem for HakoFs {
                 return;
             }
         };
-        let ino = self.inodes.lock().unwrap().intern(&child_path);
+        let ino = self
+            .inodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .intern(&child_path);
         let root = self.current_root();
         match entry_to_attr(ino, &entry, &child_path, &self.scoped(), &root) {
             Ok(attr) => reply.entry(&TTL, &attr, 0),
@@ -324,7 +340,12 @@ impl Filesystem for HakoFs {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        let path = match self.inodes.lock().unwrap().path_of(ino) {
+        let path = match self
+            .inodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .path_of(ino)
+        {
             Some(p) => p.to_string(),
             None => {
                 reply.error(ENOENT);
@@ -357,7 +378,12 @@ impl Filesystem for HakoFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let path = match self.inodes.lock().unwrap().path_of(ino) {
+        let path = match self
+            .inodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .path_of(ino)
+        {
             Some(p) => p.to_string(),
             None => {
                 reply.error(ENOENT);
@@ -383,13 +409,20 @@ impl Filesystem for HakoFs {
                 Some(i) => &path[..i],
                 None => "",
             };
-            self.inodes.lock().unwrap().intern(parent)
+            self.inodes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .intern(parent)
         };
         entries.push((parent_ino, FileType::Directory, "..".into()));
 
         for c in children {
             let child_path = join_child(&path, &c.name);
-            let child_ino = self.inodes.lock().unwrap().intern(&child_path);
+            let child_ino = self
+                .inodes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .intern(&child_path);
             let kind = match c.kind {
                 DirKind::Directory => FileType::Directory,
                 DirKind::File => FileType::RegularFile,
@@ -417,7 +450,12 @@ impl Filesystem for HakoFs {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
-        let path = match self.inodes.lock().unwrap().path_of(ino) {
+        let path = match self
+            .inodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .path_of(ino)
+        {
             Some(p) => p.to_string(),
             None => {
                 reply.error(ENOENT);
@@ -439,7 +477,12 @@ impl Filesystem for HakoFs {
     }
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
-        let path = match self.inodes.lock().unwrap().path_of(ino) {
+        let path = match self
+            .inodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .path_of(ino)
+        {
             Some(p) => p.to_string(),
             None => {
                 reply.error(ENOENT);
@@ -482,13 +525,26 @@ impl Filesystem for HakoFs {
             reply.error(EACCES);
             return;
         }
-        let path = match self.inodes.lock().unwrap().path_of(ino) {
+        let path = match self
+            .inodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .path_of(ino)
+        {
             Some(p) => p.to_string(),
             None => {
                 reply.error(ENOENT);
                 return;
             }
         };
+        if offset < 0 {
+            reply.error(EINVAL);
+            return;
+        }
+        if (offset as u64).saturating_add(data.len() as u64) > MAX_FILE_SIZE {
+            reply.error(EFBIG);
+            return;
+        }
         let written = data.len() as u32;
         let result = self.mutate(|root, scoped| {
             // Read existing content (or empty if doesn't exist).
@@ -528,7 +584,12 @@ impl Filesystem for HakoFs {
             reply.error(EACCES);
             return;
         }
-        let parent_path = match self.inodes.lock().unwrap().path_of(parent) {
+        let parent_path = match self
+            .inodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .path_of(parent)
+        {
             Some(p) => p.to_string(),
             None => {
                 reply.error(ENOENT);
@@ -548,7 +609,11 @@ impl Filesystem for HakoFs {
         });
         match result {
             Ok(_) => {
-                let ino = self.inodes.lock().unwrap().intern(&child_path);
+                let ino = self
+                    .inodes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .intern(&child_path);
                 let root = self.current_root();
                 let entry = DirEntry::File(crate::fs::FileEntry {
                     size: 0,
@@ -578,7 +643,12 @@ impl Filesystem for HakoFs {
             reply.error(EACCES);
             return;
         }
-        let parent_path = match self.inodes.lock().unwrap().path_of(parent) {
+        let parent_path = match self
+            .inodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .path_of(parent)
+        {
             Some(p) => p.to_string(),
             None => {
                 reply.error(ENOENT);
@@ -596,7 +666,11 @@ impl Filesystem for HakoFs {
         let result = self.mutate(|root, scoped| scoped.mkdir(root, &child_path));
         match result {
             Ok(_) => {
-                let ino = self.inodes.lock().unwrap().intern(&child_path);
+                let ino = self
+                    .inodes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .intern(&child_path);
                 let root = self.current_root();
                 let entry = DirEntry::Directory;
                 match entry_to_attr(ino, &entry, &child_path, &self.scoped(), &root) {
@@ -613,7 +687,12 @@ impl Filesystem for HakoFs {
             reply.error(EACCES);
             return;
         }
-        let parent_path = match self.inodes.lock().unwrap().path_of(parent) {
+        let parent_path = match self
+            .inodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .path_of(parent)
+        {
             Some(p) => p.to_string(),
             None => {
                 reply.error(ENOENT);
@@ -637,7 +716,10 @@ impl Filesystem for HakoFs {
         });
         match result {
             Ok(_) => {
-                self.inodes.lock().unwrap().forget_path(&child_path);
+                self.inodes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .forget_path(&child_path);
                 reply.ok();
             }
             Err(e) => reply.error(e.raw_os_error().unwrap_or_else(|| errno_for(&e))),
@@ -649,7 +731,12 @@ impl Filesystem for HakoFs {
             reply.error(EACCES);
             return;
         }
-        let parent_path = match self.inodes.lock().unwrap().path_of(parent) {
+        let parent_path = match self
+            .inodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .path_of(parent)
+        {
             Some(p) => p.to_string(),
             None => {
                 reply.error(ENOENT);
@@ -675,7 +762,10 @@ impl Filesystem for HakoFs {
         });
         match result {
             Ok(_) => {
-                self.inodes.lock().unwrap().forget_path(&child_path);
+                self.inodes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .forget_path(&child_path);
                 reply.ok();
             }
             Err(e) => reply.error(e.raw_os_error().unwrap_or_else(|| errno_for(&e))),
@@ -694,7 +784,12 @@ impl Filesystem for HakoFs {
             reply.error(EACCES);
             return;
         }
-        let parent_path = match self.inodes.lock().unwrap().path_of(parent) {
+        let parent_path = match self
+            .inodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .path_of(parent)
+        {
             Some(p) => p.to_string(),
             None => {
                 reply.error(ENOENT);
@@ -727,7 +822,11 @@ impl Filesystem for HakoFs {
         });
         match result {
             Ok(_) => {
-                let ino = self.inodes.lock().unwrap().intern(&child_path);
+                let ino = self
+                    .inodes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .intern(&child_path);
                 let root = self.current_root();
                 let entry = DirEntry::Symlink(crate::fs::SymlinkEntry {
                     mode: 0o777,
@@ -758,7 +857,7 @@ impl Filesystem for HakoFs {
             return;
         }
         let (old_path, new_path) = {
-            let inodes = self.inodes.lock().unwrap();
+            let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
             let p = match inodes.path_of(parent) {
                 Some(p) => p.to_string(),
                 None => {
@@ -833,7 +932,12 @@ impl Filesystem for HakoFs {
             reply.error(EACCES);
             return;
         }
-        let path = match self.inodes.lock().unwrap().path_of(ino) {
+        let path = match self
+            .inodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .path_of(ino)
+        {
             Some(p) => p.to_string(),
             None => {
                 reply.error(ENOENT);
@@ -855,6 +959,13 @@ impl Filesystem for HakoFs {
                 Err(_) => reply.error(EIO),
             }
             return;
+        }
+        // Reject a truncate to an absurd size before allocating for it.
+        if let Some(new_size) = size {
+            if new_size > MAX_FILE_SIZE {
+                reply.error(EFBIG);
+                return;
+            }
         }
         let result = self.mutate(|root, scoped| {
             // Only files support all of chmod/truncate/utimes; for dirs/symlinks
