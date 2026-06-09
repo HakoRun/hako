@@ -14,10 +14,11 @@ use crate::store::ChunkStore;
 use crate::tree::empty;
 use std::io;
 
-// toybox 0.8.13 (x86_64, static) — https://landley.net/toybox/bin/toybox-x86_64
-// Vendored under src/rootfs/toybox; copied byte-for-byte from the
-// `hako-reference` implementation (sha256
+// toybox 0.8.13 (x86_64, static, 0BSD) — https://landley.net/toybox/bin/toybox-x86_64
+// Vendored under src/rootfs/toybox (sha256
 // 8c98795a15db31ea55c8065fed379db3669766b7a714c46b009d8bfb87b25ffd).
+// Full provenance + the plan to fetch-at-build instead of vendoring: see
+// src/rootfs/README.md.
 const TOYBOX_BIN: &[u8] = include_bytes!("toybox");
 
 /// Toybox applet symlinks. Each becomes `bin/<applet>` → `toybox`.
