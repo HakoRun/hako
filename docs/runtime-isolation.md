@@ -111,11 +111,29 @@ in a read-write container, and commits the result. Verified the committed tree
 (`/etc/hako-marker` has both setup lines) and the applied-step cache (re-run =
 "0 ran, 2 cached").
 
+### `exec` / `stop` / init-reaper signals — DONE
+
+- The workload runs under a PID-1 init (`reap_as_init`) that installs a
+  SIGTERM/SIGINT handler forwarding to the workload (PID 1 ignores un-handled
+  signals from an ancestor namespace), so `hako stop` shuts the container down
+  gracefully (workload sees SIGTERM → exit 143).
+- The container's PID-1 host pid is recorded (`nspid`); `hako exec` setns into
+  ALL its namespaces (user→ipc→uts→net→pid→mnt, then fork for the PID ns), so an
+  exec'd process sees only the container's processes and its isolated network —
+  not the host's. Verified: exec shows 7 pids / 0 routes vs host 54 / 3.
+- Fixed two pre-existing detached bugs: instance state was stored under the
+  per-container dir but looked up at the workspace level (so `ps`/`exec`/`stop`
+  never found it); and the detached supervisor inherited the parent's stdio, so
+  `id=$(hako run -d …)` blocked until the workload exited. The supervisor now
+  detaches its stdio.
+
 ### Still open
-- Hardening: seccomp filter, cgroup resource limits, read-only `/sys`.
+- Hardening: seccomp filter, cgroup resource limits, a fresh read-only `/sys`
+  (currently a recursive host bind), recursive read-only for `:ro` volumes.
 - Ephemeral `run` writes create orphan store objects until `gc`; consider a
   scratch overlay or a dedicated ephemeral chunk area.
-- Signal forwarding from PID 1 to the workload (for clean `hako stop`).
+- CI now runs `scripts/isolation-check.sh` on a Linux runner (the `isolation`
+  job) as the automated gate for the runtime.
 
 ---
 
