@@ -85,5 +85,8 @@ jobs:
           echo "--- verbose run probe (stderr visible) ---"
           "$GITHUB_WORKSPACE/target/debug/hako" run --no-workspace main /bin/sh -c 'echo RUN_PROBE_OK'
           echo "run rc=$?"
+          echo "--- /proc inside the container (stderr visible) ---"
+          "$GITHUB_WORKSPACE/target/debug/hako" run --no-workspace main /bin/sh -c 'echo "proc entries:"; ls /proc 2>&1 | tr "\n" " "; echo; echo "pidcount=$(ls /proc | grep -cE "^[0-9]+$")"; echo "route:"; cat /proc/net/route 2>&1; echo "mounts:"; cat /proc/mounts 2>&1 | grep -E " /proc | /sys " '
+          echo "probe2 rc=$?"
       - name: Verify container isolation
         run: HAKO=target/debug/hako HAKO_RUN_FLAGS=--no-workspace bash scripts/isolation-check.sh
