@@ -216,38 +216,69 @@ impl<'s> Repo<'s> {
         Ok(out)
     }
 
+    /// Lowest common ancestor (merge base) of two commits, or `None` if they
+    /// share no history.
+    ///
+    /// A breadth-first "first shared commit" search can return a *higher*
+    /// ancestor on non-linear (criss-cross / octopus) histories, because the
+    /// graph distance from `b` to a common node isn't the same as how low that
+    /// node sits in the shared history — that would feed a three-way merge the
+    /// wrong base and silently produce a wrong merge. Instead, collect every
+    /// common ancestor and drop any that is a *proper* ancestor of another
+    /// common ancestor; what remains are the lowest common ancestors. If a true
+    /// criss-cross leaves several, the newest by (timestamp, hash) is returned
+    /// deterministically (hako's three-way merge uses a single base).
     pub fn common_ancestor(&self, a: Hash, b: Hash) -> io::Result<Option<Hash>> {
         if a == Hash::zero() || b == Hash::zero() {
             return Ok(None);
         }
-        let mut a_anc = HashSet::new();
+        let a_anc = self.ancestors(a)?;
+        let b_anc = self.ancestors(b)?;
+        let common: HashSet<Hash> = a_anc.intersection(&b_anc).copied().collect();
+        if common.is_empty() {
+            return Ok(None);
+        }
+        // Mark common nodes that are proper ancestors of another common node.
+        let mut dominated: HashSet<Hash> = HashSet::new();
+        for &c in &common {
+            let mut q: VecDeque<Hash> = self.load_commit(&c)?.parents.into_iter().collect();
+            let mut seen = HashSet::new();
+            while let Some(h) = q.pop_front() {
+                if h == Hash::zero() || !seen.insert(h) {
+                    continue;
+                }
+                if common.contains(&h) {
+                    dominated.insert(h);
+                }
+                for p in &self.load_commit(&h)?.parents {
+                    q.push_back(*p);
+                }
+            }
+        }
+        // The lowest common ancestors are the undominated ones; pick the newest
+        // deterministically (timestamp, then hash as a stable tiebreak).
+        let mut bases: Vec<(u64, String, Hash)> = Vec::new();
+        for &h in common.iter().filter(|h| !dominated.contains(h)) {
+            bases.push((self.load_commit(&h)?.timestamp, h.to_hex(), h));
+        }
+        bases.sort();
+        Ok(bases.last().map(|(_, _, h)| *h))
+    }
+
+    /// All ancestors of `start`, inclusive, reachable via parent links.
+    fn ancestors(&self, start: Hash) -> io::Result<HashSet<Hash>> {
+        let mut set = HashSet::new();
         let mut q = VecDeque::new();
-        q.push_back(a);
+        q.push_back(start);
         while let Some(h) = q.pop_front() {
-            if h == Hash::zero() || !a_anc.insert(h) {
+            if h == Hash::zero() || !set.insert(h) {
                 continue;
             }
-            let c = self.load_commit(&h)?;
-            for p in &c.parents {
+            for p in &self.load_commit(&h)?.parents {
                 q.push_back(*p);
             }
         }
-        let mut visited = HashSet::new();
-        let mut q = VecDeque::new();
-        q.push_back(b);
-        while let Some(h) = q.pop_front() {
-            if h == Hash::zero() || !visited.insert(h) {
-                continue;
-            }
-            if a_anc.contains(&h) {
-                return Ok(Some(h));
-            }
-            let c = self.load_commit(&h)?;
-            for p in &c.parents {
-                q.push_back(*p);
-            }
-        }
-        Ok(None)
+        Ok(set)
     }
 
     fn ref_path(&self, branch: &str) -> PathBuf {
@@ -652,6 +683,51 @@ mod tests {
         let a = r.commit(tree, vec![], "x", "a", 100).unwrap();
         let b = r.commit(tree, vec![], "y", "b", 100).unwrap();
         assert_eq!(r.common_ancestor(a, b).unwrap(), None);
+    }
+
+    #[test]
+    fn common_ancestor_returns_lowest_not_nearest() {
+        // g <- l <- p <- ours
+        //      l <- q <- theirs, and theirs ALSO has g as a parent directly.
+        // Both g and l are common ancestors; l is the *lowest*. A naive
+        // breadth-first "first shared commit" reaches g (theirs' direct parent)
+        // before l and would wrongly return g — feeding a 3-way merge a base
+        // that's too high.
+        let f = Fixture::new();
+        let r = f.repo();
+        let t = Hash::of(b"t");
+        let g = r.commit(t, vec![], "a", "g", 100).unwrap();
+        let l = r.commit(t, vec![g], "a", "l", 200).unwrap();
+        let p = r.commit(t, vec![l], "a", "p", 300).unwrap();
+        let q = r.commit(t, vec![l], "a", "q", 300).unwrap();
+        let ours = r.commit(t, vec![p], "a", "ours", 400).unwrap();
+        let theirs = r.commit(t, vec![q, g], "a", "theirs", 400).unwrap();
+        assert_eq!(r.common_ancestor(ours, theirs).unwrap(), Some(l));
+    }
+
+    #[test]
+    fn common_ancestor_criss_cross_is_deterministic() {
+        // Criss-cross: ours and theirs both descend from A and B. There are two
+        // lowest common ancestors (A, B); the result must be one of them and be
+        // stable regardless of which side is asked first.
+        let f = Fixture::new();
+        let r = f.repo();
+        let t = Hash::of(b"t");
+        let root = r.commit(t, vec![], "a", "root", 100).unwrap();
+        let a = r.commit(t, vec![root], "a", "A", 200).unwrap();
+        let b = r.commit(t, vec![root], "a", "B", 200).unwrap();
+        let ours = r.commit(t, vec![a, b], "a", "ours", 300).unwrap();
+        let theirs = r.commit(t, vec![a, b], "a", "theirs", 300).unwrap();
+        let base = r.common_ancestor(ours, theirs).unwrap();
+        assert!(
+            base == Some(a) || base == Some(b),
+            "a merge base, got {base:?}"
+        );
+        assert_eq!(
+            base,
+            r.common_ancestor(theirs, ours).unwrap(),
+            "order-independent"
+        );
     }
 
     #[test]
