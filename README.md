@@ -106,12 +106,16 @@ autocommit = false
 each not-yet-applied setup step, recording a commit per step. Re-running is fast:
 already-applied steps are skipped via a hash recorded in `.hako/applied`.
 
-> **Isolation, honestly.** `hako run` today uses user + mount namespaces and a
-> `pivot_root` rootfs; it is **not** a strong security sandbox. It does not yet
-> use network or PID namespaces, and it bind-mounts the host `$HOME` and `/tmp`
-> into the container. Treat `hako run`/`hako apply` as you would running the
-> image's commands on your host — do not run untrusted images or `hako.toml`
-> setup steps. Stronger isolation is on the roadmap.
+> **Isolation.** `hako run` runs the container rootless in user, mount, PID,
+> IPC, UTS, and network namespaces, with a fresh procfs, a private `/tmp`, no
+> host `$HOME`, private mount propagation, and a `pivot_root` rootfs (writable;
+> writes are ephemeral) — similar in posture to rootless Podman. Network is
+> **isolated by default for `run`** (opt in when a workload needs egress);
+> `apply` keeps host networking so setup steps can install dependencies. It is
+> not yet a hardened multi-tenant sandbox — no seccomp filter or cgroup limits,
+> and the command runs as PID 1 without an init reaper — so prefer trusted
+> images for now. (`hako run` requires a Linux runtime; on Windows/macOS it is
+> bridged into WSL2 / Lima.)
 
 ## Architecture
 

@@ -84,12 +84,22 @@ is PID 1 of a fresh PID namespace, mounts a fresh procfs, isolates the network,
 `CLONE_NEWPID` stays out of the shared `run_inner` unshare because the FUSE
 server there can't spawn its serve thread once a PID namespace is pending.
 
+### Writable rootfs + `/workspace` — DONE
+
+`run` now mounts the rootfs **read-write** (`mount_session_rw`) and discards the
+result (never reads `current_root()`), giving `docker run`-style ephemeral
+writability. This lets the container create mountpoints (e.g. `/workspace`) and
+write scratch. Verified: the implicit `/workspace` bind to the host workdir works
+read-write (a container write appears on the host), `/tmp`/scratch writes work,
+and all isolation checks still pass. (overlayfs-over-FUSE stays unused — broken
+for exec on this kernel.)
+
 ### Still open
-- `/workspace` volumes need a writable-rootfs approach (overlayfs-over-FUSE is
-  broken for exec; likely an fd-based `FsStore` so a writable scheme survives
-  `pivot_root`, or pre-materialized mountpoints).
-- A PID-1 init/reaper (tini-style) for workloads that spawn child processes.
-- Then PR `runtime/isolation` → `main` with CI.
+- A PID-1 init/reaper (tini-style) for workloads that spawn child processes
+  (the command currently runs as PID 1 itself).
+- Hardening: seccomp filter, cgroup resource limits, read-only `/sys`.
+- Ephemeral `run` writes create orphan store objects until `gc`; consider a
+  scratch overlay or a dedicated ephemeral chunk area.
 
 ---
 
