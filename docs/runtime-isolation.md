@@ -94,12 +94,28 @@ read-write (a container write appears on the host), `/tmp`/scratch writes work,
 and all isolation checks still pass. (overlayfs-over-FUSE stays unused — broken
 for exec on this kernel.)
 
+### PID-1 init/reaper — DONE
+
+`container_init` (PID 1) no longer execs the workload directly; it forks (the
+workload runs as PID 2) and becomes a minimal init (`reap_as_init`) that reaps
+zombies of orphaned processes while the workload runs and returns the workload's
+exit code as soon as it exits (remaining background processes are killed by PID-
+namespace teardown — `docker run` semantics). Verified: workload is PID 2,
+zombies reaped, exit codes propagate (e.g. `exit 42` → 42).
+
+### `hako apply` — VERIFIED end-to-end
+
+`apply` was fixed by the same store-path repair and works through the new
+PID-fork/reaper path: it pulls a real image (`alpine:3.19`), runs each setup step
+in a read-write container, and commits the result. Verified the committed tree
+(`/etc/hako-marker` has both setup lines) and the applied-step cache (re-run =
+"0 ran, 2 cached").
+
 ### Still open
-- A PID-1 init/reaper (tini-style) for workloads that spawn child processes
-  (the command currently runs as PID 1 itself).
 - Hardening: seccomp filter, cgroup resource limits, read-only `/sys`.
 - Ephemeral `run` writes create orphan store objects until `gc`; consider a
   scratch overlay or a dedicated ephemeral chunk area.
+- Signal forwarding from PID 1 to the workload (for clean `hako stop`).
 
 ---
 

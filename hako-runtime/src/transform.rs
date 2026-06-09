@@ -701,10 +701,37 @@ fn container_init(
         }
     }
 
-    // execvp — never returns on success.
-    match command {
-        Some(cmd) => exec_command(cmd),
-        None => exec_shell(),
+    // We are PID 1 of the container's PID namespace. Rather than exec the
+    // workload directly (which would leave PID 1 unable to reap the zombies of
+    // any processes the workload orphans), fork: the child execs the workload
+    // and we stay as a minimal init that reaps and returns the workload's code.
+    match unsafe { fork() }.map_err(|e| io_other(format!("init fork: {}", e)))? {
+        ForkResult::Child => match command {
+            // execvp — never returns on success.
+            Some(cmd) => exec_command(cmd),
+            None => exec_shell(),
+        },
+        ForkResult::Parent { child } => reap_as_init(child),
+    }
+}
+
+/// Minimal `init` for PID 1 of the container's PID namespace. Reaps zombies of
+/// orphaned processes (reparented to us) while the workload runs, and returns
+/// the workload's exit code as soon as it exits. Any still-running background
+/// processes are then killed by the kernel when PID 1 exits and the PID
+/// namespace is torn down — matching `docker run` semantics.
+fn reap_as_init(workload: Pid) -> Result<i32, RuntimeError> {
+    loop {
+        match waitpid(Pid::from_raw(-1), None) {
+            Ok(WaitStatus::Exited(pid, code)) if pid == workload => return Ok(code),
+            Ok(WaitStatus::Signaled(pid, sig, _)) if pid == workload => return Ok(128 + sig as i32),
+            // An orphan's status — reaped, keep going.
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => {}
+            // No children left (workload already reaped, or none) — done.
+            Err(nix::errno::Errno::ECHILD) => return Ok(0),
+            Err(e) => return Err(io_other(format!("init reap waitpid: {}", e))),
+        }
     }
 }
 
