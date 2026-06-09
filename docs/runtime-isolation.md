@@ -71,11 +71,25 @@ mmap/exec doesn't) — so the rootfs is the RO FUSE directly, with
 a non-init userns and `AutoUnmount` forces the fusermount3 helper; both removed
 from the runtime mounts so fuser mounts via `mount(2)` in-process.
 
-**Verified in WSL2 (`scripts/isolation-check.sh`, real running container):**
-host `$HOME` not exposed ✅, private `/tmp` ✅, network isolated ✅. PID isolation
-is the one remaining check — that's **Increment 2** (`CLONE_NEWPID` needs a
-fork-to-PID-1 restructure; adding it to the shared unshare breaks the FUSE
-thread spawn). `/workspace` volumes still need a writable-rootfs approach.
+**Verified in WSL2 (`scripts/isolation-check.sh`, real running container) — ALL
+PASS as of Increment 2:** host `$HOME` not exposed ✅, private `/tmp` ✅, network
+isolated ✅, **PID namespace ✅** (the command is PID 1 and sees only its own
+processes).
+
+### Increment 2 — DONE (PID namespace)
+
+`command_setup` unshares `CLONE_NEWPID` and forks; the child (`container_init`)
+is PID 1 of a fresh PID namespace, mounts a fresh procfs, isolates the network,
+`pivot_root`s, and execs. The parent waits and propagates the exit code.
+`CLONE_NEWPID` stays out of the shared `run_inner` unshare because the FUSE
+server there can't spawn its serve thread once a PID namespace is pending.
+
+### Still open
+- `/workspace` volumes need a writable-rootfs approach (overlayfs-over-FUSE is
+  broken for exec; likely an fd-based `FsStore` so a writable scheme survives
+  `pivot_root`, or pre-materialized mountpoints).
+- A PID-1 init/reaper (tini-style) for workloads that spawn child processes.
+- Then PR `runtime/isolation` → `main` with CI.
 
 ---
 
