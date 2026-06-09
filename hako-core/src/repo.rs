@@ -132,9 +132,9 @@ impl<'s> Repo<'s> {
             Some(b) => self.read_ref(&b),
             None => {
                 let head = fs::read_to_string(self.root.join(HEAD_FILE))?;
-                Hash::from_hex(head.trim()).map(Some).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid HEAD hash")
-                })
+                Hash::from_hex(head.trim())
+                    .map(Some)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid HEAD hash"))
             }
         }
     }
@@ -148,9 +148,8 @@ impl<'s> Repo<'s> {
 
     pub fn working_tree(&self) -> io::Result<Hash> {
         match fs::read_to_string(self.root.join(WORKING_FILE)) {
-            Ok(s) => Hash::from_hex(s.trim()).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "invalid WORKING hex")
-            }),
+            Ok(s) => Hash::from_hex(s.trim())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid WORKING hex")),
             Err(e) if e.kind() == io::ErrorKind::NotFound => self.head_tree(),
             Err(e) => Err(e),
         }
@@ -342,11 +341,7 @@ pub(crate) fn walk_tree_for_maintenance(
     walk_tree(store, tree, visited)
 }
 
-fn walk_tree(
-    store: &dyn ChunkStore,
-    tree: Hash,
-    visited: &mut HashSet<Hash>,
-) -> io::Result<()> {
+fn walk_tree(store: &dyn ChunkStore, tree: Hash, visited: &mut HashSet<Hash>) -> io::Result<()> {
     let mut stack: Vec<Hash> = vec![tree];
     while let Some(h) = stack.pop() {
         if h == Hash::zero() || !visited.insert(h) {
@@ -369,11 +364,7 @@ fn walk_tree(
     Ok(())
 }
 
-fn walk_value(
-    store: &dyn ChunkStore,
-    value: Value,
-    visited: &mut HashSet<Hash>,
-) -> io::Result<()> {
+fn walk_value(store: &dyn ChunkStore, value: Value, visited: &mut HashSet<Hash>) -> io::Result<()> {
     let bytes = match value {
         Value::Inline(b) => b,
         Value::External(h) => {
@@ -463,7 +454,10 @@ fn decode_commit(data: &[u8]) -> io::Result<Commit> {
     let alen = u16::from_be_bytes(data[p..p + 2].try_into().unwrap()) as usize;
     p += 2;
     if data.len() < p + alen + 4 + 8 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated author"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated author",
+        ));
     }
     let author = std::str::from_utf8(&data[p..p + alen])
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 author"))?
@@ -578,9 +572,15 @@ mod tests {
         let r = f.repo();
         let h = Hash::of(b"x");
         r.write_ref("dead", h).unwrap();
-        assert!(r.delete_ref("dead").unwrap(), "delete returned true for existing ref");
+        assert!(
+            r.delete_ref("dead").unwrap(),
+            "delete returned true for existing ref"
+        );
         assert_eq!(r.read_ref("dead").unwrap(), None);
-        assert!(!r.delete_ref("dead").unwrap(), "delete returned false for missing ref");
+        assert!(
+            !r.delete_ref("dead").unwrap(),
+            "delete returned false for missing ref"
+        );
     }
 
     #[test]

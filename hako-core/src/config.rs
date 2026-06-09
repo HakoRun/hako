@@ -160,19 +160,15 @@ impl Config {
         Self::load_with_profile(workspace, None)
     }
 
-    pub fn load_with_profile(
-        workspace: &Path,
-        profile: Option<&str>,
-    ) -> io::Result<Self> {
+    pub fn load_with_profile(workspace: &Path, profile: Option<&str>) -> io::Result<Self> {
         let p = workspace.join(CONFIG_FILE);
         let text = match fs::read_to_string(&p) {
             Ok(s) => s,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e),
         };
-        let raw: AppRaw = toml::from_str(&text).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("hako.toml: {}", e))
-        })?;
+        let raw: AppRaw = toml::from_str(&text)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("hako.toml: {}", e)))?;
         let app = raw.resolve(profile)?;
         let default_container = app.name.clone();
         Ok(Self {
@@ -333,10 +329,7 @@ impl AppRaw {
             .or(self.run)
             .map(RunSpec::from);
         let bin = profile.as_ref().and_then(|p| p.bin.clone()).or(self.bin);
-        let user = profile
-            .as_ref()
-            .and_then(|p| p.user.clone())
-            .or(self.user);
+        let user = profile.as_ref().and_then(|p| p.user.clone()).or(self.user);
         let env = profile
             .as_ref()
             .and_then(|p| p.env.clone())
@@ -402,11 +395,7 @@ fn looks_like_legacy_nested(p: &ProfileRaw) -> bool {
 fn derive_name_from_image(image: &str) -> String {
     let no_tag = image.split('@').next().unwrap_or(image);
     let no_tag = no_tag.split(':').next().unwrap_or(no_tag);
-    no_tag
-        .rsplit('/')
-        .next()
-        .unwrap_or(no_tag)
-        .to_string()
+    no_tag.rsplit('/').next().unwrap_or(no_tag).to_string()
 }
 
 // ============================================================================
@@ -445,10 +434,7 @@ mod tests {
         assert_eq!(derive_name_from_image("library/alpine"), "alpine");
         assert_eq!(derive_name_from_image("ghcr.io/foo/bar"), "bar");
         assert_eq!(derive_name_from_image("ghcr.io/foo/bar:v1"), "bar");
-        assert_eq!(
-            derive_name_from_image("alpine@sha256:abc123"),
-            "alpine"
-        );
+        assert_eq!(derive_name_from_image("alpine@sha256:abc123"), "alpine");
     }
 
     #[test]
@@ -525,7 +511,10 @@ workspace = "none"
         let r = parse_with(text, Some("nope"));
         assert!(r.is_err());
         let msg = r.unwrap_err().to_string();
-        assert!(msg.contains("nope"), "error should name the missing profile");
+        assert!(
+            msg.contains("nope"),
+            "error should name the missing profile"
+        );
         assert!(msg.contains("dev"), "error should list available profiles");
         assert!(msg.contains("prod"));
     }
@@ -561,10 +550,13 @@ workspace = "none"
 
     #[test]
     fn run_shell_form() {
-        let c = parse(r#"
+        let c = parse(
+            r#"
 image = "alpine"
 run = "echo hi"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         match c.run {
             Some(RunSpec::Shell(s)) => assert_eq!(s, "echo hi"),
             other => panic!("expected Shell, got {:?}", other),
@@ -573,10 +565,13 @@ run = "echo hi"
 
     #[test]
     fn run_exec_form() {
-        let c = parse(r#"
+        let c = parse(
+            r#"
 image = "alpine"
 run = ["echo", "hi"]
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         match c.run {
             Some(RunSpec::Exec(v)) => assert_eq!(v, vec!["echo", "hi"]),
             other => panic!("expected Exec, got {:?}", other),
@@ -619,7 +614,10 @@ user  = "bob"
         let ovs = AppOverrides {
             user: Some("carol".into()),
             workspace: Some(WorkspaceMode::Ro),
-            env: vec![("K".into(), "override".into()), ("NEW".into(), "added".into())],
+            env: vec![
+                ("K".into(), "override".into()),
+                ("NEW".into(), "added".into()),
+            ],
             env_pass: vec!["B".into(), "A".into()], // A is dup; should not double
             autocommit: Some(true),
         };

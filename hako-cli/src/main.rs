@@ -13,7 +13,11 @@ use cmd::Ctx;
 pub const DOT_HAKO: &str = ".hako";
 
 #[derive(Parser)]
-#[command(name = "hako", about = "Content-addressed version-controlled filesystem", version)]
+#[command(
+    name = "hako",
+    about = "Content-addressed version-controlled filesystem",
+    version
+)]
 struct Cli {
     /// Workspace directory containing .hako (defaults to current dir)
     #[arg(short = 'w', long, global = true)]
@@ -337,10 +341,7 @@ impl Cmd {
             | Cmd::Stop { .. } => false,
             // Long-running: holding the lock would block every other CLI
             // invocation for the lifetime of the container/mount.
-            Cmd::Mount { .. }
-            | Cmd::Run { .. }
-            | Cmd::Exec { .. }
-            | Cmd::External(_) => false,
+            Cmd::Mount { .. } | Cmd::Run { .. } | Cmd::Exec { .. } | Cmd::External(_) => false,
             // Branch / tag list mode (no name) is read-only.
             Cmd::Branch { name: None, .. } => false,
             Cmd::Tag { name: None, .. } => false,
@@ -496,7 +497,11 @@ fn run() -> io::Result<ExitCode> {
     let default_container = cli
         .container
         .clone()
-        .or_else(|| state.session_path_exists().then(|| session.container.clone()))
+        .or_else(|| {
+            state
+                .session_path_exists()
+                .then(|| session.container.clone())
+        })
         .unwrap_or_else(|| cfg.default_container.clone());
 
     // Acquire the workspace lock around any operation that mutates workspace
@@ -519,10 +524,7 @@ fn run() -> io::Result<ExitCode> {
             let image_ref = hako::ImageRef::parse(explicit).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!(
-                        "no container {} and not a valid image ref: {}",
-                        explicit, e
-                    ),
+                    format!("no container {} and not a valid image ref: {}", explicit, e),
                 )
             })?;
             cmd::oci::pull_into(&state, &image_ref, explicit, "linux", "amd64", false)?;
@@ -585,7 +587,11 @@ fn run() -> io::Result<ExitCode> {
         }
 
         // Files
-        Cmd::Write { path, file, content } => cmd::files::write(&ctx, path, file, content),
+        Cmd::Write {
+            path,
+            file,
+            content,
+        } => cmd::files::write(&ctx, path, file, content),
         Cmd::Cat { path } => cmd::files::cat(&ctx, path),
         Cmd::Mkdir { path } => cmd::files::mkdir(&ctx, path),
         Cmd::Del { path } => cmd::files::del(&ctx, path),
@@ -604,24 +610,46 @@ fn run() -> io::Result<ExitCode> {
         // VC
         Cmd::Commit { message, author } => cmd::vc::commit(&ctx, message, author),
         Cmd::Log => cmd::vc::log(&ctx),
-        Cmd::Branch { name, start, delete } => cmd::vc::branch(&ctx, name, start, delete),
+        Cmd::Branch {
+            name,
+            start,
+            delete,
+        } => cmd::vc::branch(&ctx, name, start, delete),
         Cmd::Checkout { branch, force } => cmd::vc::checkout(&ctx, branch, force),
-        Cmd::Merge { branch, author, abort } => cmd::vc::merge(&ctx, branch, author, abort),
+        Cmd::Merge {
+            branch,
+            author,
+            abort,
+        } => cmd::vc::merge(&ctx, branch, author, abort),
         Cmd::Diff { from, to } => cmd::vc::diff(&ctx, from, to),
-        Cmd::Tag { name, start, delete } => cmd::vc::tag(&ctx, name, start, delete),
+        Cmd::Tag {
+            name,
+            start,
+            delete,
+        } => cmd::vc::tag(&ctx, name, start, delete),
 
         // Sync
-        Cmd::Fetch { remote, branch, as_ref, from_container } => {
-            cmd::sync::fetch(&ctx, remote, branch, as_ref, from_container)
-        }
-        Cmd::Push { remote, branch, as_ref, to_container } => {
-            cmd::sync::push(&ctx, remote, branch, as_ref, to_container)
-        }
+        Cmd::Fetch {
+            remote,
+            branch,
+            as_ref,
+            from_container,
+        } => cmd::sync::fetch(&ctx, remote, branch, as_ref, from_container),
+        Cmd::Push {
+            remote,
+            branch,
+            as_ref,
+            to_container,
+        } => cmd::sync::push(&ctx, remote, branch, as_ref, to_container),
 
         // OCI
-        Cmd::Pull { image, into, per_layer, os, arch } => {
-            cmd::oci::pull(&ctx, image, per_layer, os, arch, into)
-        }
+        Cmd::Pull {
+            image,
+            into,
+            per_layer,
+            os,
+            arch,
+        } => cmd::oci::pull(&ctx, image, per_layer, os, arch, into),
 
         // Mount (Linux/macOS only)
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -636,9 +664,13 @@ fn run() -> io::Result<ExitCode> {
         Cmd::Is { branch } => cmd::nav::switch_identity(&ctx, branch),
 
         // Runtime
-        Cmd::Run { branch, detach, volumes, no_workspace, command } => {
-            cmd::runtime::run(&ctx, branch, detach, volumes, no_workspace, command)
-        }
+        Cmd::Run {
+            branch,
+            detach,
+            volumes,
+            no_workspace,
+            command,
+        } => cmd::runtime::run(&ctx, branch, detach, volumes, no_workspace, command),
         Cmd::Ps { all } => cmd::runtime::ps(&ctx, all),
         Cmd::Logs { id, follow } => cmd::runtime::logs(&ctx, id, follow),
         Cmd::Exec { id, command } => cmd::runtime::exec(&ctx, id, command),
@@ -760,10 +792,7 @@ fn init(workdir: &std::path::Path, path: Option<PathBuf>) -> io::Result<ExitCode
     State::init(&dot)?;
     println!("initialized hako workspace at {}", target.display());
     if let Some(app) = &cfg.app {
-        println!(
-            "found hako.toml: image={}, name={}",
-            app.image, app.name
-        );
+        println!("found hako.toml: image={}, name={}", app.image, app.name);
         println!("run `hako apply` to pull the image and execute setup steps");
     }
     Ok(ExitCode::SUCCESS)

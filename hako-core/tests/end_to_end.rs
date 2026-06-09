@@ -114,10 +114,15 @@ fn branch_clean_merge_no_conflict() {
         b"main side"
     );
     assert_eq!(
-        scoped.read_file(&result.merged, "/feature_only.txt").unwrap(),
+        scoped
+            .read_file(&result.merged, "/feature_only.txt")
+            .unwrap(),
         b"feature side"
     );
-    assert_eq!(scoped.read_file(&result.merged, "/shared.txt").unwrap(), b"base");
+    assert_eq!(
+        scoped.read_file(&result.merged, "/shared.txt").unwrap(),
+        b"base"
+    );
 }
 
 #[test]
@@ -180,7 +185,11 @@ fn cross_container_dedup_chunks() {
         let repo = s.open_container(c).unwrap();
         let scoped = ScopedFs::new(repo.store());
         let work = repo.working_tree().unwrap();
-        let path = if c == "alpha" { "/file.bin" } else { "/copy.bin" };
+        let path = if c == "alpha" {
+            "/file.bin"
+        } else {
+            "/copy.bin"
+        };
         assert_eq!(scoped.read_file(&work, path).unwrap(), payload);
     }
 }
@@ -299,11 +308,21 @@ fn ls_returns_directory_children() {
     let scoped = ScopedFs::new(repo.store());
     let work = repo.working_tree().unwrap();
 
-    let mut top: Vec<String> = scoped.ls(&work, "/").unwrap().into_iter().map(|c| c.name).collect();
+    let mut top: Vec<String> = scoped
+        .ls(&work, "/")
+        .unwrap()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
     top.sort();
     assert_eq!(top, vec!["a", "b"]);
 
-    let mut a: Vec<String> = scoped.ls(&work, "/a").unwrap().into_iter().map(|c| c.name).collect();
+    let mut a: Vec<String> = scoped
+        .ls(&work, "/a")
+        .unwrap()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
     a.sort();
     assert_eq!(a, vec!["x.txt", "y.txt"]);
 }
@@ -321,7 +340,10 @@ fn workspace_persists_across_state_open() {
     let repo = s2.open_container("hako").unwrap();
     let scoped = ScopedFs::new(repo.store());
     let head = repo.head_tree().unwrap();
-    assert_eq!(scoped.read_file(&head, "/persistent.txt").unwrap(), b"survives");
+    assert_eq!(
+        scoped.read_file(&head, "/persistent.txt").unwrap(),
+        b"survives"
+    );
 }
 
 #[test]
@@ -398,7 +420,10 @@ fn fetch_copies_only_reachable_objects() {
             copied2 += 1;
         }
     }
-    assert_eq!(copied2, 0, "all reachable objects should already be present");
+    assert_eq!(
+        copied2, 0,
+        "all reachable objects should already be present"
+    );
 }
 
 #[test]
@@ -423,8 +448,14 @@ fn cross_container_cp_uses_shared_chunks() {
 
     // Both containers see the same content.
     let alpha_tree = alpha.working_tree().unwrap();
-    assert_eq!(scoped.read_file(&alpha_tree, "/copied.bin").unwrap(), payload);
-    assert_eq!(scoped.read_file(&main_root, "/source.bin").unwrap(), payload);
+    assert_eq!(
+        scoped.read_file(&alpha_tree, "/copied.bin").unwrap(),
+        payload
+    );
+    assert_eq!(
+        scoped.read_file(&main_root, "/source.bin").unwrap(),
+        payload
+    );
 
     // The chunk lives once on disk.
     let h = Hash::of(&payload);
@@ -448,7 +479,13 @@ fn file_metadata_roundtrips_through_commit() {
     let repo = s.open_container("hako").unwrap();
     let scoped = ScopedFs::new(repo.store());
     let root = scoped
-        .write_file_meta(&repo.working_tree().unwrap(), "/exec.sh", b"#!/bin/sh\n", 0o755, 42)
+        .write_file_meta(
+            &repo.working_tree().unwrap(),
+            "/exec.sh",
+            b"#!/bin/sh\n",
+            0o755,
+            42,
+        )
         .unwrap();
     repo.set_working(root).unwrap();
     commit(&s, "hako", "add exec", 100).unwrap();
@@ -470,7 +507,13 @@ fn symlink_roundtrips_through_commit() {
     let repo = s.open_container("hako").unwrap();
     let scoped = ScopedFs::new(repo.store());
     let root = scoped
-        .write_symlink(&repo.working_tree().unwrap(), "/link", b"../target", 0o777, 99)
+        .write_symlink(
+            &repo.working_tree().unwrap(),
+            "/link",
+            b"../target",
+            0o777,
+            99,
+        )
         .unwrap();
     repo.set_working(root).unwrap();
     commit(&s, "hako", "add link", 200).unwrap();
@@ -486,4 +529,3 @@ fn symlink_roundtrips_through_commit() {
     assert_eq!(link.mode, Some(0o777));
     assert_eq!(link.mtime, Some(99));
 }
-

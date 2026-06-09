@@ -106,9 +106,7 @@ fn build_linux(arm64: bool, profile: &str) -> Result<(), String> {
     std::fs::copy(&src, &dst)
         .map_err(|e| format!("copy {} → {}: {}", src.display(), dst.display(), e))?;
 
-    let size = std::fs::metadata(&dst)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let size = std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0);
     eprintln!(
         "xtask: vendored {} ({:.1} MiB). Build hako-cli with --features embedded to bundle it.",
         dst.file_name().unwrap_or_default().to_string_lossy(),

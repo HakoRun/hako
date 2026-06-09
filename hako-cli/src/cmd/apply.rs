@@ -21,7 +21,7 @@ use hako_runtime::VolumeMount;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const APPLIED_FILE: &str = "applied";
@@ -53,11 +53,7 @@ pub fn apply(
     );
 
     // Phase 1: ensure the container exists, pulling the image if needed.
-    let needs_pull = !ctx
-        .state
-        .list_containers()?
-        .iter()
-        .any(|c| c == &app.name);
+    let needs_pull = !ctx.state.list_containers()?.iter().any(|c| c == &app.name);
     if needs_pull {
         if dry_run {
             println!("would pull {} into container {}", app.image, app.name);
@@ -129,10 +125,7 @@ pub fn apply(
             skipped
         );
     } else {
-        println!(
-            "apply complete: {} step(s) ran, {} cached",
-            ran, skipped
-        );
+        println!("apply complete: {} step(s) ran, {} cached", ran, skipped);
     }
 
     Ok(ExitCode::SUCCESS)
@@ -146,10 +139,8 @@ fn run_setup_step(ctx: &Ctx<'_>, app: &AppConfig, step: &str) -> io::Result<Hash
     let branch = repo.current_branch()?.unwrap_or_else(|| "main".into());
     let cmd = vec!["/bin/sh".into(), "-c".into(), step.into()];
     let volumes = build_volumes(ctx, app);
-    let (exit, new_root) =
-        hako_runtime::transform::run_container_rw(&repo, &branch, cmd, &volumes).map_err(|e| {
-            io::Error::other(format!("setup step failed to start: {}", e))
-        })?;
+    let (exit, new_root) = hako_runtime::transform::run_container_rw(&repo, &branch, cmd, &volumes)
+        .map_err(|e| io::Error::other(format!("setup step failed to start: {}", e)))?;
     if exit != 0 {
         return Err(io::Error::other(format!(
             "setup step exited with code {}: {}",
@@ -179,10 +170,14 @@ fn read_applied(path: &PathBuf) -> io::Result<BTreeSet<String>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
         Err(e) => return Err(e),
     };
-    Ok(text.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+    Ok(text
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
 }
 
-fn write_applied(path: &PathBuf, set: &BTreeSet<String>) -> io::Result<()> {
+fn write_applied(path: &Path, set: &BTreeSet<String>) -> io::Result<()> {
     let mut buf = String::new();
     for h in set {
         buf.push_str(h);

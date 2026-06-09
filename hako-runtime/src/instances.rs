@@ -379,7 +379,11 @@ mod tests {
         }
         // Allow a couple collisions in tight loops on coarse-clock systems,
         // but not many.
-        assert!(seen.len() > 195, "got too many duplicate ids: {}/200", seen.len());
+        assert!(
+            seen.len() > 195,
+            "got too many duplicate ids: {}/200",
+            seen.len()
+        );
     }
 
     #[test]

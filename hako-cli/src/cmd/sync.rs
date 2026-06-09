@@ -76,7 +76,11 @@ pub fn push(
         .clone()
         .unwrap_or_else(|| ctx.default_container.to_string());
     // Auto-create the remote container — push should "just work" against a fresh remote.
-    if !remote_state.list_containers()?.iter().any(|c| c == &remote_container) {
+    if !remote_state
+        .list_containers()?
+        .iter()
+        .any(|c| c == &remote_container)
+    {
         remote_state.create_container(&remote_container)?;
     }
     let remote_repo = remote_state.open_container(&remote_container)?;

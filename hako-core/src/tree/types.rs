@@ -38,17 +38,44 @@ pub struct Node {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiffEntry {
-    Added { key: Vec<u8>, value: Value },
-    Removed { key: Vec<u8>, value: Value },
-    Modified { key: Vec<u8>, old: Value, new: Value },
+    Added {
+        key: Vec<u8>,
+        value: Value,
+    },
+    Removed {
+        key: Vec<u8>,
+        value: Value,
+    },
+    Modified {
+        key: Vec<u8>,
+        old: Value,
+        new: Value,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Conflict {
-    BothModified { key: Vec<u8>, base: Value, ours: Value, theirs: Value },
-    ModifyDelete { key: Vec<u8>, base: Value, ours: Value },
-    DeleteModify { key: Vec<u8>, base: Value, theirs: Value },
-    BothAdded { key: Vec<u8>, ours: Value, theirs: Value },
+    BothModified {
+        key: Vec<u8>,
+        base: Value,
+        ours: Value,
+        theirs: Value,
+    },
+    ModifyDelete {
+        key: Vec<u8>,
+        base: Value,
+        ours: Value,
+    },
+    DeleteModify {
+        key: Vec<u8>,
+        base: Value,
+        theirs: Value,
+    },
+    BothAdded {
+        key: Vec<u8>,
+        ours: Value,
+        theirs: Value,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -61,13 +88,12 @@ fn level_salts() -> &'static [u64; 256] {
     static SALTS: OnceLock<[u64; 256]> = OnceLock::new();
     SALTS.get_or_init(|| {
         let mut salts = [0u64; 256];
-        for level in 0..256usize {
+        for (level, salt) in salts.iter_mut().enumerate() {
             let label = format!("hako-level-{}", level);
             let h = blake3::hash(label.as_bytes());
             let bytes = h.as_bytes();
-            salts[level] = u64::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
+            *salt = u64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]);
         }
         salts
@@ -98,7 +124,11 @@ mod tests {
             }
         }
         // Tolerance: expected 100, allow 50..200.
-        assert!(hits > 50 && hits < 200, "boundary hits at level 0: {}", hits);
+        assert!(
+            hits > 50 && hits < 200,
+            "boundary hits at level 0: {}",
+            hits
+        );
     }
 
     #[test]

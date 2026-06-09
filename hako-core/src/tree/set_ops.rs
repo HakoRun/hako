@@ -36,16 +36,28 @@ pub fn merge_walk(
         match order {
             Ordering::Less => {
                 let (key, val) = ca.next()?.unwrap();
-                visit(Pair { key, left: Some(val), right: None });
+                visit(Pair {
+                    key,
+                    left: Some(val),
+                    right: None,
+                });
             }
             Ordering::Greater => {
                 let (key, val) = cb.next()?.unwrap();
-                visit(Pair { key, left: None, right: Some(val) });
+                visit(Pair {
+                    key,
+                    left: None,
+                    right: Some(val),
+                });
             }
             Ordering::Equal => {
                 let (key, lv) = ca.next()?.unwrap();
                 let (_, rv) = cb.next()?.unwrap();
-                visit(Pair { key, left: Some(lv), right: Some(rv) });
+                visit(Pair {
+                    key,
+                    left: Some(lv),
+                    right: Some(rv),
+                });
             }
         }
     }
@@ -90,17 +102,29 @@ pub fn diff_walk(
         match order {
             Ordering::Less => {
                 let (key, val) = ca.next()?.unwrap();
-                visit(Pair { key, left: Some(val), right: None });
+                visit(Pair {
+                    key,
+                    left: Some(val),
+                    right: None,
+                });
             }
             Ordering::Greater => {
                 let (key, val) = cb.next()?.unwrap();
-                visit(Pair { key, left: None, right: Some(val) });
+                visit(Pair {
+                    key,
+                    left: None,
+                    right: Some(val),
+                });
             }
             Ordering::Equal => {
                 let (key, lv) = ca.next()?.unwrap();
                 let (_, rv) = cb.next()?.unwrap();
                 if lv != rv {
-                    visit(Pair { key, left: Some(lv), right: Some(rv) });
+                    visit(Pair {
+                        key,
+                        left: Some(lv),
+                        right: Some(rv),
+                    });
                 }
             }
         }
@@ -125,11 +149,7 @@ pub fn intersection(
 }
 
 /// Keys in `a` not in `b` (presence-only; values from `a`).
-pub fn difference(
-    store: &dyn ChunkStore,
-    a: &Hash,
-    b: &Hash,
-) -> io::Result<Vec<(Vec<u8>, Value)>> {
+pub fn difference(store: &dyn ChunkStore, a: &Hash, b: &Hash) -> io::Result<Vec<(Vec<u8>, Value)>> {
     let mut out = Vec::new();
     diff_walk(store, a, b, |p| {
         if let (Some(l), None) = (p.left, p.right) {
@@ -140,11 +160,7 @@ pub fn difference(
 }
 
 /// Keys in either tree (right-wins on collision).
-pub fn union(
-    store: &dyn ChunkStore,
-    a: &Hash,
-    b: &Hash,
-) -> io::Result<Vec<(Vec<u8>, Value)>> {
+pub fn union(store: &dyn ChunkStore, a: &Hash, b: &Hash) -> io::Result<Vec<(Vec<u8>, Value)>> {
     let mut out = Vec::new();
     merge_walk(store, a, b, |p| match (p.left, p.right) {
         (Some(l), None) => out.push((p.key, l)),
@@ -169,7 +185,10 @@ mod tests {
 
     impl CountingStore {
         fn new() -> Self {
-            Self { inner: MemStore::new(), gets: AtomicUsize::new(0) }
+            Self {
+                inner: MemStore::new(),
+                gets: AtomicUsize::new(0),
+            }
         }
         fn gets(&self) -> usize {
             self.gets.load(AOrd::Relaxed)
@@ -246,7 +265,13 @@ mod tests {
         let s = MemStore::new();
         let a = bulk_build(&s, entries(10)).unwrap();
         // Same keys, but mutate one value.
-        let b = put(&s, &a, b"k-0005".to_vec(), Value::Inline(b"different".to_vec())).unwrap();
+        let b = put(
+            &s,
+            &a,
+            b"k-0005".to_vec(),
+            Value::Inline(b"different".to_vec()),
+        )
+        .unwrap();
         let inter = intersection(&s, &a, &b).unwrap();
         assert_eq!(inter.len(), 9); // k-0005 differs, others match
     }
@@ -269,7 +294,13 @@ mod tests {
     fn union_right_wins() {
         let s = MemStore::new();
         let a = bulk_build(&s, entries(5)).unwrap();
-        let b = put(&s, &a, b"k-0002".to_vec(), Value::Inline(b"override".to_vec())).unwrap();
+        let b = put(
+            &s,
+            &a,
+            b"k-0002".to_vec(),
+            Value::Inline(b"override".to_vec()),
+        )
+        .unwrap();
         let u = union(&s, &a, &b).unwrap();
         assert_eq!(u.len(), 5);
         let v = u.iter().find(|(k, _)| k == b"k-0002").unwrap();
@@ -282,14 +313,24 @@ mod tests {
         let a = bulk_build(
             &s,
             (0..5)
-                .map(|i| (format!("a-{}", i).into_bytes(), Value::Inline(b"v".to_vec())))
+                .map(|i| {
+                    (
+                        format!("a-{}", i).into_bytes(),
+                        Value::Inline(b"v".to_vec()),
+                    )
+                })
                 .collect(),
         )
         .unwrap();
         let b = bulk_build(
             &s,
             (0..5)
-                .map(|i| (format!("b-{}", i).into_bytes(), Value::Inline(b"v".to_vec())))
+                .map(|i| {
+                    (
+                        format!("b-{}", i).into_bytes(),
+                        Value::Inline(b"v".to_vec()),
+                    )
+                })
                 .collect(),
         )
         .unwrap();
@@ -345,8 +386,13 @@ mod tests {
         // Modify ~10% of values.
         let mut b = a;
         for i in (0..n).step_by(10) {
-            b = put(&s, &b, format!("k-{:04}", i).into_bytes(), Value::Inline(b"X".to_vec()))
-                .unwrap();
+            b = put(
+                &s,
+                &b,
+                format!("k-{:04}", i).into_bytes(),
+                Value::Inline(b"X".to_vec()),
+            )
+            .unwrap();
         }
         let mut equal = 0;
         let mut differ = 0;

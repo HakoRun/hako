@@ -66,10 +66,7 @@ impl ChunkStore for FsStore {
 
         let tmp = self.temp_path(&hash);
         {
-            let mut f = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&tmp)?;
+            let mut f = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
             f.write_all(data)?;
             // sync data so a crash after rename can't leave a zero-byte chunk.
             f.sync_data()?;
@@ -130,37 +127,42 @@ impl ChunkStore for FsStore {
         let prefix = prefix.to_ascii_lowercase();
         let mut out = Vec::new();
         // Two cases: prefix is shorter than the shard prefix (2 chars), or longer.
-        let scan_dir = |dir_name: &str, file_filter: Option<&str>, out: &mut Vec<Hash>| -> io::Result<()> {
-            let dir = self.root.join(dir_name);
-            if !dir.exists() {
-                return Ok(());
-            }
-            for entry in fs::read_dir(&dir)? {
-                let entry = entry?;
-                if !entry.file_type()?.is_file() {
-                    continue;
+        let scan_dir =
+            |dir_name: &str, file_filter: Option<&str>, out: &mut Vec<Hash>| -> io::Result<()> {
+                let dir = self.root.join(dir_name);
+                if !dir.exists() {
+                    return Ok(());
                 }
-                let name = match entry.file_name().into_string() {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                if let Some(filter) = file_filter {
-                    if !name.starts_with(filter) {
+                for entry in fs::read_dir(&dir)? {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_file() {
                         continue;
                     }
+                    let name = match entry.file_name().into_string() {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    if let Some(filter) = file_filter {
+                        if !name.starts_with(filter) {
+                            continue;
+                        }
+                    }
+                    let full_hex = format!("{}{}", dir_name, name);
+                    if let Some(h) = Hash::from_hex(&full_hex) {
+                        out.push(h);
+                    }
                 }
-                let full_hex = format!("{}{}", dir_name, name);
-                if let Some(h) = Hash::from_hex(&full_hex) {
-                    out.push(h);
-                }
-            }
-            Ok(())
-        };
+                Ok(())
+            };
 
         if prefix.len() >= 2 {
             let shard = &prefix[..2];
             let rest = &prefix[2..];
-            scan_dir(shard, if rest.is_empty() { None } else { Some(rest) }, &mut out)?;
+            scan_dir(
+                shard,
+                if rest.is_empty() { None } else { Some(rest) },
+                &mut out,
+            )?;
         } else {
             // Walk every shard directory.
             for entry in fs::read_dir(&self.root)? {
@@ -248,7 +250,12 @@ mod tests {
         let _ = s.put(b"distractor").unwrap();
         let prefix = &h.to_hex()[..8];
         let matches = s.find_by_prefix(prefix).unwrap();
-        assert!(matches.contains(&h), "prefix {} should find {}", prefix, h.to_hex());
+        assert!(
+            matches.contains(&h),
+            "prefix {} should find {}",
+            prefix,
+            h.to_hex()
+        );
     }
 
     #[test]

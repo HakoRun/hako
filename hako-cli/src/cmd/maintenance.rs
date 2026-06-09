@@ -9,11 +9,12 @@ pub fn gc(ctx: &Ctx<'_>, dry_run: bool) -> io::Result<ExitCode> {
     let action = if dry_run { "would delete" } else { "deleted" };
     println!(
         "objects: {} total, {} reachable, {} unreachable",
-        report.total_objects,
-        report.reachable,
-        report.deleted
+        report.total_objects, report.reachable, report.deleted
     );
-    println!("{} {} object(s); freed {} bytes", action, report.deleted, report.bytes_freed);
+    println!(
+        "{} {} object(s); freed {} bytes",
+        action, report.deleted, report.bytes_freed
+    );
     Ok(ExitCode::SUCCESS)
 }
 

@@ -88,11 +88,7 @@ impl Client {
                     self.token = Some(fetch_token(&self.agent, &params)?);
                     attempt += 1;
                 }
-                Err(e) => {
-                    return Err(io::Error::other(
-                        format!("HTTP {}: {}", url, e),
-                    ))
-                }
+                Err(e) => return Err(io::Error::other(format!("HTTP {}: {}", url, e))),
             }
         }
     }
@@ -117,9 +113,8 @@ impl Client {
             io::Error::new(io::ErrorKind::InvalidData, format!("manifest parse: {}", e))
         })?;
 
-        let is_index = ctype.contains("index")
-            || ctype.contains("list")
-            || !manifest.manifests.is_empty();
+        let is_index =
+            ctype.contains("index") || ctype.contains("list") || !manifest.manifests.is_empty();
         if is_index {
             let pick = manifest
                 .manifests
@@ -145,7 +140,10 @@ impl Client {
         if manifest.layers.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("manifest has no layers (media type {})", manifest.media_type),
+                format!(
+                    "manifest has no layers (media type {})",
+                    manifest.media_type
+                ),
             ));
         }
         Ok(manifest)
@@ -273,7 +271,10 @@ fn fetch_token(agent: &ureq::Agent, params: &AuthParams) -> io::Result<String> {
         req = req.query("scope", s);
     }
     let resp = req.call().map_err(|e| {
-        io::Error::new(io::ErrorKind::PermissionDenied, format!("token fetch: {}", e))
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("token fetch: {}", e),
+        )
     })?;
     let mut buf = String::new();
     resp.into_reader().read_to_string(&mut buf)?;
@@ -285,15 +286,17 @@ fn fetch_token(agent: &ureq::Agent, params: &AuthParams) -> io::Result<String> {
         #[serde(default, rename = "access_token")]
         access_token: String,
     }
-    let t: Token = serde_json::from_str(&buf).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("token parse: {}", e))
-    })?;
+    let t: Token = serde_json::from_str(&buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("token parse: {}", e)))?;
     if !t.token.is_empty() {
         Ok(t.token)
     } else if !t.access_token.is_empty() {
         Ok(t.access_token)
     } else {
-        Err(io::Error::new(io::ErrorKind::PermissionDenied, "empty token"))
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "empty token",
+        ))
     }
 }
 

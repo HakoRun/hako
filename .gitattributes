@@ -1,0 +1,13 @@
+# Normalize line endings: LF in the repo, on every platform.
+* text=auto eol=lf
+
+*.rs   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.sh   text eol=lf
+*.yml  text eol=lf
+
+# Treat cross-compiled binaries and archives as binary.
+vendored/hako-linux-* binary
+*.tar binary
+*.png binary

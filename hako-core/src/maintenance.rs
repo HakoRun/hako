@@ -227,7 +227,10 @@ mod tests {
 
         let report = gc(&s, true).unwrap();
         assert_eq!(report.deleted, 1);
-        assert!(repo.store().has(&orphan).unwrap(), "dry run should not delete");
+        assert!(
+            repo.store().has(&orphan).unwrap(),
+            "dry run should not delete"
+        );
     }
 
     #[test]

@@ -7,9 +7,19 @@ use std::io;
 pub fn diff(store: &dyn ChunkStore, a: &Hash, b: &Hash) -> io::Result<Vec<DiffEntry>> {
     let mut out = Vec::new();
     diff_walk(store, a, b, |p| match (p.left, p.right) {
-        (Some(l), None) => out.push(DiffEntry::Removed { key: p.key, value: l }),
-        (None, Some(r)) => out.push(DiffEntry::Added { key: p.key, value: r }),
-        (Some(l), Some(r)) => out.push(DiffEntry::Modified { key: p.key, old: l, new: r }),
+        (Some(l), None) => out.push(DiffEntry::Removed {
+            key: p.key,
+            value: l,
+        }),
+        (None, Some(r)) => out.push(DiffEntry::Added {
+            key: p.key,
+            value: r,
+        }),
+        (Some(l), Some(r)) => out.push(DiffEntry::Modified {
+            key: p.key,
+            old: l,
+            new: r,
+        }),
         _ => {}
     })?;
     Ok(out)

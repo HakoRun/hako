@@ -19,8 +19,9 @@ pub fn pull(
     arch: String,
     into: Option<String>,
 ) -> io::Result<ExitCode> {
-    let image_ref = hako::ImageRef::parse(&image)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad image ref: {}", e)))?;
+    let image_ref = hako::ImageRef::parse(&image).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidInput, format!("bad image ref: {}", e))
+    })?;
     let container = into.unwrap_or_else(|| derive_container_name(&image_ref));
     let result_root = pull_into(ctx.state, &image_ref, &container, &os, &arch, per_layer)?;
     println!(

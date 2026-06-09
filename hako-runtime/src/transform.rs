@@ -297,13 +297,11 @@ fn run_outer(
     // Fork to escape the parent process; this also keeps the parent's
     // resources untouched if the child crashes during namespace setup.
     match unsafe { fork() }.map_err(|e| io_other(format!("fork: {}", e)))? {
-        ForkResult::Parent { child } => {
-            wait_for_child(child).map(|s| match s {
-                WaitStatus::Exited(_, code) => code,
-                WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
-                _ => 0,
-            })
-        }
+        ForkResult::Parent { child } => wait_for_child(child).map(|s| match s {
+            WaitStatus::Exited(_, code) => code,
+            WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
+            _ => 0,
+        }),
         ForkResult::Child => {
             let code = run_inner(store, root, command, detached, detached_state, volumes)
                 .unwrap_or_else(|e| {
@@ -772,7 +770,9 @@ fn exec_shell() -> Result<i32, RuntimeError> {
     let args: [&std::ffi::CStr; 1] = [&shell_cstr];
     nix::unistd::execvp(&shell_cstr, &args)
         .map_err(|e| io_other(format!("execvp {}: {}", shell, e)))?;
-    Err(io_other("execvp returned without error (impossible)".into()))
+    Err(io_other(
+        "execvp returned without error (impossible)".into(),
+    ))
 }
 
 fn exec_command(command: Vec<String>) -> Result<i32, RuntimeError> {
@@ -790,17 +790,29 @@ fn exec_command(command: Vec<String>) -> Result<i32, RuntimeError> {
     let args_ref: Vec<&std::ffi::CStr> = args.iter().map(|s| s.as_ref()).collect();
     nix::unistd::execvp(&program, &args_ref)
         .map_err(|e| io_other(format!("execvp {}: {}", command[0], e)))?;
-    Err(io_other("execvp returned without error (impossible)".into()))
+    Err(io_other(
+        "execvp returned without error (impossible)".into(),
+    ))
 }
 
 // ============================================================================
 // Mount helpers
 // ============================================================================
 
-fn bind_mount(src: impl AsRef<Path>, dst: impl AsRef<str>, flags: MsFlags) -> Result<(), RuntimeError> {
+fn bind_mount(
+    src: impl AsRef<Path>,
+    dst: impl AsRef<str>,
+    flags: MsFlags,
+) -> Result<(), RuntimeError> {
     let src = src.as_ref();
-    mount(Some(src), dst.as_ref(), None::<&str>, flags, None::<&str>)
-        .map_err(|e| io_other(format!("bind mount {} → {}: {}", src.display(), dst.as_ref(), e)))
+    mount(Some(src), dst.as_ref(), None::<&str>, flags, None::<&str>).map_err(|e| {
+        io_other(format!(
+            "bind mount {} → {}: {}",
+            src.display(),
+            dst.as_ref(),
+            e
+        ))
+    })
 }
 
 fn mount_kind(

@@ -52,20 +52,22 @@ mod bootstrap_wsl;
 // ============================================================================
 
 #[cfg(feature = "embedded")]
-pub(crate) const EMBEDDED_LINUX_X64: &[u8] =
-    include_bytes!("../../../vendored/hako-linux-x64");
+pub(crate) const EMBEDDED_LINUX_X64: &[u8] = include_bytes!("../../../vendored/hako-linux-x64");
 #[cfg(not(feature = "embedded"))]
 pub(crate) const EMBEDDED_LINUX_X64: &[u8] = &[];
 
 #[cfg(feature = "embedded")]
-pub(crate) const EMBEDDED_LINUX_ARM64: &[u8] =
-    include_bytes!("../../../vendored/hako-linux-arm64");
+pub(crate) const EMBEDDED_LINUX_ARM64: &[u8] = include_bytes!("../../../vendored/hako-linux-arm64");
 #[cfg(not(feature = "embedded"))]
 pub(crate) const EMBEDDED_LINUX_ARM64: &[u8] = &[];
 
 /// Pick the right embedded binary for the current host arch. ARM64 host
 /// uses arm64 binary if available, else falls back to x64 (Lima's
 /// rosetta layer can run x64 binaries on Apple Silicon, slowly).
+// In the default (non-`embedded`) build these consts are `&[]`, so clippy sees
+// `is_empty()` as a const `true`. With `--features embedded` they hold a real
+// ~10 MiB binary and the check is meaningful — the lint is build-config-blind.
+#[allow(clippy::const_is_empty)]
 pub(crate) fn embedded_for_host() -> &'static [u8] {
     if cfg!(target_arch = "aarch64") && !EMBEDDED_LINUX_ARM64.is_empty() {
         EMBEDDED_LINUX_ARM64
@@ -137,7 +139,10 @@ fn forward_windows(cwd: &Path, args: &[String]) -> io::Result<ExitCode> {
     let wsl_cwd = win_to_wsl_path(cwd);
     let translated_args = translate_w_flag_windows(args);
 
-    eprintln!("hako: forwarding to wsl -d {} (set HAKO_DISTRO to override)", distro);
+    eprintln!(
+        "hako: forwarding to wsl -d {} (set HAKO_DISTRO to override)",
+        distro
+    );
 
     let mut cmd = Command::new("wsl");
     cmd.args(["-d", &distro, "--cd", &wsl_cwd, "--", "hako"]);
@@ -152,7 +157,10 @@ fn forward_macos(_cwd: &Path, args: &[String]) -> io::Result<ExitCode> {
     // (`hako-runtime`) is what we forward into.
     let vm = bootstrap_lima::vm_name();
 
-    eprintln!("hako: forwarding to limactl shell {} (set HAKO_LIMA_VM to override)", vm);
+    eprintln!(
+        "hako: forwarding to limactl shell {} (set HAKO_LIMA_VM to override)",
+        vm
+    );
 
     // Lima's virtiofs typically mounts $HOME at the same path inside the VM,
     // so we don't need cwd translation. Limactl picks up the host cwd via

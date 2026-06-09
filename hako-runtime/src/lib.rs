@@ -183,7 +183,11 @@ impl std::fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RuntimeError::UnsupportedPlatform { operation, hint } => {
-                write!(f, "{} is not supported on this platform: {}", operation, hint)
+                write!(
+                    f,
+                    "{} is not supported on this platform: {}",
+                    operation, hint
+                )
             }
             RuntimeError::BranchNotFound(name) => write!(f, "branch not found: {}", name),
             RuntimeError::Io(e) => write!(f, "io error: {}", e),

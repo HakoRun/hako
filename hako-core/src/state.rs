@@ -150,10 +150,7 @@ impl State {
         validate_container_name(name)?;
         let cdir = self.containers_dir().join(name);
         if !cdir.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "no such container",
-            ));
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no such container"));
         }
         Repo::open(&cdir, &self.store)
     }
@@ -279,12 +276,18 @@ mod tests {
 
     #[test]
     fn parse_containers_list() {
-        assert_eq!(RouteTarget::parse("/containers"), RouteTarget::ContainersList);
+        assert_eq!(
+            RouteTarget::parse("/containers"),
+            RouteTarget::ContainersList
+        );
         assert_eq!(
             RouteTarget::parse("/containers/"),
             RouteTarget::ContainersList
         );
-        assert_eq!(RouteTarget::parse("containers"), RouteTarget::ContainersList);
+        assert_eq!(
+            RouteTarget::parse("containers"),
+            RouteTarget::ContainersList
+        );
     }
 
     #[test]

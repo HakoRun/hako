@@ -94,7 +94,11 @@ mod tests {
         let prefix = &h1.to_hex()[..6];
         let matches = s.find_by_prefix(prefix).unwrap();
         assert!(matches.contains(&h1));
-        assert_eq!(matches.len(), 1, "prefix of h1 should match exactly h1 (collision unlikely)");
+        assert_eq!(
+            matches.len(),
+            1,
+            "prefix of h1 should match exactly h1 (collision unlikely)"
+        );
     }
 
     #[test]

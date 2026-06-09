@@ -24,7 +24,11 @@ pub fn apply_cwd(session: &Session, raw: &str) -> String {
     }
     let cwd = session.cwd.trim_end_matches('/');
     if raw.is_empty() {
-        return if cwd.is_empty() { "/".to_string() } else { cwd.to_string() };
+        return if cwd.is_empty() {
+            "/".to_string()
+        } else {
+            cwd.to_string()
+        };
     }
     if cwd.is_empty() {
         format!("/{}", raw)
@@ -244,7 +248,9 @@ pub fn content_conflict(
     store: &dyn ChunkStore,
 ) -> io::Result<Option<ContentConflict>> {
     let (key, ours, theirs) = match c {
-        Conflict::BothModified { key, ours, theirs, .. } => (key, ours, theirs),
+        Conflict::BothModified {
+            key, ours, theirs, ..
+        } => (key, ours, theirs),
         Conflict::BothAdded { key, ours, theirs } => (key, ours, theirs),
         _ => return Ok(None),
     };
@@ -255,7 +261,11 @@ pub fn content_conflict(
     let ours_bytes = file_bytes_from_value(ours, store)?;
     let theirs_bytes = file_bytes_from_value(theirs, store)?;
     match (ours_bytes, theirs_bytes) {
-        (Some(o), Some(t)) => Ok(Some(ContentConflict { path, ours: o, theirs: t })),
+        (Some(o), Some(t)) => Ok(Some(ContentConflict {
+            path,
+            ours: o,
+            theirs: t,
+        })),
         _ => Ok(None),
     }
 }
@@ -441,11 +451,7 @@ pub fn create_host_symlink(target: &Path, link: &Path) -> io::Result<()> {
 
 /// Fetch the stored (mode, mtime) for a vfs path, if any. Returns `None` for
 /// directories (which currently don't carry metadata).
-pub fn entry_meta(
-    scoped: &ScopedFs<'_>,
-    root: &Hash,
-    src: &str,
-) -> io::Result<Option<(u32, u64)>> {
+pub fn entry_meta(scoped: &ScopedFs<'_>, root: &Hash, src: &str) -> io::Result<Option<(u32, u64)>> {
     let (parent, name) = match src.rsplit_once('/') {
         Some((p, n)) => (p, n),
         None => ("", src),
@@ -478,7 +484,10 @@ mod tests {
 
     #[test]
     fn split_ref_path_cases() {
-        assert_eq!(split_ref_path("HEAD:/file.txt"), (Some("HEAD"), "/file.txt"));
+        assert_eq!(
+            split_ref_path("HEAD:/file.txt"),
+            (Some("HEAD"), "/file.txt")
+        );
         assert_eq!(split_ref_path("dev:hello"), (Some("dev"), "hello"));
         assert_eq!(split_ref_path("/file:weird.txt"), (None, "/file:weird.txt"));
         assert_eq!(split_ref_path("a/b:c"), (None, "a/b:c"));
@@ -561,8 +570,14 @@ mod tests {
     #[test]
     fn resolve_cd_within_container() {
         let s = sess("main", "/start");
-        assert_eq!(resolve_cd(&s, "sub").unwrap(), ("main".into(), "/start/sub".into()));
-        assert_eq!(resolve_cd(&s, "/abs").unwrap(), ("main".into(), "/abs".into()));
+        assert_eq!(
+            resolve_cd(&s, "sub").unwrap(),
+            ("main".into(), "/start/sub".into())
+        );
+        assert_eq!(
+            resolve_cd(&s, "/abs").unwrap(),
+            ("main".into(), "/abs".into())
+        );
         assert_eq!(resolve_cd(&s, "..").unwrap(), ("main".into(), "/".into()));
     }
 

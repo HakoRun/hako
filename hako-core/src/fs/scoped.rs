@@ -182,10 +182,7 @@ impl<'s> ScopedFs<'s> {
     pub fn ls(&self, root: &Hash, path: &str) -> io::Result<Vec<DirChild>> {
         let key = normalize_path(path)?;
         if !key.is_empty() && !self.is_dir(root, &key)? {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "no such directory",
-            ));
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no such directory"));
         }
         let prefix = if key.is_empty() {
             String::new()
@@ -193,7 +190,13 @@ impl<'s> ScopedFs<'s> {
             format!("{}/", key)
         };
         let entries = tree::scan_prefix(self.store, root, prefix.as_bytes())?;
-        type ChildInfo = (DirKind, Option<u64>, Option<u32>, Option<u64>, Option<Vec<u8>>);
+        type ChildInfo = (
+            DirKind,
+            Option<u64>,
+            Option<u32>,
+            Option<u64>,
+            Option<Vec<u8>>,
+        );
         let mut seen: BTreeMap<String, ChildInfo> = BTreeMap::new();
         for (k, v) in entries {
             let suffix = &k[prefix.len()..];
@@ -204,16 +207,18 @@ impl<'s> ScopedFs<'s> {
             match slash_pos {
                 None => {
                     let name = std::str::from_utf8(suffix)
-                        .map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "non-utf8 path")
-                        })?
+                        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 path"))?
                         .to_string();
                     let bytes = require_inline(v)?;
                     let de = decode_entry(&bytes)?;
                     let info: ChildInfo = match de {
-                        DirEntry::File(f) => {
-                            (DirKind::File, Some(f.size), Some(f.mode), Some(f.mtime), None)
-                        }
+                        DirEntry::File(f) => (
+                            DirKind::File,
+                            Some(f.size),
+                            Some(f.mode),
+                            Some(f.mtime),
+                            None,
+                        ),
                         DirEntry::Directory => (DirKind::Directory, None, None, None, None),
                         DirEntry::Symlink(s) => (
                             DirKind::Symlink,
@@ -227,9 +232,7 @@ impl<'s> ScopedFs<'s> {
                 }
                 Some(p) => {
                     let name = std::str::from_utf8(&suffix[..p])
-                        .map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "non-utf8 path")
-                        })?
+                        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 path"))?
                         .to_string();
                     seen.entry(name)
                         .or_insert((DirKind::Directory, None, None, None, None));
@@ -238,14 +241,16 @@ impl<'s> ScopedFs<'s> {
         }
         Ok(seen
             .into_iter()
-            .map(|(name, (kind, size, mode, mtime, symlink_target))| DirChild {
-                name,
-                kind,
-                size,
-                mode,
-                mtime,
-                symlink_target,
-            })
+            .map(
+                |(name, (kind, size, mode, mtime, symlink_target))| DirChild {
+                    name,
+                    kind,
+                    size,
+                    mode,
+                    mtime,
+                    symlink_target,
+                },
+            )
             .collect())
     }
 
@@ -331,9 +336,7 @@ impl<'s> ScopedFs<'s> {
         // this, `bulk_build` ends up with two entries at the same key and
         // lookup returns the older one — i.e. cp/mv silently fail to
         // overwrite, and mv loses the source's contents (data loss).
-        dst_all.retain(|(k, _)| {
-            k != dst_key.as_bytes() && !k.starts_with(dst_pref.as_bytes())
-        });
+        dst_all.retain(|(k, _)| k != dst_key.as_bytes() && !k.starts_with(dst_pref.as_bytes()));
         dst_all.extend(to_add);
         tree::bulk_build(self.store, dst_all)
     }

@@ -25,7 +25,11 @@ impl<'a> Cursor<'a> {
     /// Open a cursor at the start of the tree. Lazily descended: the root
     /// is loaded but no descent happens until `current()`/`next()` is called.
     pub fn open(store: &'a dyn ChunkStore, root: Hash) -> io::Result<Self> {
-        let mut c = Cursor { store, stack: Vec::new(), done: true };
+        let mut c = Cursor {
+            store,
+            stack: Vec::new(),
+            done: true,
+        };
         if root == Hash::zero() {
             return Ok(c);
         }
@@ -69,7 +73,11 @@ impl<'a> Cursor<'a> {
                             Step::Done
                         }
                     }
-                    NodeKind::Internal { child_keys, child_hashes, .. } => {
+                    NodeKind::Internal {
+                        child_keys,
+                        child_hashes,
+                        ..
+                    } => {
                         let mut idx = child_keys.len();
                         for (i, k) in child_keys.iter().enumerate() {
                             if k.as_slice() >= key {
@@ -99,7 +107,10 @@ impl<'a> Cursor<'a> {
                 }
                 Step::Descend(h) => {
                     let child = load_node(self.store, &h)?;
-                    self.stack.push(Frame { node: child, pos: 0 });
+                    self.stack.push(Frame {
+                        node: child,
+                        pos: 0,
+                    });
                 }
             }
         }
@@ -122,6 +133,10 @@ impl<'a> Cursor<'a> {
     }
 
     /// Yield the entry under the cursor and advance.
+    // Deliberately named `next`, but this is a fallible streaming cursor
+    // (returns `io::Result`), not an `Iterator` — the standard trait can't
+    // express the I/O. The name mirrors the cursor vocabulary on purpose.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> io::Result<Option<(Vec<u8>, Value)>> {
         self.realize()?;
         if self.done {
@@ -183,9 +198,10 @@ impl<'a> Cursor<'a> {
             return Ok(());
         }
         let exhausted_internal = {
-            let frame = self.stack.last_mut().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "empty stack")
-            })?;
+            let frame = self
+                .stack
+                .last_mut()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty stack"))?;
             match &frame.node.kind {
                 NodeKind::Internal { child_hashes, .. } => {
                     if frame.pos >= child_hashes.len() {
@@ -252,7 +268,10 @@ impl<'a> Cursor<'a> {
                 Step::Ready => return Ok(()),
                 Step::Descend(h) => {
                     let child = load_node(self.store, &h)?;
-                    self.stack.push(Frame { node: child, pos: 0 });
+                    self.stack.push(Frame {
+                        node: child,
+                        pos: 0,
+                    });
                 }
                 Step::Bubble => {
                     self.stack.pop();
@@ -304,7 +323,10 @@ impl<'a> Cursor<'a> {
                 }
                 Some(h) => {
                     let child = load_node(self.store, &h)?;
-                    self.stack.push(Frame { node: child, pos: 0 });
+                    self.stack.push(Frame {
+                        node: child,
+                        pos: 0,
+                    });
                     return Ok(());
                 }
             }
@@ -347,8 +369,8 @@ mod tests {
             keys.push(k);
         }
         assert_eq!(keys.len(), 5);
-        for i in 0..5 {
-            assert_eq!(keys[i], format!("key-{:08}", i).into_bytes());
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(*k, format!("key-{:08}", i).into_bytes());
         }
     }
 

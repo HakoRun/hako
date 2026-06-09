@@ -89,9 +89,9 @@ pub fn branch(
         (Some(n), false) => {
             let target = match start {
                 Some(s) => resolve_commit(&repo, &s)?,
-                None => repo.head_commit()?.ok_or_else(|| {
-                    io::Error::other("no HEAD commit to branch from")
-                })?,
+                None => repo
+                    .head_commit()?
+                    .ok_or_else(|| io::Error::other("no HEAD commit to branch from"))?,
             };
             repo.write_ref(&n, target)?;
             println!("created branch {} at {}", n, &target.to_hex()[..12]);
@@ -115,7 +115,10 @@ pub fn checkout(ctx: &Ctx<'_>, branch: String, force: bool) -> io::Result<ExitCo
         }
     }
     let target = repo.read_ref(&branch)?.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, format!("no such branch: {}", branch))
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no such branch: {}", branch),
+        )
     })?;
     let tree = repo.load_commit(&target)?.tree;
     // Update working tree FIRST, then HEAD. If a crash interleaves, a
@@ -142,13 +145,19 @@ pub fn merge(
         return Ok(ExitCode::SUCCESS);
     }
     let branch = branch.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "merge requires a branch (or --abort)")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "merge requires a branch (or --abort)",
+        )
     })?;
     let head = repo
         .head_commit()?
         .ok_or_else(|| io::Error::other("no HEAD commit to merge into"))?;
     let theirs = repo.read_ref(&branch)?.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, format!("no such branch: {}", branch))
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no such branch: {}", branch),
+        )
     })?;
     if head == theirs {
         // Already pointing at the same commit — merging would create a
@@ -212,7 +221,12 @@ pub fn merge(
     let commit = repo.commit(merged_root, vec![head, theirs], &author, &msg, now_secs())?;
     let cur = repo.current_branch()?.unwrap();
     repo.write_ref(&cur, commit)?;
-    println!("merged {} into {} as {}", branch, cur, &commit.to_hex()[..12]);
+    println!(
+        "merged {} into {} as {}",
+        branch,
+        cur,
+        &commit.to_hex()[..12]
+    );
     Ok(ExitCode::SUCCESS)
 }
 

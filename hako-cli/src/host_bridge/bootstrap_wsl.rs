@@ -112,7 +112,8 @@ fn create_distro(name: &str) -> io::Result<()> {
 
     // Disable Windows PATH pollution and interop so commands inside the
     // distro don't accidentally pick up Windows .exes.
-    let wsl_conf = "[interop]\nappendWindowsPath=false\nenabled=false\n[automount]\nmountFsTab=false\n";
+    let wsl_conf =
+        "[interop]\nappendWindowsPath=false\nenabled=false\n[automount]\nmountFsTab=false\n";
     run_in_distro(
         name,
         &[
@@ -143,7 +144,18 @@ fn write_minimal_rootfs(path: &std::path::Path) -> io::Result<()> {
     let mut tar = tar::Builder::new(file);
 
     // Empty dirs WSL/Linux expect to exist.
-    for dir in &["bin", "etc", "tmp", "proc", "sys", "dev", "run", "usr", "usr/local", "usr/local/bin"] {
+    for dir in &[
+        "bin",
+        "etc",
+        "tmp",
+        "proc",
+        "sys",
+        "dev",
+        "run",
+        "usr",
+        "usr/local",
+        "usr/local/bin",
+    ] {
         let mut h = tar::Header::new_gnu();
         h.set_path(format!("{}/", dir)).map_err(io::Error::other)?;
         h.set_size(0);
@@ -309,7 +321,9 @@ mod tests {
 
     #[test]
     fn decode_utf16_without_bom() {
-        let bytes: &[u8] = &[b'a', 0, b'b', 0, b'c', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let bytes: &[u8] = &[
+            b'a', 0, b'b', 0, b'c', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         let s = decode_wsl_utf16(bytes);
         assert!(s.starts_with("abc"));
     }

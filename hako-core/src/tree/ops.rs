@@ -123,9 +123,7 @@ pub fn count(store: &dyn ChunkStore, root: &Hash) -> io::Result<u64> {
     let node = load_node(store, root)?;
     match node.kind {
         NodeKind::Leaf { entries } => Ok(entries.len() as u64),
-        NodeKind::Internal { child_counts, .. } => {
-            Ok(child_counts.iter().map(|&c| c as u64).sum())
-        }
+        NodeKind::Internal { child_counts, .. } => Ok(child_counts.iter().map(|&c| c as u64).sum()),
     }
 }
 
@@ -154,12 +152,7 @@ struct PathStep {
     chosen_idx: usize,
 }
 
-pub fn put(
-    store: &dyn ChunkStore,
-    root: &Hash,
-    key: Vec<u8>,
-    value: Value,
-) -> io::Result<Hash> {
+pub fn put(store: &dyn ChunkStore, root: &Hash, key: Vec<u8>, value: Value) -> io::Result<Hash> {
     if *root == Hash::zero() {
         return bulk_build(store, vec![(key, value)]);
     }
@@ -173,7 +166,10 @@ pub fn put(
     //     to children.len()-1 only when key > all child_keys), so the leaf
     //     is the absolute rightmost and the rightmost rule applies → safe.
     // In all cases cursor_safe(leaf_entries, path) is true; no fallback.
-    debug_assert!(cursor_safe(&leaf_entries, &path), "PUT cursor_safe invariant violated");
+    debug_assert!(
+        cursor_safe(&leaf_entries, &path),
+        "PUT cursor_safe invariant violated"
+    );
     let new_leaves = build_leaf_level(store, leaf_entries)?;
     splice_up(store, path, new_leaves, 0)
 }
@@ -308,9 +304,9 @@ fn splice_up(
         return Ok(Hash::zero());
     }
     while current_children.len() > 1 {
-        current_level = current_level.checked_add(1).ok_or_else(|| {
-            io::Error::other("tree exceeds 256 levels")
-        })?;
+        current_level = current_level
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("tree exceeds 256 levels"))?;
         current_children = build_internal_level(store, current_children, current_level)?;
     }
     Ok(current_children[0].hash)
@@ -319,10 +315,7 @@ fn splice_up(
 /// Take a flat list of entries and emit one or more leaf nodes, splitting
 /// at content-defined boundaries. Returns the resulting child refs (last
 /// key, hash, count) in order.
-fn build_leaf_level(
-    store: &dyn ChunkStore,
-    entries: Vec<Entry>,
-) -> io::Result<Vec<ChildRef>> {
+fn build_leaf_level(store: &dyn ChunkStore, entries: Vec<Entry>) -> io::Result<Vec<ChildRef>> {
     if entries.is_empty() {
         return Ok(Vec::new());
     }
@@ -429,10 +422,7 @@ fn build_internal_level(
     Ok(out)
 }
 
-pub fn bulk_build(
-    store: &dyn ChunkStore,
-    mut entries: Vec<(Vec<u8>, Value)>,
-) -> io::Result<Hash> {
+pub fn bulk_build(store: &dyn ChunkStore, mut entries: Vec<(Vec<u8>, Value)>) -> io::Result<Hash> {
     if entries.is_empty() {
         return Ok(Hash::zero());
     }
@@ -547,11 +537,7 @@ pub fn bulk_build(
         current_level = next;
         level = match level.checked_add(1) {
             Some(l) => l,
-            None => {
-                return Err(io::Error::other(
-                    "tree exceeds 256 levels",
-                ))
-            }
+            None => return Err(io::Error::other("tree exceeds 256 levels")),
         };
     }
 }
@@ -634,8 +620,8 @@ mod tests {
         // And scan returns all in order.
         let scanned = scan(&s, &root).unwrap();
         assert_eq!(scanned.len(), n);
-        for i in 0..n {
-            assert_eq!(scanned[i].0, format!("key-{:08}", i).into_bytes());
+        for (i, entry) in scanned.iter().enumerate() {
+            assert_eq!(entry.0, format!("key-{:08}", i).into_bytes());
         }
     }
 
@@ -679,13 +665,7 @@ mod tests {
     #[test]
     fn put_replaces_existing() {
         let s = MemStore::new();
-        let root = put(
-            &s,
-            &empty(),
-            b"k".to_vec(),
-            Value::Inline(b"v1".to_vec()),
-        )
-        .unwrap();
+        let root = put(&s, &empty(), b"k".to_vec(), Value::Inline(b"v1".to_vec())).unwrap();
         let root = put(&s, &root, b"k".to_vec(), Value::Inline(b"v2".to_vec())).unwrap();
         assert_eq!(
             get(&s, &root, b"k").unwrap(),
@@ -715,13 +695,7 @@ mod tests {
     #[test]
     fn delete_to_empty() {
         let s = MemStore::new();
-        let root = put(
-            &s,
-            &empty(),
-            b"k".to_vec(),
-            Value::Inline(b"v".to_vec()),
-        )
-        .unwrap();
+        let root = put(&s, &empty(), b"k".to_vec(), Value::Inline(b"v".to_vec())).unwrap();
         let root = delete(&s, &root, b"k").unwrap();
         assert_eq!(root, empty());
     }
@@ -786,7 +760,10 @@ mod tests {
         }
         let s_bulk = MemStore::new();
         let bulk_root = bulk_build(&s_bulk, entries(1000)).unwrap();
-        assert_eq!(root, bulk_root, "cursor put should yield same tree as bulk_build");
+        assert_eq!(
+            root, bulk_root,
+            "cursor put should yield same tree as bulk_build"
+        );
     }
 
     #[test]

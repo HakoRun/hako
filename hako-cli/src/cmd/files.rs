@@ -2,9 +2,8 @@
 
 use super::Ctx;
 use crate::helpers::{
-    apply_cwd, apply_host_meta, bytes_to_path, container_and_path, create_host_symlink,
-    entry_meta, host_meta, path_to_bytes, resolve_tree, split_ref_path, with_target,
-    with_target_mut,
+    apply_cwd, apply_host_meta, bytes_to_path, container_and_path, create_host_symlink, entry_meta,
+    host_meta, path_to_bytes, resolve_tree, split_ref_path, with_target, with_target_mut,
 };
 use hako::fs::{DEFAULT_FILE_MODE, DEFAULT_SYMLINK_MODE};
 use hako::{Hash, RouteTarget, ScopedFs};
@@ -105,7 +104,12 @@ pub fn import(ctx: &Ctx<'_>, src: PathBuf, dst: String) -> io::Result<ExitCode> 
         let new_root = import_path(&scoped, &root, &src, p, &mut count)?;
         repo.set_working(new_root)
     })?;
-    println!("imported {} file(s) from {} to {}", count, src.display(), dst);
+    println!(
+        "imported {} file(s) from {} to {}",
+        count,
+        src.display(),
+        dst
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -122,7 +126,12 @@ pub fn export(ctx: &Ctx<'_>, src: String, dst: PathBuf, force: bool) -> io::Resu
         export_path(&scoped, &root, p, &dst, force, &mut count)?;
         Ok(())
     })?;
-    println!("exported {} file(s) from {} to {}", count, src, dst.display());
+    println!(
+        "exported {} file(s) from {} to {}",
+        count,
+        src,
+        dst.display()
+    );
     Ok(ExitCode::SUCCESS)
 }
 

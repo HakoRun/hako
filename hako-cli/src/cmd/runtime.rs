@@ -23,7 +23,11 @@ pub fn run(
     let volumes = build_volumes(ctx, &volumes, no_workspace)?;
     let repo = ctx.state.open_container(ctx.default_container)?;
     if detach {
-        let cmd = if command.is_empty() { None } else { Some(command) };
+        let cmd = if command.is_empty() {
+            None
+        } else {
+            Some(command)
+        };
         let id = hako_runtime::transform::run_container_detached(&repo, &branch, cmd, &volumes)
             .map_err(runtime_to_io)?;
         println!("{}", id);
@@ -70,17 +74,14 @@ fn build_volumes(
 ) -> io::Result<Vec<VolumeMount>> {
     let mut user_volumes: Vec<VolumeMount> = specs
         .iter()
-        .map(|s| {
-            VolumeMount::parse(s).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
-        })
+        .map(|s| VolumeMount::parse(s).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e)))
         .collect::<io::Result<_>>()?;
 
     if no_workspace {
         return Ok(user_volumes);
     }
 
-    let user_already_mounted_workspace =
-        user_volumes.iter().any(|v| v.container == "/workspace");
+    let user_already_mounted_workspace = user_volumes.iter().any(|v| v.container == "/workspace");
     if !user_already_mounted_workspace {
         let mut all = Vec::with_capacity(user_volumes.len() + 1);
         all.push(VolumeMount {

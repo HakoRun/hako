@@ -21,8 +21,8 @@ use crate::io_util::now_secs_or_zero;
 use crate::store::ChunkStore;
 use crate::tree;
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyWrite, Request, TimeOrNow,
 };
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -63,8 +63,7 @@ pub fn mount_session(
     let fs = HakoFs::new(store, Arc::new(Mutex::new(root)), /* writable */ false);
     let mut opts = ro_opts();
     opts.push(MountOption::AllowOther);
-    let session =
-        fuser::Session::new(fs, mountpoint, &opts).map_err(io::Error::other)?;
+    let session = fuser::Session::new(fs, mountpoint, &opts).map_err(io::Error::other)?;
     session.spawn().map_err(io::Error::other)
 }
 
@@ -82,8 +81,7 @@ pub fn mount_session_rw(
     let root_mu = Arc::new(Mutex::new(root));
     let fs = HakoFs::new(store, Arc::clone(&root_mu), /* writable */ true);
     let opts = rw_opts();
-    let session =
-        fuser::Session::new(fs, mountpoint, &opts).map_err(io::Error::other)?;
+    let session = fuser::Session::new(fs, mountpoint, &opts).map_err(io::Error::other)?;
     let bg = session.spawn().map_err(io::Error::other)?;
     Ok(RwSession {
         _bg: bg,
@@ -185,7 +183,10 @@ impl HakoFs {
         F: FnOnce(&Hash, &ScopedFs<'_>) -> io::Result<Hash>,
     {
         if !self.writable {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "read-only mount"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "read-only mount",
+            ));
         }
         let mut root = self.root.lock().unwrap();
         let scoped = ScopedFs::new(&*self.store);
@@ -238,7 +239,11 @@ fn entry_to_attr(
         crtime: t,
         kind,
         perm: (mode & 0o7777) as u16,
-        nlink: if matches!(kind, FileType::Directory) { 2 } else { 1 },
+        nlink: if matches!(kind, FileType::Directory) {
+            2
+        } else {
+            1
+        },
         uid: 0,
         gid: 0,
         rdev: 0,

@@ -30,10 +30,8 @@ pub fn three_way_merge(
         });
     }
 
-    let base_map: BTreeMap<Vec<u8>, Value> =
-        super::ops::scan(store, base)?.into_iter().collect();
-    let ours_map: BTreeMap<Vec<u8>, Value> =
-        super::ops::scan(store, ours)?.into_iter().collect();
+    let base_map: BTreeMap<Vec<u8>, Value> = super::ops::scan(store, base)?.into_iter().collect();
+    let ours_map: BTreeMap<Vec<u8>, Value> = super::ops::scan(store, ours)?.into_iter().collect();
     let theirs_map: BTreeMap<Vec<u8>, Value> =
         super::ops::scan(store, theirs)?.into_iter().collect();
 

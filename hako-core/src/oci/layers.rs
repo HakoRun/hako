@@ -86,11 +86,9 @@ pub fn apply_tar_layer(
             root = scoped.write_symlink(&root, &norm, &target, mode, mtime)?;
         } else if kind.is_hard_link() {
             // Hardlinks point to another path already placed in the tree.
-            let target = header
-                .link_name_bytes()
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "hardlink without target")
-                })?;
+            let target = header.link_name_bytes().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "hardlink without target")
+            })?;
             let target_norm = normalize_archive_path(&target)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad hardlink path"))?;
             root = scoped.cp_to(&root, &root, &target_norm, &norm)?;
@@ -244,7 +242,12 @@ mod tests {
                 Vec::new(),
                 None,
             ),
-            ("app/fresh.txt", tar::EntryType::Regular, b"new".to_vec(), None),
+            (
+                "app/fresh.txt",
+                tar::EntryType::Regular,
+                b"new".to_vec(),
+                None,
+            ),
         ]);
         let root = apply_tar_layer(&fs, base, &tar).unwrap();
         assert!(!fs.exists(&root, "app/a.txt").unwrap());

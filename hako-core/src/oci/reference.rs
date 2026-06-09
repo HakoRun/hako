@@ -17,7 +17,10 @@ impl ImageRef {
     pub fn parse(s: &str) -> io::Result<Self> {
         let s = s.trim();
         if s.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty image ref"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty image ref",
+            ));
         }
 
         // Split off registry: the first path segment is a registry iff it

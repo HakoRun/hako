@@ -57,7 +57,12 @@ pub fn ls(ctx: &Ctx<'_>, path: Option<String>) -> io::Result<ExitCode> {
 
 pub fn cd(ctx: &Ctx<'_>, path: String) -> io::Result<ExitCode> {
     let (new_container, new_cwd) = resolve_cd(ctx.session, &path)?;
-    if !ctx.state.list_containers()?.iter().any(|c| c == &new_container) {
+    if !ctx
+        .state
+        .list_containers()?
+        .iter()
+        .any(|c| c == &new_container)
+    {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("no such container: {}", new_container),
@@ -145,7 +150,9 @@ pub fn tree(ctx: &Ctx<'_>, path: Option<String>, depth: Option<usize>) -> io::Re
 
 pub fn status(ctx: &Ctx<'_>) -> io::Result<ExitCode> {
     let repo = ctx.state.open_container(ctx.default_container)?;
-    let branch = repo.current_branch()?.unwrap_or_else(|| "(detached)".into());
+    let branch = repo
+        .current_branch()?
+        .unwrap_or_else(|| "(detached)".into());
     let head_tree = repo.head_tree()?;
     let work_tree = repo.working_tree()?;
     println!("on branch {}", branch);

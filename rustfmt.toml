@@ -1,0 +1,4 @@
+# Stable rustfmt configuration. Pin the edition so formatting is identical
+# locally and in CI regardless of the toolchain default.
+edition = "2021"
+max_width = 100
