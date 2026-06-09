@@ -109,13 +109,15 @@ already-applied steps are skipped via a hash recorded in `.hako/applied`.
 > **Isolation.** `hako run` runs the container rootless in user, mount, PID,
 > IPC, UTS, and network namespaces, with a fresh procfs, a private `/tmp`, no
 > host `$HOME`, private mount propagation, and a `pivot_root` rootfs (writable;
-> writes are ephemeral) — similar in posture to rootless Podman. Network is
-> **isolated by default for `run`** (opt in when a workload needs egress);
-> `apply` keeps host networking so setup steps can install dependencies. It is
-> not yet a hardened multi-tenant sandbox — no seccomp filter or cgroup limits,
-> and the command runs as PID 1 without an init reaper — so prefer trusted
-> images for now. (`hako run` requires a Linux runtime; on Windows/macOS it is
-> bridged into WSL2 / Lima.)
+> writes are ephemeral) — similar in posture to rootless Podman. The workload
+> runs under a minimal **PID-1 init** that reaps orphaned processes and forwards
+> `SIGTERM`/`SIGINT`, so `hako stop` shuts it down cleanly; `hako exec` enters
+> all of the container's namespaces. Network is **isolated by default for `run`**
+> (opt in when a workload needs egress); `apply` keeps host networking so setup
+> steps can install dependencies. It is not yet a hardened multi-tenant sandbox —
+> no seccomp filter or cgroup limits, and `/sys` is a host bind — so prefer
+> trusted images for now. (`hako run` requires a Linux runtime; on Windows/macOS
+> it is bridged into WSL2 / Lima.)
 
 ## Architecture
 

@@ -123,13 +123,13 @@ fn ro_opts() -> Vec<MountOption> {
 }
 
 fn rw_opts() -> Vec<MountOption> {
-    // No AllowOther: this is mounted inside a user namespace by the runtime,
-    // where allow_other makes the mount serve empty (see mount_session).
-    vec![
-        MountOption::RW,
-        MountOption::FSName("hako".into()),
-        MountOption::AutoUnmount,
-    ]
+    // No AllowOther and no AutoUnmount: this is mounted inside a user namespace
+    // by the runtime. allow_other serves an empty mount in a non-init userns,
+    // and AutoUnmount forces the fusermount3 helper (which on shared-propagation
+    // systems doesn't propagate the mount back, and prints a spurious
+    // "not mounted" on teardown). fuser mounts via mount(2) in-process instead;
+    // cleanup is via session drop + mount-namespace teardown. See mount_session.
+    vec![MountOption::RW, MountOption::FSName("hako".into())]
 }
 
 struct HakoFs {

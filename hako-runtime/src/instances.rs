@@ -156,13 +156,25 @@ pub fn create(
 /// platforms where the start time isn't readable, we fall back to
 /// pid-only and accept the small risk.
 pub fn write_pid(workdir: &Path, id: &str, pid: u32) -> Result<(), RuntimeError> {
-    let dir = instance_dir(workdir, id);
-    fs::create_dir_all(&dir)?;
+    write_pidfile(&instance_dir(workdir, id), "pid", pid)
+}
+
+/// Record the container's PID-1 (the process that owns the container's PID,
+/// network, IPC, and UTS namespaces) host-visible pid. This is the target for
+/// `hako exec` (setns into its namespaces) and `hako stop` (signal it so its
+/// init forwards to the workload). Distinct from the supervisor `pid`, which
+/// owns the FUSE mount and is used for liveness.
+pub fn write_nspid(workdir: &Path, id: &str, pid: u32) -> Result<(), RuntimeError> {
+    write_pidfile(&instance_dir(workdir, id), "nspid", pid)
+}
+
+fn write_pidfile(dir: &Path, name: &str, pid: u32) -> Result<(), RuntimeError> {
+    fs::create_dir_all(dir)?;
     let line = match read_starttime(pid) {
         Some(st) => format!("{}:{}", pid, st),
         None => pid.to_string(),
     };
-    write_atomic(&dir.join("pid"), line.as_bytes())
+    write_atomic(&dir.join(name), line.as_bytes())
 }
 
 /// Record the supervising process exit code. Called when the process dies.
@@ -181,14 +193,19 @@ pub fn read_pid(workdir: &Path, id: &str) -> Option<u32> {
 /// Read (pid, start_time) from disk. Start time is `None` for entries
 /// written on platforms where /proc/PID/stat wasn't available.
 pub fn read_pid_with_starttime(workdir: &Path, id: &str) -> Option<(u32, Option<u64>)> {
-    let s = fs::read_to_string(instance_dir(workdir, id).join("pid")).ok()?;
+    read_pidfile(workdir, id, "pid")
+}
+
+/// Read the container PID-1 host pid (see `write_nspid`), if recorded.
+pub fn read_nspid_with_starttime(workdir: &Path, id: &str) -> Option<(u32, Option<u64>)> {
+    read_pidfile(workdir, id, "nspid")
+}
+
+fn read_pidfile(workdir: &Path, id: &str, name: &str) -> Option<(u32, Option<u64>)> {
+    let s = fs::read_to_string(instance_dir(workdir, id).join(name)).ok()?;
     let s = s.trim();
     match s.split_once(':') {
-        Some((pid_s, st_s)) => {
-            let pid = pid_s.parse().ok()?;
-            let st = st_s.parse().ok();
-            Some((pid, st))
-        }
+        Some((pid_s, st_s)) => Some((pid_s.parse().ok()?, st_s.parse().ok())),
         None => Some((s.parse().ok()?, None)),
     }
 }
@@ -269,13 +286,18 @@ pub fn remove(workdir: &Path, id: &str, force: bool) -> Result<(), RuntimeError>
     Ok(())
 }
 
-/// Send SIGTERM to the supervising process. Validates start_time before
-/// killing so we don't shoot a recycled pid that belongs to someone else.
+/// Send SIGTERM to the container's PID-1. Its init (`reap_as_init`) installs a
+/// handler that forwards the signal to the workload, so the container shuts down
+/// gracefully and the supervisor then tears down the FUSE mount. Falls back to
+/// the supervisor pid for instances with no recorded nspid (e.g. one that never
+/// finished starting). Validates start_time first to avoid signalling a
+/// recycled pid.
 #[cfg(unix)]
 pub fn stop(workdir: &Path, id: &str) -> Result<(), RuntimeError> {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
-    let (pid, recorded_start) = read_pid_with_starttime(workdir, id)
+    let (pid, recorded_start) = read_nspid_with_starttime(workdir, id)
+        .or_else(|| read_pid_with_starttime(workdir, id))
         .ok_or_else(|| RuntimeError::Other(format!("instance {} has no pid", id)))?;
     if !process_matches(pid, recorded_start) {
         return Err(RuntimeError::Other(format!(

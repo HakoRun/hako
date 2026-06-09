@@ -12,6 +12,12 @@
 
 set -u
 HAKO="${HAKO:-hako}"
+# Resolve a relative path (e.g. target/debug/hako) to absolute BEFORE we cd into
+# a temp dir below — otherwise every hako call silently fails and the absence
+# checks become false passes. A bare command name (on PATH) is left as-is.
+case "$HAKO" in
+  */*) HAKO="$(cd "$(dirname "$HAKO")" && pwd)/$(basename "$HAKO")" ;;
+esac
 # `hako run` takes a BRANCH name; a fresh `hako init` container's branch is `main`.
 BRANCH="${HAKO_BRANCH:-main}"
 
@@ -25,11 +31,23 @@ bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=1; }
 check() { if eval "$2"; then pass "$1"; else bad "$1 (got: ${3:-?})"; fi; }
 
 echo "hako isolation check  (binary: $HAKO)"
-"$HAKO" init >/dev/null
+if ! "$HAKO" init >/dev/null 2>&1; then
+  echo "FATAL: '$HAKO init' failed — binary not found or not runnable" >&2
+  exit 2
+fi
 
-# HAKO_RUN_FLAGS lets callers pass extra `run` flags (e.g. --no-workspace while
-# writable-rootfs/volume support is still landing).
-run() { "$HAKO" run ${HAKO_RUN_FLAGS:-} "$BRANCH" sh -c "$1" 2>/dev/null; }
+# HAKO_RUN_FLAGS lets callers pass extra `run` flags (e.g. --no-workspace).
+# Use an ABSOLUTE /bin/sh: bare `sh` relies on the container PATH resolving it,
+# which isn't guaranteed across environments (e.g. CI runners) and would make
+# the run produce no output — silently turning absence checks into false passes.
+run() { "$HAKO" run ${HAKO_RUN_FLAGS:-} "$BRANCH" /bin/sh -c "$1" 2>/dev/null; }
+
+# Preflight: the container must actually run, or the absence checks below would
+# pass vacuously. Fail loudly if a trivial command doesn't round-trip.
+if [ "$(run 'echo HAKO_RUNS')" != "HAKO_RUNS" ]; then
+  echo "FATAL: container did not run (\`hako run\` produced no output)" >&2
+  exit 2
+fi
 
 # 1. PID namespace — the container must NOT see host processes. With a private
 #    PID namespace the highest visible pid is tiny (its own pid 1 + the probe).

@@ -54,3 +54,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # Runs the real container runtime and asserts the isolation properties
+  # (private PID view, no host $HOME, private /tmp, network isolation). This is
+  # the only automated coverage of the security-critical transform.rs path.
+  isolation:
+    name: isolation (linux runtime)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare runtime prerequisites
+        run: |
+          sudo apt-get update && sudo apt-get install -y libfuse3-dev pkg-config
+          # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor;
+          # the rootless runtime needs them.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p hako-cli
+      - name: Verify container isolation
+        run: HAKO=target/debug/hako HAKO_RUN_FLAGS=--no-workspace bash scripts/isolation-check.sh

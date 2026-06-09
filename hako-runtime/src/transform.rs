@@ -159,7 +159,9 @@ pub fn run_container_detached(
     volumes: &[VolumeMount],
 ) -> Result<String, RuntimeError> {
     let (store, root) = resolve_branch(repo, branch)?;
-    let workdir = repo.root().to_path_buf();
+    // Instance state lives at the WORKSPACE level (`<ws>/.hako/runtime`), the
+    // same place the CLI's ps/exec/stop look — NOT under the per-container dir.
+    let workdir = hako_dir(repo)?;
     let id = instances::generate_id();
     let cmd_for_record = command.clone().unwrap_or_default();
     instances::create(&workdir, &id, branch, &cmd_for_record)?;
@@ -184,6 +186,13 @@ pub fn run_container_detached(
             // Best-effort — if we can't write the pid, we still try to run.
             let _ = instances::write_pid(&workdir, &id, pid);
 
+            // Fully detach from the parent's stdio. Otherwise the supervisor (and
+            // the command_setup/container_init it forks) keep the parent's
+            // inherited stdout/stderr open, so `id=$(hako run -d ...)` blocks
+            // until the workload exits. The workload's own stdout/stderr are
+            // captured to the instance log files by `redirect_output`.
+            detach_stdio();
+
             let exit_code = match run_inner(
                 store,
                 root,
@@ -206,14 +215,13 @@ pub fn run_container_detached(
 
 /// Run `command` inside the namespaces of an already-running instance.
 ///
-/// Behaves like `docker exec`: opens the supervising process's user and
-/// mount namespaces via `/proc/<pid>/ns/{user,mnt}`, fork+`setns`+exec.
-/// Order matters: enter the user namespace FIRST so we acquire the caps
-/// needed to enter the mount namespace afterwards.
+/// Behaves like `docker exec`. Enters ALL of the container's namespaces by
+/// joining those of the container's PID-1 (`nspid`) — user, IPC, UTS, network,
+/// PID, and mount — so the exec'd process lands in the same sandbox as the
+/// workload (same process view, same isolated network), not just user+mount.
 ///
-/// Refuses to run if the recorded pid no longer matches the recorded
-/// start_time — that pid was recycled by an unrelated process and we'd
-/// be entering the wrong sandbox.
+/// Liveness is checked against the supervising process; refuses if the instance
+/// isn't running or hasn't recorded its namespace pid yet.
 pub fn exec_in_instance(
     workdir: &Path,
     id: &str,
@@ -222,28 +230,43 @@ pub fn exec_in_instance(
     if command.is_empty() {
         return Err(RuntimeError::Other("command is empty".into()));
     }
-    let (pid, recorded_st) = instances::read_pid_with_starttime(workdir, id)
-        .ok_or_else(|| RuntimeError::InstanceNotFound(id.into()))?;
-    // Validate the pid still belongs to our supervising process. The same
-    // check `is_running` would do — duplicated here so we can give a
-    // clearer error before forking.
-    {
-        let inst = instances::get(workdir, id)?;
-        if !inst.is_running() {
-            return Err(RuntimeError::Other(format!(
-                "instance {} is not running (pid {} has exited or was recycled)",
-                id, pid
-            )));
-        }
-        let _ = recorded_st;
+    let inst = instances::get(workdir, id)?;
+    if !inst.is_running() {
+        return Err(RuntimeError::Other(format!(
+            "instance {} is not running (it has exited or its pid was recycled)",
+            id
+        )));
     }
+    // Target the container's PID-1, which owns the pid/net/ipc/uts namespaces.
+    let (nspid, _st) = instances::read_nspid_with_starttime(workdir, id).ok_or_else(|| {
+        RuntimeError::Other(format!(
+            "instance {} is still starting (no namespace pid yet)",
+            id
+        ))
+    })?;
 
-    // Open the namespace fds in the parent so the error path is clean if
-    // /proc/PID/ns/* doesn't exist.
-    let user_ns = fs::File::open(format!("/proc/{}/ns/user", pid))
-        .map_err(|e| io_other(format!("open user ns: {}", e)))?;
-    let mnt_ns = fs::File::open(format!("/proc/{}/ns/mnt", pid))
-        .map_err(|e| io_other(format!("open mnt ns: {}", e)))?;
+    // Open every namespace fd up front so the error path is clean. Order of the
+    // setns calls (below) matters; this open order does not.
+    let open_ns = |kind: &str| -> Result<fs::File, RuntimeError> {
+        fs::File::open(format!("/proc/{}/ns/{}", nspid, kind))
+            .map_err(|e| io_other(format!("open {} ns of pid {}: {}", kind, nspid, e)))
+    };
+    // (file, flag) in the order they must be entered: user FIRST (for caps),
+    // mount LAST, PID before the fork below.
+    let user_ns = open_ns("user")?;
+    let ipc_ns = open_ns("ipc")?;
+    let uts_ns = open_ns("uts")?;
+    let net_ns = open_ns("net")?;
+    let pid_ns = open_ns("pid")?;
+    let mnt_ns = open_ns("mnt")?;
+    let ns_order: [(&fs::File, CloneFlags); 6] = [
+        (&user_ns, CloneFlags::CLONE_NEWUSER),
+        (&ipc_ns, CloneFlags::CLONE_NEWIPC),
+        (&uts_ns, CloneFlags::CLONE_NEWUTS),
+        (&net_ns, CloneFlags::CLONE_NEWNET),
+        (&pid_ns, CloneFlags::CLONE_NEWPID),
+        (&mnt_ns, CloneFlags::CLONE_NEWNS),
+    ];
 
     match unsafe { fork() }.map_err(|e| io_other(format!("fork: {}", e)))? {
         ForkResult::Parent { child } => wait_for_child(child).map(|s| match s {
@@ -252,7 +275,7 @@ pub fn exec_in_instance(
             _ => 0,
         }),
         ForkResult::Child => {
-            let code = enter_and_exec(&user_ns, &mnt_ns, command).unwrap_or_else(|e| {
+            let code = enter_and_exec(&ns_order, command).unwrap_or_else(|e| {
                 eprintln!("hako exec: {}", e);
                 1
             });
@@ -262,26 +285,48 @@ pub fn exec_in_instance(
 }
 
 fn enter_and_exec(
-    user_ns: &fs::File,
-    mnt_ns: &fs::File,
+    ns_order: &[(&fs::File, CloneFlags)],
     command: Vec<String>,
 ) -> Result<i32, RuntimeError> {
-    // User ns first — we need its caps to enter mnt ns.
-    setns(user_ns.as_fd(), CloneFlags::CLONE_NEWUSER)
-        .map_err(|e| io_other(format!("setns user: {}", e)))?;
-    setns(mnt_ns.as_fd(), CloneFlags::CLONE_NEWNS)
-        .map_err(|e| io_other(format!("setns mnt: {}", e)))?;
-
-    // setns doesn't change cwd; the inherited cwd may not exist in the
-    // new mount ns. chdir to / which is guaranteed to be the pivoted root.
-    env::set_current_dir("/")?;
-
-    exec_command(command)
+    // Enter each namespace. User first (we need its caps to join the others);
+    // mount last. setns(CLONE_NEWPID) only moves *future children* into the PID
+    // namespace, so we fork after.
+    for (file, flag) in ns_order {
+        setns(file.as_fd(), *flag).map_err(|e| io_other(format!("setns {:?}: {}", flag, e)))?;
+    }
+    match unsafe { fork() }.map_err(|e| io_other(format!("exec fork: {}", e)))? {
+        ForkResult::Parent { child } => wait_for_child(child).map(|s| match s {
+            WaitStatus::Exited(_, code) => code,
+            WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
+            _ => 0,
+        }),
+        ForkResult::Child => {
+            // cwd from the host may not exist in the container's mount ns.
+            env::set_current_dir("/")?;
+            exec_command(command)
+        }
+    }
 }
 
 // ============================================================================
 // Internals
 // ============================================================================
+
+/// The workspace `.hako` directory for a container repo. `repo.root()` is
+/// `<ws>/.hako/containers/<name>`, so `.hako` is two levels up. This is where
+/// the shared object store (`objects/`) and instance state (`runtime/`) live.
+fn hako_dir(repo: &Repo<'_>) -> Result<PathBuf, RuntimeError> {
+    repo.root()
+        .parent()
+        .and_then(|p| p.parent())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            io_other(format!(
+                "cannot locate .hako from {}",
+                repo.root().display()
+            ))
+        })
+}
 
 fn resolve_branch(
     repo: &Repo<'_>,
@@ -301,17 +346,7 @@ fn resolve_branch(
     // levels up. (cmd::mount uses `<workdir>/.hako/objects` for the same reason;
     // pointing at `repo.root()/objects` yields an empty store and an empty
     // rootfs.)
-    let dot_hako = repo
-        .root()
-        .parent()
-        .and_then(|p| p.parent())
-        .ok_or_else(|| {
-            io_other(format!(
-                "cannot locate .hako objects from container root {}",
-                repo.root().display()
-            ))
-        })?;
-    let objs_path = dot_hako.join(hako::state::OBJECTS);
+    let objs_path = hako_dir(repo)?.join(hako::state::OBJECTS);
     let store: Arc<dyn ChunkStore + Send + Sync + 'static> = Arc::new(FsStore::new(objs_path)?);
     Ok((store, tree_root))
 }
@@ -631,6 +666,12 @@ fn run_command_setup(
 
     match unsafe { fork() }.map_err(|e| io_other(format!("pidns fork: {}", e)))? {
         ForkResult::Parent { child } => {
+            // Record the container PID-1's host pid so `hako exec` can setns into
+            // its namespaces and `hako stop` can signal it (its init forwards to
+            // the workload). Only meaningful for detached instances.
+            if let Some((workdir, id)) = detached_state {
+                let _ = instances::write_nspid(workdir, id, child.as_raw() as u32);
+            }
             let status = wait_for_child(child)?;
             Ok(match status {
                 WaitStatus::Exited(_, code) => code,
@@ -715,12 +756,44 @@ fn container_init(
     }
 }
 
-/// Minimal `init` for PID 1 of the container's PID namespace. Reaps zombies of
-/// orphaned processes (reparented to us) while the workload runs, and returns
-/// the workload's exit code as soon as it exits. Any still-running background
-/// processes are then killed by the kernel when PID 1 exits and the PID
-/// namespace is torn down — matching `docker run` semantics.
+/// The container workload's pid (in the container's PID namespace), for the
+/// signal-forwarding handler below. Set once by `reap_as_init` before installing
+/// the handler; only read from the handler. `0` means "not set".
+static WORKLOAD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Signal handler installed in the container's PID 1: forward SIGTERM/SIGINT to
+/// the workload. PID 1 ignores un-handled signals from an ancestor namespace, so
+/// without this `hako stop` (SIGTERM to PID 1) and Ctrl-C would never reach the
+/// workload. `kill` is async-signal-safe.
+extern "C" fn forward_signal(sig: libc::c_int) {
+    let pid = WORKLOAD_PID.load(std::sync::atomic::Ordering::SeqCst);
+    if pid > 0 {
+        unsafe {
+            libc::kill(pid, sig);
+        }
+    }
+}
+
+/// Minimal `init` for PID 1 of the container's PID namespace. Forwards
+/// SIGTERM/SIGINT to the workload, reaps zombies of orphaned processes
+/// (reparented to us) while the workload runs, and returns the workload's exit
+/// code as soon as it exits. Any still-running background processes are then
+/// killed by the kernel when PID 1 exits and the PID namespace is torn down —
+/// matching `docker run` semantics.
 fn reap_as_init(workload: Pid) -> Result<i32, RuntimeError> {
+    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+    WORKLOAD_PID.store(workload.as_raw(), std::sync::atomic::Ordering::SeqCst);
+    let action = SigAction::new(
+        SigHandler::Handler(forward_signal),
+        SaFlags::empty(), // no SA_RESTART: let waitpid return EINTR so we loop
+        SigSet::empty(),
+    );
+    // Safe: forward_signal only does an async-signal-safe kill().
+    unsafe {
+        let _ = sigaction(Signal::SIGTERM, &action);
+        let _ = sigaction(Signal::SIGINT, &action);
+    }
+
     loop {
         match waitpid(Pid::from_raw(-1), None) {
             Ok(WaitStatus::Exited(pid, code)) if pid == workload => return Ok(code),
@@ -731,6 +804,26 @@ fn reap_as_init(workload: Pid) -> Result<i32, RuntimeError> {
             // No children left (workload already reaped, or none) — done.
             Err(nix::errno::Errno::ECHILD) => return Ok(0),
             Err(e) => return Err(io_other(format!("init reap waitpid: {}", e))),
+        }
+    }
+}
+
+/// Point stdin/stdout/stderr at /dev/null, releasing the parent's inherited
+/// stdio so a detached supervisor (and the processes it forks) don't keep the
+/// caller's pipes open. Best-effort: if /dev/null can't be opened we leave the
+/// inherited fds in place.
+fn detach_stdio() {
+    use std::os::unix::io::AsRawFd;
+    if let Ok(devnull) = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+    {
+        // SAFETY: dup2 with valid fd numbers.
+        unsafe {
+            libc::dup2(devnull.as_raw_fd(), libc::STDIN_FILENO);
+            libc::dup2(devnull.as_raw_fd(), libc::STDOUT_FILENO);
+            libc::dup2(devnull.as_raw_fd(), libc::STDERR_FILENO);
         }
     }
 }
