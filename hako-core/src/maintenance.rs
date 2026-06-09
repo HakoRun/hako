@@ -58,6 +58,17 @@ fn union_repo_reachable(repo: &Repo<'_>, out: &mut HashSet<Hash>) -> io::Result<
             }
         }
     }
+    // Every tag. Tags are a pinned, immutable reference namespace separate
+    // from branches; a commit reachable *only* through a tag (e.g. the branch
+    // was moved off it) must NOT be collected — otherwise `gc` deletes the
+    // tagged snapshot's objects.
+    for tag in repo.list_tags()? {
+        if let Some(commit) = repo.read_tag(&tag)? {
+            for h in repo.reachable_objects(commit)? {
+                out.insert(h);
+            }
+        }
+    }
     // Working tree may differ from HEAD; walk it explicitly so an in-progress
     // edit isn't garbage-collected. `working_tree` returns `Hash::zero()` for
     // a never-touched workspace — skip that case.
@@ -131,6 +142,23 @@ pub fn fsck(state: &State) -> io::Result<FsckReport> {
                     report.problems.push((
                         commit_hash,
                         format!("container {}, branch {}: {}", container, branch, e),
+                    ));
+                }
+            }
+        }
+        // Tags are roots too — walk them so tag-only-reachable objects are
+        // verified (and, in gc, preserved).
+        for tag in repo.list_tags()? {
+            let commit_hash = match repo.read_tag(&tag)? {
+                Some(c) => c,
+                None => continue,
+            };
+            match repo.reachable_objects(commit_hash) {
+                Ok(set) => all_reachable.extend(set),
+                Err(e) => {
+                    report.problems.push((
+                        commit_hash,
+                        format!("container {}, tag {}: {}", container, tag, e),
                     ));
                 }
             }
@@ -217,6 +245,41 @@ mod tests {
         assert_eq!(report.deleted, 1);
         assert!(report.bytes_freed > 0);
         assert!(!repo.store().has(&orphan).unwrap());
+    }
+
+    #[test]
+    fn gc_preserves_tag_only_reachable_commit() {
+        // A commit reachable ONLY through a tag (no branch points at it or a
+        // descendant) must survive gc. Regression for tag-blind reachability.
+        let (_d, s) = init_with_one_container();
+        let repo = s.open_container("hako").unwrap();
+        let scoped = crate::ScopedFs::new(repo.store());
+
+        // Commit c1 holds a blob reachable only via the tag we make below.
+        let base = repo.working_tree().unwrap();
+        let w1 = scoped
+            .write_file(&base, "tagged.txt", b"only-reachable-via-tag")
+            .unwrap();
+        let c1 = repo.commit(w1, vec![], "u", "tagged", 0).unwrap();
+        repo.write_tag("v1", c1).unwrap();
+
+        // Point main (and WORKING) at an unrelated commit that does NOT
+        // contain tagged.txt, so the only path to c1's objects is the tag.
+        let c2 = repo.commit(base, vec![], "u", "main-tip", 0).unwrap();
+        repo.write_ref("main", c2).unwrap();
+        repo.set_working(base).unwrap();
+
+        gc(&s, false).unwrap();
+
+        // The tagged commit, its tree, and its blob must all still load.
+        let t1 = repo
+            .load_commit(&c1)
+            .expect("tagged commit must survive gc")
+            .tree;
+        assert_eq!(
+            scoped.read_file(&t1, "tagged.txt").unwrap(),
+            b"only-reachable-via-tag"
+        );
     }
 
     #[test]

@@ -107,6 +107,16 @@ pub fn decode(data: &[u8]) -> io::Result<Node> {
             kind: NodeKind::Leaf { entries },
         })
     } else {
+        // An internal node must have at least one child. Rejecting n == 0 here
+        // prevents a corrupt/adversarial 4-byte object from decoding into an
+        // empty internal node, which would later underflow `find_path`
+        // (child_keys.len() - 1) during a put/delete.
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "internal node with no children",
+            ));
+        }
         let mut child_keys = Vec::with_capacity(n);
         let mut child_hashes = Vec::with_capacity(n);
         for _ in 0..n {
@@ -297,6 +307,14 @@ mod tests {
     fn decode_rejects_unknown_tag() {
         // version=1, level=0, count=1, key_len=1, "k", tag=0xFF
         let bad = vec![NODE_VERSION, 0, 0, 1, 0, 1, b'k', 0xFF];
+        assert!(decode(&bad).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_empty_internal_node() {
+        // version=1, level=1 (internal), count=0. Must be rejected so it can
+        // never reach find_path and underflow `child_keys.len() - 1`.
+        let bad = vec![NODE_VERSION, 1, 0, 0];
         assert!(decode(&bad).is_err());
     }
 

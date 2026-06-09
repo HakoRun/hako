@@ -13,7 +13,14 @@ pub fn commit(ctx: &Ctx<'_>, message: String, author: String) -> io::Result<Exit
     let repo = ctx.state.open_container(ctx.default_container)?;
     let work = repo.working_tree()?;
     let head = repo.head_commit()?;
-    if Some(work) == head.map(|h| repo.load_commit(&h).map(|c| c.tree).unwrap_or(Hash::zero())) {
+    // Propagate (don't swallow) a failure to load HEAD: a corrupt/missing HEAD
+    // commit must surface as an error, not be masked as a tree mismatch that
+    // then commits on top of the unreadable parent.
+    let head_tree = match head {
+        Some(h) => Some(repo.load_commit(&h)?.tree),
+        None => None,
+    };
+    if Some(work) == head_tree {
         eprintln!("nothing to commit (working tree matches HEAD)");
         return Ok(ExitCode::from(1));
     }

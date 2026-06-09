@@ -5,7 +5,16 @@
 version = 2
 # Fail on packages pulled from a source with a known security advisory.
 yanked = "deny"
-ignore = []
+ignore = [
+    # fuser: "uninitialized memory read & leak". In a transitive position
+    # (FUSE mount layer); no fixed release of fuser exists. Tracked in the
+    # code review; revisit when fuser ships a fix.
+    "RUSTSEC-2021-0154",
+    # rustls-webpki: reachable panic parsing a certificate revocation list.
+    # hako only performs plain HTTPS GETs to OCI registries and never parses
+    # CRLs, so this path is not reachable in our usage. Revisit on upgrade.
+    "RUSTSEC-2026-0104",
+]
 
 [licenses]
 version = 2
@@ -22,6 +31,8 @@ allow = [
     "Zlib",
     "MPL-2.0",
     "CC0-1.0",
+    "BSL-1.0",              # xxhash-rust
+    "CDLA-Permissive-2.0", # webpki-roots (Mozilla CA bundle)
 ]
 confidence-threshold = 0.8
 

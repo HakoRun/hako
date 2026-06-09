@@ -504,6 +504,35 @@ fn run() -> io::Result<ExitCode> {
         })
         .unwrap_or_else(|| cfg.default_container.clone());
 
+    // Auto-bootstrap on explicit container override (-c X / `as X cmd`):
+    // if the named container doesn't exist, treat the name as an OCI image
+    // ref and pull it. Same "do whatever it takes" intent as `hako is X`,
+    // applied to the one-off form. Only fires when -c was explicitly given,
+    // not when default_container is coming from session/config.
+    //
+    // This is a *mutating* operation (create container + write refs), so it
+    // must be serialized even when the command itself is read-only or
+    // long-running (which skip the command lock below). We take a short-lived
+    // lock here, re-check existence under it (another process may have just
+    // created the container), pull, then release before dispatch — so a
+    // long-running `run`/`exec` doesn't hold the lock for its whole lifetime.
+    if let Some(explicit) = &cli.container {
+        if !state.list_containers()?.iter().any(|c| c == explicit) {
+            let _pull_lock = WorkspaceLock::acquire(&dot)?;
+            // Re-check under the lock to avoid a TOCTOU double-pull / create
+            // race between concurrent invocations.
+            if !state.list_containers()?.iter().any(|c| c == explicit) {
+                let image_ref = hako::ImageRef::parse(explicit).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("no container {} and not a valid image ref: {}", explicit, e),
+                    )
+                })?;
+                cmd::oci::pull_into(&state, &image_ref, explicit, "linux", "amd64", false)?;
+            }
+        }
+    }
+
     // Acquire the workspace lock around any operation that mutates workspace
     // state. Skipped for long-running commands (mount, runtime is/as/spawn)
     // and for read-only inspection commands; those would either deadlock
@@ -513,23 +542,6 @@ fn run() -> io::Result<ExitCode> {
     } else {
         None
     };
-
-    // Auto-bootstrap on explicit container override (-c X / `as X cmd`):
-    // if the named container doesn't exist, treat the name as an OCI image
-    // ref and pull it. Same "do whatever it takes" intent as `hako is X`,
-    // applied to the one-off form. Only fires when -c was explicitly given,
-    // not when default_container is coming from session/config.
-    if let Some(explicit) = &cli.container {
-        if !state.list_containers()?.iter().any(|c| c == explicit) {
-            let image_ref = hako::ImageRef::parse(explicit).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("no container {} and not a valid image ref: {}", explicit, e),
-                )
-            })?;
-            cmd::oci::pull_into(&state, &image_ref, explicit, "linux", "amd64", false)?;
-        }
-    }
 
     let ctx = Ctx {
         state: &state,

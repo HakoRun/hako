@@ -190,6 +190,37 @@ fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         s.to_string()
     } else {
-        format!("{}…", &s[..n.saturating_sub(1)])
+        // Snap the cut to a UTF-8 char boundary so multibyte content (any
+        // non-ASCII setup string from hako.toml) can't panic the slice.
+        let mut end = n.saturating_sub(1).min(s.len());
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate("echo hi", 80), "echo hi");
+    }
+
+    #[test]
+    fn truncate_does_not_panic_on_multibyte_boundary() {
+        // Each "é" is 2 bytes; cutting mid-char must snap to a boundary,
+        // not panic. Exercise every cut length across a multibyte string.
+        let s = "ééééééééééééééééééé"; // 19 × 2 bytes
+        for n in 0..=s.len() + 2 {
+            let t = truncate(s, n); // old impl panicked here on odd n
+            if n < s.len() {
+                assert!(t.ends_with('…'), "n={n} should mark truncation");
+            } else {
+                assert_eq!(t, s);
+            }
+        }
     }
 }

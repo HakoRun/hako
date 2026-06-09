@@ -238,6 +238,15 @@ fn find_path(
             } => {
                 // Find the smallest i such that child_keys[i] >= key.
                 // (child_keys[i] is the LAST key in child[i]'s subtree.)
+                // Defense in depth: `decode` rejects empty internal nodes, so
+                // child_keys is non-empty here — but guard the subtraction so a
+                // future decode path can never turn this into an underflow.
+                if child_keys.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "internal node with no children",
+                    ));
+                }
                 let chosen_idx = match child_keys.iter().position(|k| k.as_slice() >= key) {
                     Some(i) => i,
                     // Key falls past every subtree — descend into the rightmost,
