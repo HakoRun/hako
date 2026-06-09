@@ -114,10 +114,12 @@ already-applied steps are skipped via a hash recorded in `.hako/applied`.
 > `SIGTERM`/`SIGINT`, so `hako stop` shuts it down cleanly; `hako exec` enters
 > all of the container's namespaces. Network is **isolated by default for `run`**
 > (opt in when a workload needs egress); `apply` keeps host networking so setup
-> steps can install dependencies. It is not yet a hardened multi-tenant sandbox —
-> no seccomp filter or cgroup limits, and `/sys` is a host bind — so prefer
-> trusted images for now. (`hako run` requires a Linux runtime; on Windows/macOS
-> it is bridged into WSL2 / Lima.)
+> steps can install dependencies. The workload runs under a **seccomp filter** that
+> blocks dangerous syscalls (module loading, kexec/reboot, mount, kernel keyring,
+> bpf, …). It is not yet a hardened multi-tenant sandbox — no cgroup resource
+> limits yet, and `/sys` is a host bind — so prefer trusted images for now.
+> (`hako run` requires a Linux runtime; on Windows/macOS it is bridged into
+> WSL2 / Lima.)
 
 ## Architecture
 
