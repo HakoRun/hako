@@ -27,25 +27,35 @@
 //!  └── fork() ──── parent: waitpid(child); return exit code
 //!       │
 //!       child:
-//!         unshare(CLONE_NEWUSER | CLONE_NEWNS)
+//!         unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS)
 //!         write /proc/self/{uid_map, setgroups, gid_map}
 //!         fork() ──── fuse_server:
-//!         │             mount_session() → background FUSE thread
+//!         │             mount_session() → background FUSE thread (mount(2),
+//!         │               not the fusermount3 helper)
 //!         │             signal command_setup
-//!         │             waitpid(command_setup)
-//!         │             exit with command_setup's status
+//!         │             waitpid(command_setup); exit with its status
 //!         │
 //!         command_setup:
 //!           wait for fuse-ready signal
-//!           setup_bind_mounts(/tmp/hako-transform)
-//!           setup_special_mounts(/tmp/hako-transform)
-//!           pivot_root into mount
-//!           execvp(shell or command)
+//!           unshare(CLONE_NEWNS)   ← own mount ns, so pivot_root below doesn't
+//!                                    detach the store from the FUSE server
+//!           make_rprivate()
+//!           unshare(CLONE_NEWPID)
+//!           fork() ──── parent: waitpid(container_init); return its status
+//!                   └── container_init  (PID 1 of the new PID namespace):
+//!                         setup_bind_mounts / special_mounts (fresh procfs)
+//!                         unshare(CLONE_NEWNET)   (isolated `run`)
+//!                         pivot_root(".", ".") into the FUSE rootfs
+//!                         execvp(shell or command)
 //! ```
 //!
-//! When the user shell exits, the kernel sends SIGCHLD to the FUSE server,
-//! it `exit`s, the FUSE thread dies with the process, and `AutoUnmount`
-//! unmounts the FUSE mount automatically.
+//! Isolation for `run`: user + mount + IPC + UTS + PID + network namespaces,
+//! a fresh procfs, private mount propagation, no host `$HOME`, and a private
+//! tmpfs `/tmp`. `apply` keeps host networking (no NEWNET) so setup steps can
+//! install dependencies.
+//!
+//! When the command exits, the FUSE server's `waitpid` returns and it drops the
+//! session, which unmounts the FUSE mount.
 
 use crate::instances;
 use crate::{RuntimeError, VolumeMount};
@@ -285,12 +295,16 @@ fn resolve_branch(
     // levels up. (cmd::mount uses `<workdir>/.hako/objects` for the same reason;
     // pointing at `repo.root()/objects` yields an empty store and an empty
     // rootfs.)
-    let dot_hako = repo.root().parent().and_then(|p| p.parent()).ok_or_else(|| {
-        io_other(format!(
-            "cannot locate .hako objects from container root {}",
-            repo.root().display()
-        ))
-    })?;
+    let dot_hako = repo
+        .root()
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| {
+            io_other(format!(
+                "cannot locate .hako objects from container root {}",
+                repo.root().display()
+            ))
+        })?;
     let objs_path = dot_hako.join(hako::state::OBJECTS);
     let store: Arc<dyn ChunkStore + Send + Sync + 'static> = Arc::new(FsStore::new(objs_path)?);
     Ok((store, tree_root))
@@ -595,6 +609,47 @@ fn run_command_setup(
     // Stop our mounts from propagating to/from the host namespace.
     make_rprivate()?;
 
+    // Create the container's PID namespace, then fork: the child becomes PID 1
+    // of the new namespace, mounts a fresh procfs (so the container cannot see
+    // host processes), and execs the command; this process stays in the host PID
+    // namespace and waits, propagating the child's exit code.
+    //
+    // CLONE_NEWPID can't go in the shared run_inner unshare — once a PID
+    // namespace is pending there, the FUSE server can no longer spawn its serve
+    // thread (a thread can't be created into a not-yet-populated PID namespace).
+    unshare(CloneFlags::CLONE_NEWPID).map_err(|e| io_other(format!("unshare pidns: {}", e)))?;
+
+    match unsafe { fork() }.map_err(|e| io_other(format!("pidns fork: {}", e)))? {
+        ForkResult::Parent { child } => {
+            let status = wait_for_child(child)?;
+            Ok(match status {
+                WaitStatus::Exited(_, code) => code,
+                WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
+                _ => 0,
+            })
+        }
+        ForkResult::Child => {
+            // PID 1 of the container's PID namespace. Never returns on success.
+            let code = container_init(command, detached, detached_state, volumes, net_isolated)
+                .unwrap_or_else(|e| {
+                    eprintln!("hako runtime: {}", e);
+                    1
+                });
+            std::process::exit(code);
+        }
+    }
+}
+
+/// Runs as PID 1 of the container's PID namespace, sharing the caller's mount
+/// namespace: finish mount setup, mount a fresh procfs, isolate the network,
+/// `pivot_root`, and exec. Never returns on success.
+fn container_init(
+    command: Option<Vec<String>>,
+    detached: bool,
+    detached_state: Option<&(PathBuf, String)>,
+    volumes: &[VolumeMount],
+    net_isolated: bool,
+) -> Result<i32, RuntimeError> {
     // The container root is the read-only FUSE tree mounted at MOUNTPOINT.
     // (overlayfs-over-FUSE was tried for a writable root but is broken for exec
     // on this kernel — stat works, mmap/exec of the lower file does not.)
@@ -616,8 +671,7 @@ fn run_command_setup(
     // (creating a netns in run_inner breaks fusermount3). Only the command's
     // process tree gets the empty netns; the FUSE server keeps host net.
     if net_isolated {
-        unshare(CloneFlags::CLONE_NEWNET)
-            .map_err(|e| io_other(format!("unshare netns: {}", e)))?;
+        unshare(CloneFlags::CLONE_NEWNET).map_err(|e| io_other(format!("unshare netns: {}", e)))?;
     }
 
     pivot_into(root)?;
@@ -735,11 +789,12 @@ fn setup_special_mounts(root: &str) -> Result<(), RuntimeError> {
     fs::create_dir_all(&shm)?;
     mount_kind("tmpfs", &shm, "tmpfs", MsFlags::empty(), Some("mode=1777"))?;
 
-    // === /proc: bind from host for now. A fresh procfs (hiding host PIDs)
-    // requires a PID namespace — that's Increment 2 (fork-to-PID-1). ===
+    // === /proc: a FRESH procfs reflecting the container's PID namespace. The
+    // caller (container_init) is PID 1 of a new PID namespace, so this shows only
+    // the container's own processes, not the host's. ===
     let proc_path = format!("{}/proc", root);
     fs::create_dir_all(&proc_path)?;
-    bind_mount("/proc", &proc_path, MsFlags::MS_BIND | MsFlags::MS_REC)?;
+    mount_kind("proc", &proc_path, "proc", MsFlags::empty(), None)?;
 
     // === /sys: bind from host ===
     let sys_path = format!("{}/sys", root);
