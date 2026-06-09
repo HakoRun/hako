@@ -725,6 +725,9 @@ fn container_init(
         unshare(CloneFlags::CLONE_NEWNET).map_err(|e| io_other(format!("unshare netns: {}", e)))?;
     }
 
+    // /sys after the netns unshare: a fresh read-only sysfs needs the owned netns.
+    setup_sysfs(root, net_isolated)?;
+
     pivot_into(root)?;
 
     // For interactive use, chdir to /workspace if it exists (the default
@@ -1018,11 +1021,50 @@ fn setup_special_mounts(root: &str) -> Result<(), RuntimeError> {
     fs::create_dir_all(&proc_path)?;
     mount_kind("proc", &proc_path, "proc", MsFlags::empty(), None)?;
 
-    // === /sys: bind from host ===
+    // /sys is mounted separately (setup_sysfs), AFTER the network namespace is
+    // unshared — a fresh read-only sysfs requires owning the netns.
+
+    Ok(())
+}
+
+/// Mount `/sys` in the container. When the container owns its network namespace
+/// (`run` default), mount a FRESH read-only sysfs: this avoids exposing the
+/// host's sysfs (cgroup/kernel internals, writable host-owned nodes) and
+/// reflects the container's own empty network. When networking is shared
+/// (`apply`, or `run --network`) we don't own a netns, so the kernel refuses a
+/// fresh sysfs mount; fall back to a read-only recursive bind of the host /sys
+/// (defense-in-depth — at least the top mount is read-only).
+///
+/// Must be called AFTER any `unshare(CLONE_NEWNET)`.
+fn setup_sysfs(root: &str, net_isolated: bool) -> Result<(), RuntimeError> {
     let sys_path = format!("{}/sys", root);
     fs::create_dir_all(&sys_path)?;
+    let ro = MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
+    if net_isolated
+        && mount(
+            Some("sysfs"),
+            sys_path.as_str(),
+            Some("sysfs"),
+            ro,
+            None::<&str>,
+        )
+        .is_ok()
+    {
+        return Ok(());
+    }
+    // Fallback (shared netns, e.g. `apply`): bind the host /sys, then a
+    // best-effort read-only remount of the TOP mount. A recursive RO remount is
+    // refused (EPERM) for submounts we don't own, and we must not fail the run
+    // over it — so this is non-recursive and best-effort; if even that is denied
+    // the bind stays read-write (the prior behavior).
     bind_mount("/sys", &sys_path, MsFlags::MS_BIND | MsFlags::MS_REC)?;
-
+    let _ = mount(
+        None::<&str>,
+        sys_path.as_str(),
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+        None::<&str>,
+    );
     Ok(())
 }
 

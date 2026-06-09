@@ -144,10 +144,20 @@ works). `HAKO_NO_SECCOMP` skips it. Verified: `mount` inside a container returns
 `EPERM` with the filter on and runs (different errno) with it off, while the full
 isolation check still passes.
 
+### Read-only `/sys` — DONE
+
+`/sys` is now mounted after the netns unshare. For `run` (owns its netns) it's a
+**fresh read-only sysfs** (`ro,nosuid,nodev,noexec`) — no host sysfs exposure
+(cgroup/kernel internals) and it reflects the container's own empty network. For
+shared-netns cases (`apply`) the kernel refuses a fresh sysfs mount, so it falls
+back to a host `/sys` bind with a best-effort read-only remount of the top mount
+(a recursive RO remount is refused for submounts we don't own; the bind stays rw
+if even the top can't be remounted, matching prior behavior). Verified: writes to
+`/sys` in a `run` container fail with EROFS, and `apply` still completes.
+
 ### Still open
-- Hardening: cgroup v2 resource limits (pids/memory — needs delegation), a fresh
-  read-only `/sys` (currently a recursive host bind), recursive read-only for
-  `:ro` volumes.
+- Hardening: cgroup v2 resource limits (pids/memory — needs delegation),
+  recursive read-only for `:ro` volumes.
 - Ephemeral `run` writes create orphan store objects until `gc`; consider a
   scratch overlay or a dedicated ephemeral chunk area.
 - CI runs `scripts/isolation-check.sh` on a Linux runner (the `isolation` job)
