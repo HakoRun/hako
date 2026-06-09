@@ -835,7 +835,7 @@ fn wait_for_child(pid: Pid) -> Result<WaitStatus, RuntimeError> {
 }
 
 fn io_other(msg: String) -> RuntimeError {
-    RuntimeError::Io(std::io::Error::new(std::io::ErrorKind::Other, msg))
+    RuntimeError::Io(std::io::Error::other(msg))
 }
 
 // Suppress unused-imports / dead_code on intentional uid/gid type imports
