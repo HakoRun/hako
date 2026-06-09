@@ -326,8 +326,16 @@ fn run_inner(
     let uid = getuid();
     let gid = getgid();
 
-    unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS)
-        .map_err(|e| io_other(format!("unshare: {}", e)))?;
+    // `run` is the running-container boundary: isolate IPC + UTS alongside
+    // user + mount. Network is isolated later, per-command, in
+    // run_command_setup — doing it here breaks fusermount3's FUSE mount.
+    unshare(
+        CloneFlags::CLONE_NEWUSER
+            | CloneFlags::CLONE_NEWNS
+            | CloneFlags::CLONE_NEWIPC
+            | CloneFlags::CLONE_NEWUTS,
+    )
+    .map_err(|e| io_other(format!("unshare: {}", e)))?;
 
     fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid))?;
     fs::write("/proc/self/setgroups", "deny\n")?;
@@ -347,6 +355,7 @@ fn run_inner(
                 detached,
                 detached_state.as_ref(),
                 &volumes,
+                true, // net_isolated: `run` has no network by default
             )
         }
         ForkResult::Parent { child } => {
@@ -472,8 +481,16 @@ fn run_inner_rw(
     let uid = getuid();
     let gid = getgid();
 
-    unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS)
-        .map_err(|e| io_other(format!("unshare: {}", e)))?;
+    // `apply` is the build phase: isolate IPC + UTS but keep host network so
+    // setup steps (pip/apk/apt …) can reach the internet. Network isolation for
+    // builds is opt-in (a future `--no-network`).
+    unshare(
+        CloneFlags::CLONE_NEWUSER
+            | CloneFlags::CLONE_NEWNS
+            | CloneFlags::CLONE_NEWIPC
+            | CloneFlags::CLONE_NEWUTS,
+    )
+    .map_err(|e| io_other(format!("unshare: {}", e)))?;
 
     fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid))?;
     fs::write("/proc/self/setgroups", "deny\n")?;
@@ -489,7 +506,7 @@ fn run_inner_rw(
             drop(fuse_sock);
             // The pipe to outer is for the FUSE server only.
             let _ = nix::unistd::close(outer_pipe_fd);
-            run_command_setup(shell_sock, Some(command), false, None, &volumes)
+            run_command_setup(shell_sock, Some(command), false, None, &volumes, false)
         }
         ForkResult::Parent { child } => {
             drop(shell_sock);
@@ -546,6 +563,7 @@ fn run_command_setup(
     detached: bool,
     detached_state: Option<&(PathBuf, String)>,
     volumes: &[VolumeMount],
+    net_isolated: bool,
 ) -> Result<i32, RuntimeError> {
     // Wait for FUSE-ready signal from the FUSE-server process.
     let mut sock = sync_sock;
@@ -554,7 +572,12 @@ fn run_command_setup(
         .map_err(|e| io_other(format!("await fuse ready: {}", e)))?;
     drop(sock);
 
-    setup_bind_mounts(MOUNTPOINT)?;
+    // Stop our mounts from propagating to/from the host namespace. Done after
+    // the FUSE mount is established (making `/` rprivate before it interferes
+    // with fusermount3's mount becoming visible here).
+    make_rprivate()?;
+
+    setup_bind_mounts(MOUNTPOINT, net_isolated)?;
     setup_special_mounts(MOUNTPOINT)?;
     setup_user_volumes(MOUNTPOINT, volumes)?;
 
@@ -564,6 +587,14 @@ fn run_command_setup(
         if let Some((workdir, id)) = detached_state {
             redirect_output(workdir, id)?;
         }
+    }
+
+    // Isolate the command's network now — AFTER the FUSE mount is established
+    // (creating a netns in run_inner breaks fusermount3). Only the command's
+    // process tree gets the empty netns; the FUSE server keeps host net.
+    if net_isolated {
+        unshare(CloneFlags::CLONE_NEWNET)
+            .map_err(|e| io_other(format!("unshare netns: {}", e)))?;
     }
 
     pivot_into(MOUNTPOINT)?;
@@ -607,29 +638,37 @@ fn redirect_output(workdir: &Path, id: &str) -> Result<(), RuntimeError> {
 // Mount setup
 // ============================================================================
 
-fn setup_bind_mounts(root: &str) -> Result<(), RuntimeError> {
-    if let Some(home) = dirs::home_dir() {
-        let user = env::var("USER").unwrap_or_else(|_| "user".into());
-        let target = format!("{}/home/{}", root, user);
-        fs::create_dir_all(&target)?;
-        bind_mount(&home, &target, MsFlags::MS_BIND | MsFlags::MS_REC)?;
-    }
+fn setup_bind_mounts(root: &str, net_isolated: bool) -> Result<(), RuntimeError> {
+    // The host $HOME is deliberately NOT mounted: exposing it leaks the user's
+    // credentials (ssh keys, cloud tokens) into every container, and creating
+    // `/home/<user>` writes into the read-only rootfs (EROFS) when it's absent.
 
-    // /tmp — bind so user-side temp files survive into the container.
+    // Private /tmp — a fresh tmpfs, never the host's. `mount` over the existing
+    // `/tmp` is a VFS op, so it works even on the read-only rootfs (no write to
+    // the underlying tree). Container temp files stay inside the container.
     let tmp_target = format!("{}/tmp", root);
-    fs::create_dir_all(&tmp_target)?;
-    bind_mount("/tmp", &tmp_target, MsFlags::MS_BIND)?;
+    mount_kind(
+        "tmpfs",
+        &tmp_target,
+        "tmpfs",
+        MsFlags::empty(),
+        Some("mode=1777"),
+    )?;
 
-    // Essential read-from-host files (DNS, host map).
-    for file in &["/etc/resolv.conf", "/etc/hosts"] {
-        if Path::new(file).exists() {
-            let target = format!("{}{}", root, file);
-            if let Some(parent) = Path::new(&target).parent() {
-                fs::create_dir_all(parent)?;
+    // DNS / host files are only relevant — and only writable into the rootfs —
+    // when the container has network. For an isolated `run`, skip them entirely.
+    if !net_isolated {
+        for file in &["/etc/resolv.conf", "/etc/hosts"] {
+            if Path::new(file).exists() {
+                let target = format!("{}{}", root, file);
+                if let Some(parent) = Path::new(&target).parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if !Path::new(&target).exists() {
+                    fs::write(&target, "")?;
+                }
+                bind_mount(file, &target, MsFlags::MS_BIND)?;
             }
-            // Create an empty file to mount over.
-            fs::write(&target, "")?;
-            bind_mount(file, &target, MsFlags::MS_BIND)?;
         }
     }
 
@@ -824,6 +863,20 @@ fn mount_kind(
 ) -> Result<(), RuntimeError> {
     mount(Some(src), dst, Some(fstype), flags, data)
         .map_err(|e| io_other(format!("mount {} ({}): {}", dst, fstype, e)))
+}
+
+/// Recursively mark the mount namespace private so mounts we set up here do not
+/// propagate back to the host namespace (and host mount events don't leak in).
+/// Must run after `unshare(CLONE_NEWNS)` and before any other mount.
+fn make_rprivate() -> Result<(), RuntimeError> {
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        None::<&str>,
+    )
+    .map_err(|e| io_other(format!("make / rprivate: {}", e)))
 }
 
 // ============================================================================

@@ -26,7 +26,9 @@ check() { if eval "$2"; then pass "$1"; else bad "$1 (got: ${3:-?})"; fi; }
 echo "hako isolation check  (binary: $HAKO)"
 "$HAKO" init >/dev/null
 
-run() { "$HAKO" run "$CONTAINER" sh -c "$1" 2>/dev/null; }
+# HAKO_RUN_FLAGS lets callers pass extra `run` flags (e.g. --no-workspace while
+# writable-rootfs/volume support is still landing).
+run() { "$HAKO" run ${HAKO_RUN_FLAGS:-} "$CONTAINER" sh -c "$1" 2>/dev/null; }
 
 # 1. PID namespace — the container must NOT see host processes. With a private
 #    PID namespace the highest visible pid is tiny (its own pid 1 + the probe).
