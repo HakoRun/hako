@@ -27,9 +27,11 @@ check() { if eval "$2"; then pass "$1"; else bad "$1 (got: ${3:-?})"; fi; }
 echo "hako isolation check  (binary: $HAKO)"
 "$HAKO" init >/dev/null
 
-# HAKO_RUN_FLAGS lets callers pass extra `run` flags (e.g. --no-workspace while
-# writable-rootfs/volume support is still landing).
-run() { "$HAKO" run ${HAKO_RUN_FLAGS:-} "$BRANCH" sh -c "$1" 2>/dev/null; }
+# HAKO_RUN_FLAGS lets callers pass extra `run` flags (e.g. --no-workspace).
+# Use an ABSOLUTE /bin/sh: bare `sh` relies on the container PATH resolving it,
+# which isn't guaranteed across environments (e.g. CI runners) and would make
+# the run produce no output — silently turning absence checks into false passes.
+run() { "$HAKO" run ${HAKO_RUN_FLAGS:-} "$BRANCH" /bin/sh -c "$1" 2>/dev/null; }
 
 # 1. PID namespace — the container must NOT see host processes. With a private
 #    PID namespace the highest visible pid is tiny (its own pid 1 + the probe).
