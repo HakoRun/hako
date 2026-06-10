@@ -663,13 +663,13 @@ fn run() -> io::Result<ExitCode> {
             arch,
         } => cmd::oci::pull(&ctx, image, per_layer, os, arch, into),
 
-        // Mount (Linux/macOS only)
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        // Mount (Linux only — macOS/Windows bridge runtime ops into a Linux VM)
+        #[cfg(target_os = "linux")]
         Cmd::Mount { mountpoint, from } => cmd::mount::mount(&ctx, mountpoint, from),
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(target_os = "linux"))]
         Cmd::Mount { .. } => Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "hako mount uses FUSE and is only supported on Linux and macOS",
+            "hako mount uses FUSE and is only supported natively on Linux",
         )),
 
         // Identity

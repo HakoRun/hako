@@ -1,6 +1,6 @@
 pub mod config;
 pub mod fs;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 pub mod fuse;
 pub mod hash;
 pub mod io_util;
