@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "hako"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "flate2",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "hako-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "hako",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "hako-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "dirs",
@@ -1483,7 +1483,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
 ]

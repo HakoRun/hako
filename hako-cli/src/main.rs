@@ -16,7 +16,14 @@ pub const DOT_HAKO: &str = ".hako";
 #[command(
     name = "hako",
     about = "Content-addressed version-controlled filesystem",
-    version
+    version,
+    arg_required_else_help = true,
+    after_help = "EXTRAS:\n  \
+        hako is <image>          Switch the workspace's identity to an image (e.g. `hako is alpine`).\n  \
+        hako as <ctr> <cmd>...   Run a one-off command inside another container without switching.\n  \
+        hako <anything> ...      Any unknown command runs inside the current container\n                           \
+        (e.g. `hako python app.py`, `hako npm install`).\n\n\
+        Run/exec need a Linux runtime; on Windows/macOS they bridge into a WSL2 distro / Lima VM."
 )]
 struct Cli {
     /// Workspace directory containing .hako (defaults to current dir)
@@ -160,7 +167,7 @@ enum Cmd {
 
     // ------------------------------------------------------------ Mount
     /// Mount a tree (ref or working) as a read-only filesystem at `mountpoint`.
-    /// Linux + macOS only. Blocks until unmounted.
+    /// Linux only. Blocks until unmounted.
     Mount {
         mountpoint: PathBuf,
         #[arg(long, default_value = "working")]
