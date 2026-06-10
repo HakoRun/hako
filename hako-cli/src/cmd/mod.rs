@@ -16,7 +16,7 @@ pub mod runtime;
 pub mod sync;
 pub mod vc;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 pub mod mount;
 
 /// Shared per-invocation context. Built once in `run()` after parsing CLI
