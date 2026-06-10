@@ -821,6 +821,16 @@ fn apply_seccomp() -> Result<(), RuntimeError> {
         libc::SYS_umount2,
         libc::SYS_pivot_root,
         libc::SYS_chroot,
+        // The modern mount API (kernel >= 5.2) is an equivalent mount path —
+        // without these, a nested userns (unshare is allowed) could still mount
+        // via fsopen+fsmount despite the mount(2) block above.
+        libc::SYS_fsopen,
+        libc::SYS_fsconfig,
+        libc::SYS_fsmount,
+        libc::SYS_move_mount,
+        libc::SYS_open_tree,
+        libc::SYS_fspick,
+        libc::SYS_mount_setattr,
         libc::SYS_settimeofday,
         libc::SYS_clock_settime,
         libc::SYS_adjtimex,
@@ -832,6 +842,18 @@ fn apply_seccomp() -> Result<(), RuntimeError> {
         libc::SYS_keyctl,
         libc::SYS_bpf,
         libc::SYS_perf_event_open,
+        // io_uring: the largest recent source of kernel LPEs; blocked by
+        // Docker's default profile and most production sandboxes.
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
+        // Kernel-exploit timing primitive (unprivileged-creatable).
+        libc::SYS_userfaultfd,
+        // The "Shocker" container-breakout primitive. Needs CAP_DAC_READ_SEARCH
+        // in the init userns (which the workload lacks), but costs nothing to
+        // block outright.
+        libc::SYS_open_by_handle_at,
+        libc::SYS_name_to_handle_at,
     ];
     let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
         denied.iter().map(|&n| (n, Vec::new())).collect();

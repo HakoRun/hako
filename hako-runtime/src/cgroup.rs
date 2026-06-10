@@ -33,7 +33,9 @@ impl Limits {
     pub fn from_env() -> Self {
         let pids_max = match std::env::var("HAKO_PIDS_MAX") {
             Ok(s) if s == "0" || s.eq_ignore_ascii_case("max") => None,
-            Ok(s) => s.parse().ok(),
+            // Fail closed: a typo'd value falls back to the default cap rather
+            // than silently meaning "unlimited" (this is a security knob).
+            Ok(s) => Some(s.parse().unwrap_or(1024)),
             Err(_) => Some(1024),
         };
         let memory_max = std::env::var("HAKO_MEMORY_MAX")
@@ -104,15 +106,25 @@ fn apply_under(parent: &Path, container_pid: i32, limits: &Limits) -> Option<Cgr
         path: child.clone(),
     };
 
-    if want_pids {
-        if let Some(p) = limits.pids_max {
-            let _ = fs::write(child.join("pids.max"), p.to_string());
+    // Write the limits and require that at least one intended limit actually
+    // bound. The controller files only exist if `subtree_control` enable above
+    // succeeded; if it was refused (e.g. the parent directly hosts processes —
+    // the cgroup-v2 "no internal process" rule) these writes fail, and we must
+    // NOT report success, or callers get a false "limits applied" signal while
+    // the container runs unconstrained.
+    let mut any_applied = false;
+    if let (true, Some(p)) = (want_pids, limits.pids_max) {
+        if fs::write(child.join("pids.max"), p.to_string()).is_ok() {
+            any_applied = true;
         }
     }
-    if want_mem {
-        if let Some(m) = limits.memory_max {
-            let _ = fs::write(child.join("memory.max"), m.to_string());
+    if let (true, Some(m)) = (want_mem, limits.memory_max) {
+        if fs::write(child.join("memory.max"), m.to_string()).is_ok() {
+            any_applied = true;
         }
+    }
+    if !any_applied {
+        return None; // guard's Drop rmdirs the empty cgroup
     }
     // Move the container (and thus its whole subtree) into the cgroup. If this
     // fails the limits wouldn't bind, so drop the empty cgroup and report none.
@@ -182,7 +194,10 @@ fn parse_size(s: &str) -> Option<u64> {
         c if c.is_ascii_digit() => (s, 1),
         _ => return None,
     };
-    num.trim().parse::<u64>().ok().map(|n| n * mult)
+    num.trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
 }
 
 #[cfg(test)]
@@ -207,6 +222,9 @@ mod tests {
         assert_eq!(parse_size("abc"), None);
         assert_eq!(parse_size("12X"), None);
         assert_eq!(parse_size("M"), None);
+        // Overflow saturates to None rather than panicking / wrapping to a tiny
+        // memory.max that would instantly OOM-kill the workload.
+        assert_eq!(parse_size("99999999999G"), None);
     }
 
     // Verifies hako writes the right limits to the right cgroup files against a

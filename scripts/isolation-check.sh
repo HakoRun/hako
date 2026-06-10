@@ -71,6 +71,16 @@ rm -f "$htmp"
 routelines="$(run 'cat /proc/net/route 2>/dev/null | wc -l')"
 check "network is isolated by default (no host routes)" '[ -n "$routelines" ] && [ "$routelines" -le 1 ]' "$routelines"
 
+# 5. Seccomp — a blocked syscall must fail. `mount` is on the denylist, so a
+#    tmpfs mount (which a userns-root workload could otherwise do) returns EPERM.
+#    With the filter active the applet prints "Operation not permitted".
+mnt="$(run 'mount -t tmpfs none /mnt 2>&1; echo rc=$?')"
+check "seccomp blocks the mount syscall" 'echo "$mnt" | grep -q "rc=0" && false || echo "$mnt" | grep -qi "not permitted"' "$mnt"
+
+# 6. /sys is read-only — writes must fail (fresh RO sysfs for the isolated-net run).
+sysrc="$(run 'touch /sys/.hako_iso_w 2>&1; echo rc=$?')"
+check "/sys is read-only" 'echo "$sysrc" | grep -q "rc=0" && false || echo "$sysrc" | grep -qiE "read-only|not permitted"' "$sysrc"
+
 echo "---"
 if [ "$fail" -eq 0 ]; then
   echo -e "\033[32mALL ISOLATION CHECKS PASSED\033[0m"
