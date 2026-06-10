@@ -1,4 +1,4 @@
-//! FUSE mount. Linux + macOS only; this module is `#[cfg]`-gated out elsewhere.
+//! FUSE mount. Linux only; this module is `#[cfg]`-gated out elsewhere.
 
 use super::Ctx;
 use crate::helpers::resolve_tree;

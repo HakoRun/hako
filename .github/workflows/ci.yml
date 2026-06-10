@@ -28,7 +28,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: test (${{ matrix.os }})
@@ -41,7 +41,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      - run: cargo test --workspace --locked
 
   deny:
     name: cargo-deny
@@ -50,12 +50,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  # Runs the real container runtime and asserts the isolation properties
-  # (private PID view, no host $HOME, private /tmp, network isolation). This is
-  # the only automated coverage of the security-critical transform.rs path.
+  # Runs the real container runtime and asserts its isolation properties
+  # (private PID view, no host $HOME, private /tmp, network isolation, seccomp,
+  # read-only /sys) — the only automated coverage of the security-critical
+  # transform.rs path. Runs on BOTH x86_64 and native arm64, since seccomp-BPF
+  # filters and syscall numbers are architecture-specific and the release ships
+  # an aarch64 binary.
   isolation:
-    name: isolation (linux runtime)
-    runs-on: ubuntu-latest
+    name: isolation (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       - name: Prepare runtime prerequisites
@@ -66,6 +77,25 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build -p hako-cli
+      - run: cargo build -p hako-cli --locked
       - name: Verify container isolation
         run: HAKO=target/debug/hako HAKO_RUN_FLAGS=--no-workspace bash scripts/isolation-check.sh
+
+  # Builds the Windows/macOS wrappers with the Linux runtime embedded, on every
+  # PR. This path previously ran only at release time, so a break (e.g. a macOS
+  # build failure) merged green and only surfaced when cutting a tag. Build-only:
+  # the embedded blob is a zero-byte stub here (build.rs creates it; an empty
+  # blob just means "no embedded binary" at runtime), which is enough to compile
+  # the include_bytes!/host-bridge embedded paths and catch breakage early.
+  embedded-build:
+    name: embedded build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, macos-13]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p hako-cli --features embedded --locked
