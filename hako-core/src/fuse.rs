@@ -899,7 +899,7 @@ impl Filesystem for HakoFs {
             Ok(_) => {
                 self.inodes
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .rename_subtree(&old_path, &new_path);
                 reply.ok();
             }

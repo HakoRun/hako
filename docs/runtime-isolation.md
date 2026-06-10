@@ -134,9 +134,13 @@ filter installed immediately before `exec`, after all mounts/pivot. It's a
 denylist returning `EPERM` for syscalls a container never legitimately needs and
 that widen the host kernel attack surface: module loading
 (`init_module`/`finit_module`/`delete_module`), `kexec_load`/`reboot`,
-`swapon`/`swapoff`, `mount`/`umount2`/`pivot_root`/`chroot`, host clock changes
-(`settimeofday`/`clock_settime`/`adjtimex`/`clock_adjtime`), `acct`/`quotactl`,
-the kernel keyring (`add_key`/`request_key`/`keyctl`), and `bpf`/`perf_event_open`.
+`swapon`/`swapoff`, the mount API — both legacy `mount`/`umount2`/`pivot_root`/
+`chroot` AND the modern `fsopen`/`fsconfig`/`fsmount`/`move_mount`/`open_tree`/
+`fspick`/`mount_setattr` (else a nested userns could mount despite the legacy
+block) — host clock changes (`settimeofday`/`clock_settime`/`adjtimex`/
+`clock_adjtime`), `acct`/`quotactl`, the kernel keyring (`add_key`/`request_key`/
+`keyctl`), `bpf`/`perf_event_open`, `io_uring_*` (the top recent kernel-LPE
+source), `userfaultfd`, and `open_by_handle_at`/`name_to_handle_at`.
 Everything else is allowed, so normal programs are unaffected. Built with the
 pure-Rust `seccompiler` crate (no libseccomp C dependency); installs via the
 userns `CAP_SYS_ADMIN` without `no_new_privs` (so in-container setuid still

@@ -42,7 +42,12 @@ hako run alpine sh               # run it for real (Linux / WSL2 / Lima)
 
 ## Install / build
 
-Requires a recent stable Rust toolchain (developed against 1.91).
+Requires a recent stable Rust toolchain (developed against 1.96). On **Linux**,
+`hako-core` links libfuse, so install its headers first:
+
+```sh
+sudo apt-get install -y libfuse3-dev pkg-config   # Debian/Ubuntu
+```
 
 ```sh
 # Native CLI + runtime (full runtime on Linux; CLI + host bridge on Win/Mac)
@@ -152,6 +157,19 @@ natively on every platform. Only `run`/`exec` need a Linux kernel:
 
 See [BUILD.md](BUILD.md) for the bridge and embedded-binary details, and the
 `HAKO_DISTRO` / `HAKO_LIMA_VM` / `HAKO_NO_BRIDGE` environment knobs.
+
+### Runtime tuning (env)
+
+| Variable | Effect |
+| --- | --- |
+| `HAKO_PIDS_MAX` | Container process cap (`pids.max`). Default `1024`; `0`/`max` = unlimited. Requires a delegated cgroup v2. |
+| `HAKO_MEMORY_MAX` | Container memory cap (`memory.max`), e.g. `512M`, `2G`. Off by default. |
+| `HAKO_CGROUP_PARENT` | Explicit delegated cgroup to create the container cgroup under (otherwise auto-detected). |
+| `HAKO_NO_SECCOMP` | Skip the workload seccomp filter (debugging, or a workload that needs a blocked syscall). |
+
+Cgroup limits are best-effort: they apply only where a delegated cgroup v2 is
+available (a systemd user session, or `HAKO_CGROUP_PARENT`), and are skipped
+silently otherwise — the same posture as rootless Podman/Docker.
 
 ## Development
 
