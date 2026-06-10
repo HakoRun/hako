@@ -1,0 +1,115 @@
+name: release
+
+# Cuts a GitHub Release with binaries for every supported platform.
+#   - Linux x86_64 / aarch64: static musl builds (the full runtime).
+#   - Windows / macOS: host wrappers with the matching Linux runtime EMBEDDED
+#     (`--features embedded`), so they auto-bootstrap a WSL2 distro / Lima VM.
+#
+# Push a `vX.Y.Z` tag to build AND publish. Run via the Actions "Run workflow"
+# button (workflow_dispatch) to build + upload artifacts only (a dry run, no
+# release is published).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # 1. The Linux runtime binaries — static musl, no libfuse/glibc dependency.
+  linux:
+    name: linux (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            asset: hako-linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            asset: hako-linux-aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # Sets up the cross C toolchain (musl-gcc) so ring's C sources build for
+      # the target; also exports the right linker.
+      - uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target ${{ matrix.target }} -p hako-cli
+      - run: cp target/${{ matrix.target }}/release/hako "${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  # 2. Windows wrapper with the x86_64 Linux runtime embedded.
+  windows:
+    name: windows (embedded x86_64)
+    needs: linux
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: hako-linux-x86_64
+          path: dl
+      # `embedded_for_host()` on a Windows (x86_64) host embeds vendored/hako-linux-x64.
+      - run: copy dl\hako-linux-x86_64 vendored\hako-linux-x64
+        shell: cmd
+      - run: cargo build --release -p hako-cli --features embedded
+      - run: copy target\release\hako.exe hako-windows-x86_64.exe
+        shell: cmd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hako-windows-x86_64.exe
+          path: hako-windows-x86_64.exe
+          if-no-files-found: error
+
+  # 3. macOS (Apple Silicon) wrapper with the aarch64 Linux runtime embedded.
+  macos:
+    name: macos (embedded arm64)
+    needs: linux
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: hako-linux-aarch64
+          path: dl
+      # `embedded_for_host()` on an arm64 macOS host embeds vendored/hako-linux-arm64.
+      - run: cp dl/hako-linux-aarch64 vendored/hako-linux-arm64
+      - run: cargo build --release -p hako-cli --features embedded
+      - run: cp target/release/hako hako-macos-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hako-macos-arm64
+          path: hako-macos-arm64
+          if-no-files-found: error
+
+  # 4. Publish the Release (only on a version tag; a dry run stops here).
+  publish:
+    name: publish release
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -la dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

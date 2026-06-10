@@ -42,18 +42,30 @@ hako run alpine sh               # run it for real (Linux / WSL2 / Lima)
 
 ## Install / build
 
-Requires a recent stable Rust toolchain (developed against 1.96). On **Linux**,
-`hako-core` links libfuse, so install its headers first:
+The quickest way to get hako is the install script (Linux / macOS):
 
 ```sh
-sudo apt-get install -y libfuse3-dev pkg-config   # Debian/Ubuntu
+curl -fsSL https://hako.run/install.sh | sh
 ```
+
+Or grab a binary from the [latest release](https://github.com/HakoRun/hako/releases/latest).
+On Windows/macOS the binary auto-bootstraps a WSL2 distro / Lima VM on first
+runtime command.
+
+### From source
+
+Requires a recent stable Rust toolchain (developed against 1.96). No system
+libraries are needed — hako mounts FUSE via `mount(2)` directly, so there's no
+libfuse/pkg-config build dependency.
 
 ```sh
 # Native CLI + runtime (full runtime on Linux; CLI + host bridge on Win/Mac)
 cargo build --workspace --release
 # binary: target/release/hako
 ```
+
+(The `hako mount` browse command shells out to `fusermount3` at runtime for an
+unprivileged mount; the core `run`/`apply` runtime needs nothing extra.)
 
 For the Windows/macOS auto-bootstrap build that embeds a cross-compiled Linux
 binary, see [BUILD.md](BUILD.md).
