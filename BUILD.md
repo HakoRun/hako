@@ -9,8 +9,9 @@ cargo build --workspace --release
 Produces a single `hako` binary at `target/release/hako`. On Linux this is
 the full hako: native CLI + runtime. On Windows/macOS it's the native CLI
 plus the `host_bridge` that forwards runtime ops (`run`, `apply`, `exec`,
-`hako <unknown>`) to a Linux env you've set up yourself (WSL distro or
-Lima VM with `cargo install hako-cli` inside).
+`hako <unknown>`) to a Linux env you've set up yourself (a WSL distro or
+Lima VM with the Linux `hako` binary on its PATH). The released Win/Mac
+binaries embed the Linux runtime instead and auto-bootstrap it (see below).
 
 This build does not embed a Linux binary — `hako bootstrap` will say so
 and exit cleanly without trying to create a distro.
@@ -85,9 +86,10 @@ For a release build of the cross-platform wrapper, the order is:
 - **Musl linker** on the build host. On Debian/Ubuntu: `apt install
   musl-tools`. On Alpine: musl is the default. On Windows/macOS: easiest
   is `cross` which uses Docker.
-- **`fuser` and musl**: hako-cli depends on `fuser` which interfaces with
-  libfuse. Building static against musl works on Alpine; on Debian-based
-  hosts you may need libfuse-static or use cross.
+- **`fuser` and musl**: hako-cli depends on `fuser` but builds it with
+  `default-features = false` (no libfuse), mounting FUSE via `mount(2)`
+  directly. So there is **no libfuse/pkg-config dependency** and the static
+  musl build needs no extra C libraries — only the musl cross toolchain.
 
 If `cargo xtask build-linux` fails with linker errors, the error message
 points to the most likely fix.

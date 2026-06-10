@@ -28,7 +28,11 @@ fs2 = "0.4"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-fuser = "0.15"
+# default-features = false drops the libfuse C dependency: hako mounts via
+# direct mount(2) inside its user namespace (it already avoids the fusermount3
+# helper), so libfuse isn't needed at runtime — and dropping it lets the runtime
+# cross-compile to a static musl binary for the release.
+fuser = { version = "0.15", default-features = false }
 libc = "0.2"
 # hako-core is the storage / VC / OCI library. The user-facing binary lives
 # in hako-cli (which depends on this crate plus hako-runtime). The split
