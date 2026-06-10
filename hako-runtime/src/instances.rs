@@ -292,7 +292,7 @@ pub fn remove(workdir: &Path, id: &str, force: bool) -> Result<(), RuntimeError>
 /// the supervisor pid for instances with no recorded nspid (e.g. one that never
 /// finished starting). Validates start_time first to avoid signalling a
 /// recycled pid.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub fn stop(workdir: &Path, id: &str) -> Result<(), RuntimeError> {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
@@ -310,12 +310,12 @@ pub fn stop(workdir: &Path, id: &str) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 pub fn stop(_workdir: &Path, _id: &str) -> Result<(), RuntimeError> {
     Err(RuntimeError::UnsupportedPlatform {
         operation: "hako stop",
-        hint: "Sending signals to runtime instances requires a Unix system. \
-               On Windows, manage instances from inside WSL2.",
+        hint: "Signalling runtime instances happens on the Linux runtime host. \
+               On Windows/macOS, manage instances from inside the WSL2 distro / Lima VM.",
     })
 }
 
@@ -326,7 +326,7 @@ pub fn stop(_workdir: &Path, _id: &str) -> Result<(), RuntimeError> {
 /// True iff a process exists at `pid` AND (when both sides have a recorded
 /// start_time) the start times match. Without a recorded start_time we fall
 /// back to mere existence — better than nothing, but lossy under pid reuse.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn process_matches(pid: u32, recorded_start: Option<u64>) -> bool {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
@@ -339,7 +339,7 @@ fn process_matches(pid: u32, recorded_start: Option<u64>) -> bool {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn process_matches(_pid: u32, _recorded_start: Option<u64>) -> bool {
     // Non-Unix host can't check process state at all. Used only for the
     // read-only "ps from Mac/Windows" flow.
@@ -487,7 +487,7 @@ mod tests {
     // reports "not running" because we can't OpenProcess without the
     // `windows` crate. This test exercises the running/not-running gate
     // and is meaningful only where process_alive can detect liveness.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn remove_refuses_running_unless_forced() {
         let wd = workdir();
