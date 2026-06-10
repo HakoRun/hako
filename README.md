@@ -116,10 +116,11 @@ already-applied steps are skipped via a hash recorded in `.hako/applied`.
 > (opt in when a workload needs egress); `apply` keeps host networking so setup
 > steps can install dependencies. The workload runs under a **seccomp filter** that
 > blocks dangerous syscalls (module loading, kexec/reboot, mount, kernel keyring,
-> bpf, …), and `/sys` is a fresh read-only sysfs. It is not yet a hardened
-> multi-tenant sandbox — no cgroup resource limits yet — so prefer trusted images
-> for now. (`hako run` requires a Linux runtime; on Windows/macOS it is bridged
-> into WSL2 / Lima.)
+> bpf, …), `/sys` is a fresh read-only sysfs, and — where a delegated cgroup v2
+> is available (systemd host) — a **cgroup `pids`/`memory` limit** (best-effort,
+> like rootless Podman). It is not yet a hardened multi-tenant sandbox, so prefer
+> trusted images for now. (`hako run` requires a Linux runtime; on Windows/macOS
+> it is bridged into WSL2 / Lima.)
 
 ## Architecture
 

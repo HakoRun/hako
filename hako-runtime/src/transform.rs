@@ -672,6 +672,11 @@ fn run_command_setup(
             if let Some((workdir, id)) = detached_state {
                 let _ = instances::write_nspid(workdir, id, child.as_raw() as u32);
             }
+            // Best-effort cgroup v2 resource limits (pids/memory) on the whole
+            // container subtree. No-op when no delegated cgroup is available
+            // (rootless without systemd delegation). Held until the container
+            // exits, then dropped to remove the now-empty cgroup.
+            let _cgroup = crate::cgroup::apply(child.as_raw(), &crate::cgroup::Limits::from_env());
             let status = wait_for_child(child)?;
             Ok(match status {
                 WaitStatus::Exited(_, code) => code,
