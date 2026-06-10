@@ -25,6 +25,8 @@
 pub mod instances;
 
 #[cfg(target_os = "linux")]
+mod cgroup;
+#[cfg(target_os = "linux")]
 pub mod transform;
 
 use std::path::PathBuf;

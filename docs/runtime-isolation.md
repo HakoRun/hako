@@ -155,9 +155,30 @@ back to a host `/sys` bind with a best-effort read-only remount of the top mount
 if even the top can't be remounted, matching prior behavior). Verified: writes to
 `/sys` in a `run` container fail with EROFS, and `apply` still completes.
 
+### Cgroup v2 resource limits — DONE (best-effort)
+
+The container's whole subtree is placed in a cgroup v2 with `pids.max` (default
+1024 — the main fork-bomb DoS) and optional `memory.max` (`HAKO_MEMORY_MAX`,
+off by default since an over-tight cap OOM-kills legitimate workloads).
+
+This mirrors rootless Podman/Docker exactly: cgroup limits **require a delegated
+cgroup v2** (systemd user session, or an explicit `HAKO_CGROUP_PARENT`), because
+the kernel grants an unprivileged process no cgroup powers over a subtree it
+doesn't own — and a container can't self-provision that. So the limiter is
+best-effort: it finds the delegation boundary (the highest writable ancestor of
+its own cgroup, e.g. `…/user@1000.service`), creates `…/hako-<pid>`, enables the
+controllers, writes the limits, and moves the container in; if nothing is
+delegated (rootless without systemd — e.g. default WSL2, hosted CI) it skips
+silently. The cgroup is removed when the container exits.
+
+Verified: the limit-writing logic is unit-tested against a delegated parent (the
+right values land in `pids.max`/`memory.max`/`cgroup.procs`); the no-op path is
+verified on real WSL2 (no delegation → run is unaffected). Kernel *enforcement*
+of those values is the kernel's job. `HAKO_PIDS_MAX`/`HAKO_MEMORY_MAX` tune it.
+
 ### Still open
-- Hardening: cgroup v2 resource limits (pids/memory — needs delegation),
-  recursive read-only for `:ro` volumes.
+- Hardening: recursive read-only for `:ro` volumes; a hako.toml `[safety]` knob
+  for the seccomp/limits (currently env-var controlled).
 - Ephemeral `run` writes create orphan store objects until `gc`; consider a
   scratch overlay or a dedicated ephemeral chunk area.
 - CI runs `scripts/isolation-check.sh` on a Linux runner (the `isolation` job)
