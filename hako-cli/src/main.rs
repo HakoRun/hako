@@ -26,12 +26,18 @@ pub const DOT_HAKO: &str = ".hako";
         Run/exec need a Linux runtime; on Windows/macOS they bridge into a WSL2 distro / Lima VM."
 )]
 struct Cli {
-    /// Workspace directory containing .hako (defaults to current dir)
-    #[arg(short = 'w', long, global = true)]
+    /// Workspace directory containing .hako (defaults to current dir).
+    /// A context flag: must appear before the subcommand (e.g.
+    /// `hako -w /path run ...`), so it never collides with a guest program's
+    /// own `-w`/`--workdir` in `run`/`run-host`/`exec`.
+    #[arg(short = 'w', long)]
     workdir: Option<PathBuf>,
 
-    /// Default container (overrides session container if set)
-    #[arg(short = 'c', long, global = true)]
+    /// Default container, overriding the session identity for this one command.
+    /// A context flag: must appear before the subcommand (e.g.
+    /// `hako -c ubuntu ls /`), so it never collides with a guest program's own
+    /// `-c` (use `hako is`/`as` for the durable/sugared forms).
+    #[arg(short = 'c', long)]
     container: Option<String>,
 
     #[command(subcommand)]
@@ -220,7 +226,9 @@ enum Cmd {
         /// Skip the implicit workspace bind-mount at /workspace.
         #[arg(long)]
         no_workspace: bool,
-        #[arg(trailing_var_arg = true)]
+        /// Command + args to run, passed through verbatim. A leading `-` is
+        /// fine; use `--` if the first token would look like a hako flag.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
     /// Run a Linux executable from the HOST filesystem through hako.
@@ -236,10 +244,12 @@ enum Cmd {
     ///   `hako run-host ~/Downloads/app.bin`   — run a downloaded binary
     /// Network is isolated. Linux only (bridged from Windows/macOS).
     RunHost {
-        /// Path to the host executable (absolute, or relative to cwd).
-        path: String,
-        #[arg(trailing_var_arg = true)]
-        args: Vec<String>,
+        /// The host executable to run, followed by its arguments. Everything
+        /// here is passed through verbatim (the first token is the binary
+        /// path, absolute or relative to cwd). Use `--` if the binary's own
+        /// flags would otherwise look like hako flags.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
     },
     /// List runtime instances (running and exited).
     Ps {
@@ -257,7 +267,7 @@ enum Cmd {
     Exec {
         /// Instance id (or unique prefix)
         id: String,
-        #[arg(trailing_var_arg = true, required = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
     /// Send SIGTERM to a runtime instance's supervising process. Unix only.
@@ -424,6 +434,10 @@ fn strip_globals(args: &[String]) -> (Option<PathBuf>, Option<String>, Vec<Strin
         } else if let Some(v) = a.strip_prefix("--container=") {
             container = Some(v.to_string());
             i += 1;
+        } else if a == "--" {
+            // Explicit end-of-options: everything after `--` is the guest
+            // command, passed through verbatim. Drop the `--` itself.
+            return (workdir, container, args[i + 1..].to_vec());
         } else {
             return (workdir, container, args[i..].to_vec());
         }
@@ -712,7 +726,7 @@ fn run() -> io::Result<ExitCode> {
             no_workspace,
             command,
         } => cmd::runtime::run(&ctx, branch, detach, volumes, no_workspace, command),
-        Cmd::RunHost { path, args } => cmd::runtime::run_host(&ctx, path, args),
+        Cmd::RunHost { command } => cmd::runtime::run_host(&ctx, command),
         Cmd::Ps { all } => cmd::runtime::ps(&ctx, all),
         Cmd::Logs { id, follow } => cmd::runtime::logs(&ctx, id, follow),
         Cmd::Exec { id, command } => cmd::runtime::exec(&ctx, id, command),

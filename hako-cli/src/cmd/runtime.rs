@@ -48,8 +48,14 @@ pub fn run(
 /// and shared libraries resolve, lets the runtime pass the display through
 /// automatically, and execs the binary under hako's namespaces. Trades the
 /// pristine versioned rootfs for "just run this downloaded app".
-pub fn run_host(ctx: &Ctx<'_>, path: String, args: Vec<String>) -> io::Result<ExitCode> {
+pub fn run_host(ctx: &Ctx<'_>, command: Vec<String>) -> io::Result<ExitCode> {
     use std::path::{Path, PathBuf};
+
+    // command[0] is the host binary path; the rest are its arguments.
+    let path = command
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "run-host needs a path"))?
+        .clone();
 
     // Read-only binds of the host system, so a dynamically-linked binary finds
     // its interpreter (/lib64/ld-*.so) and libraries. Only existing dirs added.
@@ -81,9 +87,6 @@ pub fn run_host(ctx: &Ctx<'_>, path: String, args: Vec<String>) -> io::Result<Ex
     let branch = repo
         .current_branch()?
         .ok_or_else(|| io::Error::other("current container has no current branch"))?;
-
-    let mut command = vec![path];
-    command.extend(args);
 
     let code = hako_runtime::transform::run_container(&repo, &branch, command, &volumes)
         .map_err(runtime_to_io)?;
