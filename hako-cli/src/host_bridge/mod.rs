@@ -138,6 +138,7 @@ fn forward_windows(cwd: &Path, args: &[String]) -> io::Result<ExitCode> {
     let distro = bootstrap_wsl::distro_name();
     let wsl_cwd = win_to_wsl_path(cwd);
     let translated_args = translate_w_flag_windows(args);
+    let translated_args = translate_run_host_path_windows(translated_args);
 
     eprintln!(
         "hako: forwarding to wsl -d {} (set HAKO_DISTRO to override)",
@@ -223,6 +224,25 @@ fn translate_w_flag_windows(args: &[String]) -> Vec<String> {
     out
 }
 
+/// Translate the binary path of a `run-host` invocation from a Windows path
+/// to a WSL path, so `hako run-host C:\Users\me\app` works from a Windows
+/// shell. Only the binary path — the first token after `run-host`, skipping an
+/// optional `--` — is rewritten; the program's own arguments pass through
+/// verbatim (we can't know whether they're paths the guest will interpret).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn translate_run_host_path_windows(mut args: Vec<String>) -> Vec<String> {
+    if let Some(pos) = args.iter().position(|a| a == "run-host") {
+        let mut i = pos + 1;
+        if args.get(i).map(String::as_str) == Some("--") {
+            i += 1;
+        }
+        if let Some(p) = args.get(i) {
+            args[i] = win_to_wsl_path(Path::new(p));
+        }
+    }
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +264,53 @@ mod tests {
         // Already-Linux path or relative — leave structure alone.
         assert_eq!(win_to_wsl_path(Path::new("/tmp/x")), "/tmp/x");
         assert_eq!(win_to_wsl_path(Path::new("relative/path")), "relative/path");
+    }
+
+    #[test]
+    fn run_host_path_is_translated() {
+        // Bare: the binary path is rewritten, guest args left alone.
+        let args = vec![
+            "run-host".to_string(),
+            r"C:\Users\me\app".to_string(),
+            r"--config=C:\keep".to_string(),
+        ];
+        let out = translate_run_host_path_windows(args);
+        assert_eq!(
+            out,
+            vec!["run-host", "/mnt/c/Users/me/app", r"--config=C:\keep"]
+        );
+    }
+
+    #[test]
+    fn run_host_path_after_double_dash_and_globals() {
+        // Leading hako globals + an explicit `--` before the binary.
+        let args = vec![
+            "-c".to_string(),
+            "ubuntu".to_string(),
+            "run-host".to_string(),
+            "--".to_string(),
+            r"D:\bin\tool.bin".to_string(),
+            "-v".to_string(),
+        ];
+        let out = translate_run_host_path_windows(args);
+        assert_eq!(
+            out,
+            vec![
+                "-c",
+                "ubuntu",
+                "run-host",
+                "--",
+                "/mnt/d/bin/tool.bin",
+                "-v"
+            ]
+        );
+    }
+
+    #[test]
+    fn non_run_host_is_untouched() {
+        let args = vec!["run".to_string(), "alpine".to_string(), "sh".to_string()];
+        let out = translate_run_host_path_windows(args.clone());
+        assert_eq!(out, args);
     }
 
     #[test]
