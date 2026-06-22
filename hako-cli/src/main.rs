@@ -296,6 +296,22 @@ enum Cmd {
     /// Verify the object graph is intact. Exit 1 if problems found.
     Fsck,
 
+    /// Package a container + command into a single self-contained executable
+    /// that runs the app through hako — no prior hako install or workspace
+    /// needed on the target. (First cut: a Unix self-extracting bundle; the
+    /// native Windows `.exe` stub is WIP.)
+    Bundle {
+        /// Container to package.
+        container: String,
+        /// Output path for the bundle executable.
+        #[arg(short = 'o', long, default_value = "app.hako")]
+        output: PathBuf,
+        /// Command to run inside it (default: the container's interactive
+        /// shell). Must come last; passed through verbatim.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
+    },
+
     /// Pre-warm the host runtime: idempotently set up the WSL distro
     /// (Windows) / Lima VM (macOS) and inject the embedded Linux hako
     /// binary. No-op on Linux. Useful to do this once explicitly so the
@@ -737,6 +753,11 @@ fn run() -> io::Result<ExitCode> {
             in_container,
             command,
         } => cmd::runtime::run_host(&ctx, in_container, command),
+        Cmd::Bundle {
+            container,
+            output,
+            cmd,
+        } => cmd::bundle::create(&ctx, container, cmd, output),
         Cmd::Ps { all } => cmd::runtime::ps(&ctx, all),
         Cmd::Logs { id, follow } => cmd::runtime::logs(&ctx, id, follow),
         Cmd::Exec { id, command } => cmd::runtime::exec(&ctx, id, command),
