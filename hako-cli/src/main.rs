@@ -244,6 +244,13 @@ enum Cmd {
     ///   `hako run-host ~/Downloads/app.bin`   — run a downloaded binary
     /// Network is isolated. Linux only (bridged from Windows/macOS).
     RunHost {
+        /// Run the binary against a CONTAINER's filesystem instead of the
+        /// host's — its libraries come from the container, so an Alpine/musl
+        /// or other cross-distro binary works. Pass a container name, or
+        /// `auto` to pick (and pull if missing) a base image from the binary's
+        /// libc (musl → alpine, glibc → debian). Omit for host libraries.
+        #[arg(long = "in", value_name = "CONTAINER")]
+        in_container: Option<String>,
         /// The host executable to run, followed by its arguments. Everything
         /// here is passed through verbatim (the first token is the binary
         /// path, absolute or relative to cwd). Use `--` if the binary's own
@@ -726,7 +733,10 @@ fn run() -> io::Result<ExitCode> {
             no_workspace,
             command,
         } => cmd::runtime::run(&ctx, branch, detach, volumes, no_workspace, command),
-        Cmd::RunHost { command } => cmd::runtime::run_host(&ctx, command),
+        Cmd::RunHost {
+            in_container,
+            command,
+        } => cmd::runtime::run_host(&ctx, in_container, command),
         Cmd::Ps { all } => cmd::runtime::ps(&ctx, all),
         Cmd::Logs { id, follow } => cmd::runtime::logs(&ctx, id, follow),
         Cmd::Exec { id, command } => cmd::runtime::exec(&ctx, id, command),

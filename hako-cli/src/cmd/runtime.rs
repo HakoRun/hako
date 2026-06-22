@@ -43,20 +43,41 @@ pub fn run(
     }
 }
 
-/// `hako run-host <path> [args...]` — run a host-filesystem Linux binary
-/// through hako. Bind-mounts the host system read-only so the dynamic loader
-/// and shared libraries resolve, lets the runtime pass the display through
-/// automatically, and execs the binary under hako's namespaces. Trades the
-/// pristine versioned rootfs for "just run this downloaded app".
-pub fn run_host(ctx: &Ctx<'_>, command: Vec<String>) -> io::Result<ExitCode> {
-    use std::path::{Path, PathBuf};
-
+/// `hako run-host [--in <container>|auto] <path> [args...]` — run a Linux
+/// binary from the host filesystem through hako, with display passthrough.
+///
+/// Three modes, differing in where the binary's *libraries* come from:
+///   - default — the host system (bind-mounted read-only). Best for a binary
+///     matching the host libc, a static binary, or an AppImage.
+///   - `--in <container>` — that container's rootfs (only the binary is mounted
+///     in). Lets a cross-distro binary (e.g. Alpine/musl) run against the
+///     libraries it actually needs.
+///   - `--in auto` — detect the binary's libc and pick (pulling if missing) a
+///     base image: musl → alpine, glibc → debian.
+pub fn run_host(
+    ctx: &Ctx<'_>,
+    in_container: Option<String>,
+    command: Vec<String>,
+) -> io::Result<ExitCode> {
     // command[0] is the host binary path; the rest are its arguments.
     let path = command
         .first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "run-host needs a path"))?
         .clone();
 
+    match in_container.as_deref() {
+        None => run_host_on_host(ctx, &path, command),
+        Some("auto") => {
+            let container = resolve_auto_container(ctx, &path)?;
+            run_host_in_container(ctx, &container, &path, command)
+        }
+        Some(name) => run_host_in_container(ctx, name, &path, command),
+    }
+}
+
+/// Tier 1: libraries from the host system.
+fn run_host_on_host(ctx: &Ctx<'_>, path: &str, command: Vec<String>) -> io::Result<ExitCode> {
+    use std::path::{Path, PathBuf};
     // Read-only binds of the host system, so a dynamically-linked binary finds
     // its interpreter (/lib64/ld-*.so) and libraries. Only existing dirs added.
     let mut volumes: Vec<VolumeMount> = ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/opt"]
@@ -68,29 +89,119 @@ pub fn run_host(ctx: &Ctx<'_>, command: Vec<String>) -> io::Result<ExitCode> {
             readonly: true,
         })
         .collect();
-
-    // The binary's own directory, in case it lives outside the dirs above
-    // (e.g. a download under /home or /mnt/c). Mounted ro at the same path so
-    // the in-container command path resolves.
-    if let Some(dir) = Path::new(&path).parent() {
-        let dir_s = dir.to_string_lossy().to_string();
-        if !dir_s.is_empty() && !volumes.iter().any(|v| v.container == dir_s) {
-            volumes.push(VolumeMount {
-                host: dir.to_path_buf(),
-                container: dir_s,
-                readonly: true,
-            });
-        }
-    }
+    push_bin_dir(&mut volumes, path);
 
     let repo = ctx.state.open_container(ctx.default_container)?;
     let branch = repo
         .current_branch()?
         .ok_or_else(|| io::Error::other("current container has no current branch"))?;
-
     let code = hako_runtime::transform::run_container(&repo, &branch, command, &volumes)
         .map_err(runtime_to_io)?;
     Ok(exit_code_from(code))
+}
+
+/// Tiers 2/3: libraries from `container`'s rootfs; only the binary is mounted in.
+fn run_host_in_container(
+    ctx: &Ctx<'_>,
+    container: &str,
+    path: &str,
+    command: Vec<String>,
+) -> io::Result<ExitCode> {
+    let mut volumes: Vec<VolumeMount> = Vec::new();
+    push_bin_dir(&mut volumes, path);
+
+    let repo = ctx.state.open_container(container).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "container '{}' not found ({}). Pull it first (`hako pull {}`), or use `--in auto`.",
+                container, e, container
+            ),
+        )
+    })?;
+    let branch = repo
+        .current_branch()?
+        .ok_or_else(|| io::Error::other("container has no current branch"))?;
+    eprintln!(
+        "hako: running {} against container '{}' (libraries from the container)",
+        path, container
+    );
+    let code = hako_runtime::transform::run_container(&repo, &branch, command, &volumes)
+        .map_err(runtime_to_io)?;
+    Ok(exit_code_from(code))
+}
+
+/// Mount the binary's own directory read-only at the same path, so the
+/// in-container command path resolves to the host file.
+fn push_bin_dir(volumes: &mut Vec<VolumeMount>, path: &str) {
+    use std::path::{Path, PathBuf};
+    if let Some(dir) = Path::new(path).parent() {
+        let dir_s = dir.to_string_lossy().to_string();
+        if !dir_s.is_empty() && !volumes.iter().any(|v| v.container == dir_s) {
+            volumes.push(VolumeMount {
+                host: PathBuf::from(dir),
+                container: dir_s,
+                readonly: true,
+            });
+        }
+    }
+}
+
+/// Tier 3: detect the binary's libc and resolve a container to run it against,
+/// pulling a base image if no suitable container exists yet.
+fn resolve_auto_container(ctx: &Ctx<'_>, path: &str) -> io::Result<String> {
+    let (libc, distro, image) = match detect_libc(path)? {
+        Libc::Musl => ("musl", "alpine", "alpine"),
+        Libc::Glibc => ("glibc", "debian", "debian"),
+    };
+    eprintln!("hako: detected {} binary → base image '{}'", libc, image);
+
+    // Reuse an existing container of that name if present (it may already have
+    // the binary's other shared-lib deps installed); otherwise pull the base.
+    if ctx.state.list_containers()?.iter().any(|c| c == distro) {
+        eprintln!("hako: reusing existing container '{}'", distro);
+    } else {
+        let image_ref = hako::ImageRef::parse(image).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("bad image ref: {}", e))
+        })?;
+        crate::cmd::oci::pull_into(ctx.state, &image_ref, distro, "linux", "amd64", false)?;
+    }
+    Ok(distro.to_string())
+}
+
+enum Libc {
+    Musl,
+    Glibc,
+}
+
+/// Detect a binary's libc by finding its ELF interpreter (PT_INTERP) string.
+/// `ld-musl-*` → musl, `ld-linux-*` → glibc. Static binaries have no
+/// interpreter and are rejected with a hint to choose a container explicitly.
+fn detect_libc(path: &str) -> io::Result<Libc> {
+    let data = std::fs::read(path)?;
+    if data.len() < 4 || &data[..4] != b"\x7fELF" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not an ELF binary; `--in auto` needs an ELF", path),
+        ));
+    }
+    // The interpreter path is a null-terminated string near the file start.
+    let hay = &data[..data.len().min(512 * 1024)];
+    let find = |needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+    if find(b"ld-musl") {
+        Ok(Libc::Musl)
+    } else if find(b"ld-linux") {
+        Ok(Libc::Glibc)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "could not detect libc for {} (no ld-musl/ld-linux interpreter — likely static); \
+                 pass `--in <container>` explicitly",
+                path
+            ),
+        ))
+    }
 }
 
 /// `hako <unknown-subcommand> [args...]` — clap routes here when the first
