@@ -43,6 +43,53 @@ pub fn run(
     }
 }
 
+/// `hako run-host <path> [args...]` — run a host-filesystem Linux binary
+/// through hako. Bind-mounts the host system read-only so the dynamic loader
+/// and shared libraries resolve, lets the runtime pass the display through
+/// automatically, and execs the binary under hako's namespaces. Trades the
+/// pristine versioned rootfs for "just run this downloaded app".
+pub fn run_host(ctx: &Ctx<'_>, path: String, args: Vec<String>) -> io::Result<ExitCode> {
+    use std::path::{Path, PathBuf};
+
+    // Read-only binds of the host system, so a dynamically-linked binary finds
+    // its interpreter (/lib64/ld-*.so) and libraries. Only existing dirs added.
+    let mut volumes: Vec<VolumeMount> = ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/opt"]
+        .iter()
+        .filter(|d| Path::new(d).exists())
+        .map(|d| VolumeMount {
+            host: PathBuf::from(d),
+            container: (*d).to_string(),
+            readonly: true,
+        })
+        .collect();
+
+    // The binary's own directory, in case it lives outside the dirs above
+    // (e.g. a download under /home or /mnt/c). Mounted ro at the same path so
+    // the in-container command path resolves.
+    if let Some(dir) = Path::new(&path).parent() {
+        let dir_s = dir.to_string_lossy().to_string();
+        if !dir_s.is_empty() && !volumes.iter().any(|v| v.container == dir_s) {
+            volumes.push(VolumeMount {
+                host: dir.to_path_buf(),
+                container: dir_s,
+                readonly: true,
+            });
+        }
+    }
+
+    let repo = ctx.state.open_container(ctx.default_container)?;
+    let branch = repo
+        .current_branch()?
+        .ok_or_else(|| io::Error::other("current container has no current branch"))?;
+
+    let mut command = vec![path];
+    command.extend(args);
+
+    let code = hako_runtime::transform::run_container(&repo, &branch, command, &volumes)
+        .map_err(runtime_to_io)?;
+    Ok(exit_code_from(code))
+}
+
 /// `hako <unknown-subcommand> [args...]` — clap routes here when the first
 /// token isn't a known command. Run those args as a command inside the
 /// current identity's container, like the user typed `hako run <current>

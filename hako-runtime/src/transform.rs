@@ -714,6 +714,13 @@ fn container_init(
     setup_bind_mounts(root, net_isolated)?;
     setup_special_mounts(root)?;
     setup_user_volumes(root, volumes)?;
+    // Always-on display passthrough: if a display server is reachable on the
+    // host (native X/Wayland, or WSLg on Windows), expose its sockets inside
+    // the container. A non-GUI workload simply never opens them; a GUI app
+    // renders on the host desktop. No flag — mirrors WSLg's own behavior.
+    // The matching DISPLAY/WAYLAND_DISPLAY/XDG_RUNTIME_DIR env vars are
+    // inherited by the workload through execvp, so nothing else is needed.
+    setup_display(root);
 
     // For detached mode, redirect stdout/stderr to log files BEFORE pivot_root
     // (the log paths are on the host filesystem, not the new root).
@@ -1144,6 +1151,42 @@ fn setup_user_volumes(root: &str, volumes: &[VolumeMount]) -> Result<(), Runtime
         }
     }
     Ok(())
+}
+
+/// Best-effort display passthrough. Binds the host's X11 and/or Wayland
+/// sockets into the container so a GUI workload can render on the host
+/// desktop (native X/Wayland, or WSLg when bridged from Windows). Entirely
+/// silent and non-fatal: any missing piece is skipped, so a headless host or
+/// a non-GUI workload is unaffected. The DISPLAY / WAYLAND_DISPLAY /
+/// XDG_RUNTIME_DIR env vars are inherited by the workload via execvp.
+fn setup_display(root: &str) {
+    // X11: the Unix-socket directory. Mounted into the container's private
+    // tmpfs /tmp so that DISPLAY=:N resolves to /tmp/.X11-unix/XN inside.
+    let x11 = "/tmp/.X11-unix";
+    if Path::new(x11).is_dir() {
+        let target = format!("{}{}", root, x11);
+        if fs::create_dir_all(&target).is_ok() {
+            let _ = bind_mount(x11, target.as_str(), MsFlags::MS_BIND | MsFlags::MS_REC);
+        }
+    }
+
+    // Wayland: $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY (default wayland-0). Resolve
+    // symlinks (WSLg points /run/user/<uid>/wayland-0 at /mnt/wslg) and bind
+    // the real socket at the same in-container path the env var advertises.
+    if let Ok(xdg) = env::var("XDG_RUNTIME_DIR") {
+        let disp = env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
+        let sock = Path::new(&xdg).join(&disp);
+        if let Ok(real) = sock.canonicalize() {
+            let target = format!("{}/{}/{}", root, xdg.trim_start_matches('/'), disp);
+            if let Some(parent) = Path::new(&target).parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if !Path::new(&target).exists() {
+                let _ = fs::write(&target, "");
+            }
+            let _ = bind_mount(real, target.as_str(), MsFlags::MS_BIND);
+        }
+    }
 }
 
 fn pivot_into(new_root: &str) -> Result<(), RuntimeError> {

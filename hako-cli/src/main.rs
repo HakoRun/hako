@@ -223,6 +223,24 @@ enum Cmd {
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
+    /// Run a Linux executable from the HOST filesystem through hako.
+    ///
+    /// The host system directories are bind-mounted read-only (so a
+    /// dynamically-linked binary resolves its loader + libraries), the display
+    /// is passed through automatically (X11/Wayland, incl. WSLg), and the
+    /// process runs under hako's namespaces + seccomp. This is the "I
+    /// downloaded a Linux app, just run it" path — a convenience sandbox, not
+    /// a reproducible versioned container.
+    /// Examples:
+    ///   `hako run-host /usr/bin/xeyes`        — render a GUI app on the desktop
+    ///   `hako run-host ~/Downloads/app.bin`   — run a downloaded binary
+    /// Network is isolated. Linux only (bridged from Windows/macOS).
+    RunHost {
+        /// Path to the host executable (absolute, or relative to cwd).
+        path: String,
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
     /// List runtime instances (running and exited).
     Ps {
         #[arg(short = 'a', long)]
@@ -318,7 +336,7 @@ impl Cmd {
     /// user's WSL/Lima env via `host_bridge`. Read-only commands stay native.
     fn needs_linux_runtime(&self) -> bool {
         match self {
-            Cmd::Run { .. } | Cmd::Exec { .. } | Cmd::External(_) => true,
+            Cmd::Run { .. } | Cmd::RunHost { .. } | Cmd::Exec { .. } | Cmd::External(_) => true,
             // `apply --dry-run` parses hako.toml and prints the plan
             // without touching the runtime — no reason to pay the WSL/Lima
             // round-trip just to print 4 lines.
@@ -348,7 +366,11 @@ impl Cmd {
             | Cmd::Stop { .. } => false,
             // Long-running: holding the lock would block every other CLI
             // invocation for the lifetime of the container/mount.
-            Cmd::Mount { .. } | Cmd::Run { .. } | Cmd::Exec { .. } | Cmd::External(_) => false,
+            Cmd::Mount { .. }
+            | Cmd::Run { .. }
+            | Cmd::RunHost { .. }
+            | Cmd::Exec { .. }
+            | Cmd::External(_) => false,
             // Branch / tag list mode (no name) is read-only.
             Cmd::Branch { name: None, .. } => false,
             Cmd::Tag { name: None, .. } => false,
@@ -690,6 +712,7 @@ fn run() -> io::Result<ExitCode> {
             no_workspace,
             command,
         } => cmd::runtime::run(&ctx, branch, detach, volumes, no_workspace, command),
+        Cmd::RunHost { path, args } => cmd::runtime::run_host(&ctx, path, args),
         Cmd::Ps { all } => cmd::runtime::ps(&ctx, all),
         Cmd::Logs { id, follow } => cmd::runtime::logs(&ctx, id, follow),
         Cmd::Exec { id, command } => cmd::runtime::exec(&ctx, id, command),
