@@ -193,6 +193,14 @@ pub fn run_container_detached(
             // captured to the instance log files by `redirect_output`.
             detach_stdio();
 
+            // Become a session leader NOW — before run_inner's inner fork
+            // spawns the FUSE server and the command/workload subtree — so the
+            // *entire* detached tree leaves the launching shell's session. Done
+            // after detach_stdio (stdio already points at /dev/null, so losing
+            // the controlling terminal is harmless). Best-effort: a failure
+            // here shouldn't abort the spawn. (Issue #17.)
+            let _ = setsid();
+
             let exit_code = match run_inner(
                 store,
                 root,
@@ -427,7 +435,7 @@ fn run_inner(
         }
         ForkResult::Parent { child } => {
             drop(shell_sock);
-            run_fuse_server(store, root, fuse_sock, child, detached, detached_state)
+            run_fuse_server(store, root, fuse_sock, child, detached_state)
         }
     }
 }
@@ -439,7 +447,6 @@ fn run_fuse_server(
     root: Hash,
     sync_sock: UnixStream,
     child: Pid,
-    detached: bool,
     detached_state: Option<(PathBuf, String)>,
 ) -> Result<i32, RuntimeError> {
     // Mount FUSE in the background, READ-WRITE so the container has a writable
@@ -451,11 +458,9 @@ fn run_fuse_server(
     let _session = hako::fuse::mount_session_rw(store, root, Path::new(MOUNTPOINT))
         .map_err(|e| io_other(format!("mount FUSE rw: {}", e)))?;
 
-    // For detached mode, become a session leader after FUSE is set up so we
-    // detach cleanly from the controlling terminal.
-    if detached {
-        setsid().map_err(|e| io_other(format!("setsid: {}", e)))?;
-    }
+    // (Detachment from the controlling terminal is handled earlier, in the
+    // detached supervisor before the inner fork, so the whole tree — not just
+    // this FUSE server — leaves the launching shell's session. See issue #17.)
 
     // Signal the command-setup process that the mount is ready.
     let mut sock = sync_sock;
