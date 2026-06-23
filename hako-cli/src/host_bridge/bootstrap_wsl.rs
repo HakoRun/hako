@@ -52,7 +52,9 @@ pub fn ensure_runtime() -> io::Result<()> {
     }
 
     // Distro exists. If we have an embedded binary, keep the installed
-    // copy in sync. If we don't, trust whatever the user installed manually.
+    // copy in sync. If we don't, the WSL hako was installed out-of-band and
+    // can silently drift from this wrapper — warn on a version mismatch so a
+    // stale runtime doesn't surface as a confusing downstream error.
     if has_embedded_binary() {
         let want = binary_hash();
         if read_installed_hash(&distro).as_deref() != Some(&want) {
@@ -60,8 +62,52 @@ pub fn ensure_runtime() -> io::Result<()> {
             inject_binary(&distro)?;
             write_installed_hash(&distro, &want)?;
         }
+    } else {
+        warn_on_version_skew(&distro);
     }
     Ok(())
+}
+
+/// Best-effort warning when the hako installed in `distro` reports a different
+/// version than this wrapper, or can't report one at all (missing/stale). Only
+/// reached in non-embedded builds, where nothing keeps the WSL binary in sync.
+///
+/// Note: this compares the crate version string, so it catches release-to-
+/// release drift but not same-version code drift — an embedded build (exact
+/// hash sync) is the only thing that guarantees byte-for-byte parity. A binary
+/// too old to answer `--version` does trip the "couldn't determine" branch.
+fn warn_on_version_skew(distro: &str) {
+    let want = env!("CARGO_PKG_VERSION");
+    match wsl_hako_version(distro) {
+        Some(got) if got == want => {} // in sync
+        Some(got) => eprintln!(
+            "hako: WARNING: the hako in WSL distro '{distro}' is {got}, but this \
+             wrapper is {want}. Runtime commands run inside WSL, so they use \
+             {got}. Update it with `wsl -d {distro} -- cargo install --force \
+             hako-cli`, or rebuild this wrapper with --features embedded to \
+             keep it auto-synced."
+        ),
+        None => eprintln!(
+            "hako: WARNING: couldn't determine the hako version in WSL distro \
+             '{distro}' — it may be missing or too old. If runtime commands \
+             fail, update it with `wsl -d {distro} -- cargo install --force \
+             hako-cli`."
+        ),
+    }
+}
+
+/// Run `hako --version` inside `distro` and parse the `X.Y.Z` out of
+/// `hako X.Y.Z`. Returns None if it can't run or doesn't print a version.
+fn wsl_hako_version(distro: &str) -> Option<String> {
+    let out = Command::new("wsl")
+        .args(["-d", distro, "--", "hako", "--version"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace().nth(1).map(|s| s.to_string())
 }
 
 fn require_wsl_available() -> io::Result<()> {
