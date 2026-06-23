@@ -35,13 +35,29 @@ pub fn create(
         hako::Hash::of(format!("{container}\u{0}{branch}\u{0}{}", cmd.join("\u{0}")).as_bytes());
     let id = id.to_hex()[..12].to_string();
 
-    let hako_bin = std::env::current_exe()?;
-
     // Stage layout: <tmp>/{hako, ws/.hako}
     let stage = std::env::temp_dir().join(format!("hako-bundle-stage-{id}"));
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(stage.join("ws"))?;
-    std::fs::copy(&hako_bin, stage.join("hako"))?;
+
+    // The runtime the bundle ships must be a *Linux* hako (the app always runs
+    // in Linux). Prefer the embedded, cross-compiled, release-stripped binary
+    // — it's small and correct even when bundling from a Windows/macOS host
+    // (where `current_exe()` is not a Linux binary). Fall back to the running
+    // binary only in a dev build with no embedded runtime, which by definition
+    // is itself the native Linux hako.
+    let staged_hako = stage.join("hako");
+    let embedded = crate::host_bridge::embedded_for_host();
+    if embedded.is_empty() {
+        std::fs::copy(std::env::current_exe()?, &staged_hako)?;
+    } else {
+        std::fs::write(&staged_hako, embedded)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staged_hako, std::fs::Permissions::from_mode(0o755))?;
+    }
 
     // Build a PRUNED workspace holding only this container's reachable objects
     // (not the whole source .hako, which carries every other container and all
