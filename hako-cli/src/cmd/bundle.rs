@@ -43,22 +43,43 @@ pub fn create(
     std::fs::create_dir_all(stage.join("ws"))?;
     std::fs::copy(&hako_bin, stage.join("hako"))?;
 
-    // Copy the workspace store. First cut ships the whole .hako; pruning to the
-    // single container's reachable chunks is a follow-up.
-    let dot_hako = ctx.workdir.join(DOT_HAKO);
-    if !dot_hako.is_dir() {
-        return Err(io::Error::new(
+    // Build a PRUNED workspace holding only this container's reachable objects
+    // (not the whole source .hako, which carries every other container and all
+    // of history). A fresh `State::init` seeds a toybox `hako` container; we
+    // drop it and gc so the bundle ships just the target.
+    let commit = repo.read_ref(&branch)?.ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::NotFound,
-            format!("no {} workspace at {}", DOT_HAKO, ctx.workdir.display()),
-        ));
+            format!("branch '{}' not found in container '{}'", branch, container),
+        )
+    })?;
+    let ws_dot = stage.join("ws").join(DOT_HAKO);
+    let dst_state = hako::State::init(&ws_dot)?;
+    let _ = dst_state.delete_container("hako");
+    let dst_repo = dst_state.create_container(&container)?;
+
+    // Copy only the objects reachable from the target commit.
+    let mut copied = 0usize;
+    for h in repo.reachable_objects(commit)? {
+        if dst_repo.store().has(&h)? {
+            continue;
+        }
+        let bytes = repo
+            .store()
+            .get(&h)?
+            .ok_or_else(|| io::Error::other(format!("source missing object {}", h.to_hex())))?;
+        dst_repo.store().put(&bytes)?;
+        copied += 1;
     }
-    run_tool(
-        Command::new("cp")
-            .arg("-a")
-            .arg(&dot_hako)
-            .arg(stage.join("ws").join(DOT_HAKO)),
-        "copy workspace into the bundle stage",
-    )?;
+    dst_repo.write_ref(&branch, commit)?;
+    // Reclaim the toybox seed's now-unreferenced objects.
+    let _ = hako::gc(&dst_state, false);
+    drop(dst_repo);
+    drop(dst_state);
+    eprintln!(
+        "hako: bundled {} reachable objects for '{}'",
+        copied, container
+    );
 
     // tar.gz the stage into a payload.
     let payload = stage.with_extension("tgz");
