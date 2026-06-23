@@ -187,7 +187,14 @@ fn spawn_and_wait(mut cmd: Command, tool: &str) -> io::Result<ExitCode> {
 /// `C:\Users\foo\bar` → `/mnt/c/Users/foo/bar`. WSL's path-translation
 /// convention. Falls back to a literal forward-slash conversion if the
 /// path doesn't have a drive letter.
+///
+/// Spaces are the wrinkle: when the translated path is handed to `wsl.exe -- `,
+/// a space (e.g. a `C:\Users\First Last\…` profile) gets re-split into two
+/// arguments on the Linux side. So for an existing spaced path we first resolve
+/// the Windows 8.3 short name (`FIRST~1`, no spaces), which drvfs exposes under
+/// `/mnt/c` just like the long name.
 fn win_to_wsl_path(p: &Path) -> String {
+    let p = short_if_spaced(p);
     let s = p.to_string_lossy().replace('\\', "/");
     let bytes = s.as_bytes();
     if bytes.len() >= 2 && bytes[1] == b':' {
@@ -195,6 +202,55 @@ fn win_to_wsl_path(p: &Path) -> String {
         format!("/mnt/{}{}", drive, &s[2..])
     } else {
         s
+    }
+}
+
+/// Return the Windows 8.3 short path for a spaced, existing path; otherwise the
+/// path unchanged. No-op off Windows.
+fn short_if_spaced(p: &Path) -> std::borrow::Cow<'_, Path> {
+    #[cfg(windows)]
+    {
+        if p.to_string_lossy().contains(' ') {
+            if let Some(short) = short_path_windows(p) {
+                return std::borrow::Cow::Owned(short);
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(p)
+}
+
+/// Resolve a Windows path to its 8.3 short form via GetShortPathNameW. Returns
+/// None if the path doesn't exist or 8.3 generation is disabled on the volume.
+#[cfg(windows)]
+fn short_path_windows(p: &Path) -> Option<std::path::PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetShortPathNameW(long: *const u16, short: *mut u16, cch: u32) -> u32;
+    }
+    let wide: Vec<u16> = p
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // First call with a null buffer returns the required length (incl. NUL).
+    let needed = unsafe { GetShortPathNameW(wide.as_ptr(), std::ptr::null_mut(), 0) };
+    if needed == 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; needed as usize];
+    let written = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), needed) };
+    if written == 0 || written >= needed {
+        return None;
+    }
+    buf.truncate(written as usize);
+    let short = std::path::PathBuf::from(OsString::from_wide(&buf));
+    // If 8.3 is disabled the result still contains the space — no gain.
+    if short.to_string_lossy().contains(' ') {
+        None
+    } else {
+        Some(short)
     }
 }
 

@@ -104,10 +104,14 @@ fn launch(payload: &[u8]) -> io::Result<ExitCode> {
 
 fn bundle_cache_dir() -> PathBuf {
     use std::env;
+    // On Windows prefer LOCALAPPDATA (HOME is usually unset outside Git Bash).
+    #[cfg(windows)]
+    if let Some(d) = env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(d).join("hako-bundles");
+    }
     let base = env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .or_else(|| env::var_os("LOCALAPPDATA").map(PathBuf::from))
         .unwrap_or_else(env::temp_dir);
     base.join("hako-bundles")
 }
