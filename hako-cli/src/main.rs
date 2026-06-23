@@ -418,6 +418,16 @@ impl Cmd {
 }
 
 fn main() -> ExitCode {
+    // If this binary is a self-contained bundle (a hako binary with a payload
+    // appended), run the baked container command instead of the normal CLI.
+    match cmd::bundle::maybe_run_as_bundle() {
+        Ok(Some(code)) => return code,
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("hako: bundle: {}", e);
+            return ExitCode::FAILURE;
+        }
+    }
     match run() {
         Ok(code) => code,
         Err(e) => {

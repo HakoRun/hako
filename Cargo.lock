@@ -411,6 +411,7 @@ name = "hako-cli"
 version = "0.1.1"
 dependencies = [
  "clap",
+ "flate2",
  "hako",
  "hako-runtime",
  "tar",

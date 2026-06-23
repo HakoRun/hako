@@ -17,6 +17,9 @@ clap = { version = "4", features = ["derive"] }
 # Used by host_bridge::bootstrap_wsl to write the minimal rootfs.tar
 # imported via `wsl --import` when auto-bootstrapping the runtime distro.
 tar = "0.4"
+# Used by `hako bundle` to pack/unpack the self-contained bundle payload
+# (the pruned container store) that is appended to the hako binary.
+flate2 = "1"
 # Used by host_bridge::bootstrap_lima to stage the embedded Linux binary
 # in $TMP before `limactl copy` ships it into the VM. RAII cleanup so a
 # crash mid-copy doesn't leak a ~10 MiB file in /tmp.
