@@ -137,8 +137,10 @@ fn forward_windows(cwd: &Path, args: &[String]) -> io::Result<ExitCode> {
     // `Ubuntu` distro and getting "command not found" or worse).
     let distro = bootstrap_wsl::distro_name();
     let wsl_cwd = win_to_wsl_path(cwd);
-    let translated_args = translate_w_flag_windows(args);
-    let translated_args = translate_run_host_path_windows(translated_args);
+    // Lift -w out to an env var (forwarded via WSLENV path translation) so a
+    // spaced workspace path survives wsl.exe; translate a run-host binary path.
+    let (workdir_win, rest) = extract_w_flag_windows(args);
+    let translated_args = translate_run_host_path_windows(rest);
 
     eprintln!(
         "hako: forwarding to wsl -d {} (set HAKO_DISTRO to override)",
@@ -148,6 +150,15 @@ fn forward_windows(cwd: &Path, args: &[String]) -> io::Result<ExitCode> {
     let mut cmd = Command::new("wsl");
     cmd.args(["-d", &distro, "--cd", &wsl_cwd, "--", "hako"]);
     cmd.args(&translated_args);
+    if let Some(w) = workdir_win {
+        // WSLENV with the `/p` flag tells WSL to translate HAKO_WORKDIR (a
+        // Windows path) into a WSL path. Append to any existing WSLENV.
+        let wslenv = match env::var("WSLENV") {
+            Ok(prev) if !prev.is_empty() => format!("{prev}:HAKO_WORKDIR/p"),
+            _ => "HAKO_WORKDIR/p".to_string(),
+        };
+        cmd.env("HAKO_WORKDIR", w).env("WSLENV", wslenv);
+    }
 
     spawn_and_wait(cmd, "wsl")
 }
@@ -254,30 +265,32 @@ fn short_path_windows(p: &Path) -> Option<std::path::PathBuf> {
     }
 }
 
-/// Translate any `-w <path>` or `--workdir <path>` argument from a Windows
-/// path to a WSL path. Other args pass through verbatim.
+/// Pull a `-w <path>` / `--workdir <path>` / `--workdir=<path>` out of `args`,
+/// returning the (Windows) workdir value and the remaining args. The bridge
+/// forwards this via `$HAKO_WORKDIR` + `WSLENV` path translation rather than as
+/// a command-line argument, so a workspace path containing spaces survives the
+/// `wsl.exe` boundary intact (forwarded args get re-split on spaces; an env
+/// var's value does not).
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn translate_w_flag_windows(args: &[String]) -> Vec<String> {
+fn extract_w_flag_windows(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut workdir = None;
     let mut out = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
-        if a == "-w" || a == "--workdir" {
-            if let Some(next) = args.get(i + 1) {
-                out.push(a.clone());
-                out.push(win_to_wsl_path(Path::new(next)));
-                i += 2;
-                continue;
-            }
-        } else if let Some(rest) = a.strip_prefix("--workdir=") {
-            out.push(format!("--workdir={}", win_to_wsl_path(Path::new(rest))));
+        if (a == "-w" || a == "--workdir") && i + 1 < args.len() {
+            workdir = Some(args[i + 1].clone());
+            i += 2;
+            continue;
+        } else if let Some(v) = a.strip_prefix("--workdir=") {
+            workdir = Some(v.to_string());
             i += 1;
             continue;
         }
         out.push(a.clone());
         i += 1;
     }
-    out
+    (workdir, out)
 }
 
 /// Translate the binary path of a `run-host` invocation from a Windows path
@@ -370,43 +383,35 @@ mod tests {
     }
 
     #[test]
-    fn translate_w_flag_handles_all_forms() {
-        let args = vec![
+    fn extract_w_flag_pulls_workdir_out() {
+        // `-w <path>` form: workdir extracted (verbatim Windows path), rest kept.
+        let (w, rest) = extract_w_flag_windows(&[
             "-w".to_string(),
-            r"C:\proj".to_string(),
+            r"C:\My Proj".to_string(),
             "run".to_string(),
             "alpine".to_string(),
-        ];
-        let out = translate_w_flag_windows(&args);
-        assert_eq!(out, vec!["-w", "/mnt/c/proj", "run", "alpine"]);
+        ]);
+        assert_eq!(w.as_deref(), Some(r"C:\My Proj"));
+        assert_eq!(rest, vec!["run", "alpine"]);
 
-        let args2 = vec![
-            "--workdir".to_string(),
-            r"D:\code".to_string(),
-            "apply".to_string(),
-        ];
-        let out2 = translate_w_flag_windows(&args2);
-        assert_eq!(out2, vec!["--workdir", "/mnt/d/code", "apply"]);
-
-        let args3 = vec![
-            r"--workdir=C:\one".to_string(),
-            "exec".to_string(),
-            "abc".to_string(),
-        ];
-        let out3 = translate_w_flag_windows(&args3);
-        assert_eq!(out3, vec!["--workdir=/mnt/c/one", "exec", "abc"]);
+        // `--workdir=<path>` form.
+        let (w2, rest2) =
+            extract_w_flag_windows(&[r"--workdir=D:\code".to_string(), "apply".to_string()]);
+        assert_eq!(w2.as_deref(), Some(r"D:\code"));
+        assert_eq!(rest2, vec!["apply"]);
     }
 
     #[test]
-    fn translate_passes_through_non_w_args() {
+    fn extract_w_flag_passes_through_non_w_args() {
         let args = vec![
             "run".to_string(),
             "alpine".to_string(),
             "ls".to_string(),
             "/etc".to_string(),
         ];
-        let out = translate_w_flag_windows(&args);
-        assert_eq!(out, args);
+        let (w, rest) = extract_w_flag_windows(&args);
+        assert_eq!(w, None);
+        assert_eq!(rest, args);
     }
 
     #[test]

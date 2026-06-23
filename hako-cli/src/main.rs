@@ -559,10 +559,16 @@ fn run() -> io::Result<ExitCode> {
     }
 
     // For every other command: if -w was passed, use it verbatim. Otherwise
-    // walk up from cwd looking for `.hako/`, like git looks for `.git/`.
+    // fall back to $HAKO_WORKDIR (the host bridge sets this, via WSLENV path
+    // translation, so a Windows workspace path with spaces survives the
+    // wsl.exe boundary). Otherwise walk up from cwd looking for `.hako/`, like
+    // git looks for `.git/`.
     let workdir = match cli.workdir.clone() {
         Some(w) => w,
-        None => find_workspace_root(&cwd)?,
+        None => match std::env::var_os("HAKO_WORKDIR") {
+            Some(w) if !w.is_empty() => PathBuf::from(w),
+            _ => find_workspace_root(&cwd)?,
+        },
     };
 
     let dot = workdir.join(DOT_HAKO);
