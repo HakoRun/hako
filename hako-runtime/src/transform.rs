@@ -1192,18 +1192,27 @@ fn setup_display(root: &str) {
     // Wayland: $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY (default wayland-0). Resolve
     // symlinks (WSLg points /run/user/<uid>/wayland-0 at /mnt/wslg) and bind
     // the real socket at the same in-container path the env var advertises.
+    // The runtime dir is backed by a fresh tmpfs so the socket mountpoint goes
+    // there, not into the rootfs tree (which would otherwise leak a /run/user
+    // stub into an `apply` commit — and future-proofs a read-only root).
     if let Ok(xdg) = env::var("XDG_RUNTIME_DIR") {
         let disp = env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
         let sock = Path::new(&xdg).join(&disp);
         if let Ok(real) = sock.canonicalize() {
-            let target = format!("{}/{}/{}", root, xdg.trim_start_matches('/'), disp);
-            if let Some(parent) = Path::new(&target).parent() {
-                let _ = fs::create_dir_all(parent);
+            let run_dir = format!("{}/{}", root, xdg.trim_start_matches('/'));
+            if fs::create_dir_all(&run_dir).is_ok() {
+                let _ = mount_kind(
+                    "tmpfs",
+                    &run_dir,
+                    "tmpfs",
+                    MsFlags::empty(),
+                    Some("mode=700"),
+                );
+                let target = format!("{}/{}", run_dir, disp);
+                if fs::write(&target, "").is_ok() {
+                    let _ = bind_mount(real, target.as_str(), MsFlags::MS_BIND);
+                }
             }
-            if !Path::new(&target).exists() {
-                let _ = fs::write(&target, "");
-            }
-            let _ = bind_mount(real, target.as_str(), MsFlags::MS_BIND);
         }
     }
 }
