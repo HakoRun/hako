@@ -18,8 +18,10 @@ pub fn run(
     detach: bool,
     volumes: Vec<String>,
     no_workspace: bool,
+    display: bool,
     command: Vec<String>,
 ) -> io::Result<ExitCode> {
+    set_display_env(ctx, display);
     let volumes = build_volumes(ctx, &volumes, no_workspace)?;
     let repo = ctx.state.open_container(ctx.default_container)?;
     if detach {
@@ -43,6 +45,18 @@ pub fn run(
     }
 }
 
+/// Opt display passthrough on for the runtime call about to be made. The
+/// runtime reads `HAKO_DISPLAY`; setting it here (before the in-process fork
+/// in `hako_runtime::transform`) propagates it to the container. Honors the
+/// explicit `--display` flag OR `display = true` in the workspace's hako.toml.
+/// Off otherwise — passthrough weakens isolation, so it is never the default.
+fn set_display_env(ctx: &Ctx<'_>, flag: bool) {
+    let from_cfg = ctx.cfg.app.as_ref().is_some_and(|a| a.display);
+    if flag || from_cfg {
+        std::env::set_var("HAKO_DISPLAY", "1");
+    }
+}
+
 /// `hako run-host [--in <container>|auto] <path> [args...]` — run a Linux
 /// binary from the host filesystem through hako, with display passthrough.
 ///
@@ -57,8 +71,10 @@ pub fn run(
 pub fn run_host(
     ctx: &Ctx<'_>,
     in_container: Option<String>,
+    display: bool,
     command: Vec<String>,
 ) -> io::Result<ExitCode> {
+    set_display_env(ctx, display);
     // command[0] is the host binary path; the rest are its arguments.
     let path = command
         .first()

@@ -91,6 +91,11 @@ pub struct AppConfig {
     pub autocommit: bool,
     /// Workspace bind-mount mode.
     pub workspace: WorkspaceMode,
+    /// Pass the host display (X11/Wayland) into the container so a GUI app can
+    /// render on the host desktop. Off by default: it exposes the host display
+    /// socket to the workload, which weakens isolation (see the runtime's
+    /// `setup_display`). Opt in here, with `--display`, or `HAKO_DISPLAY=1`.
+    pub display: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -203,6 +208,7 @@ struct AppRaw {
     env_pass: Vec<String>,
     autocommit: Option<bool>,
     workspace: Option<WorkspaceRaw>,
+    display: Option<bool>,
 
     /// Catch-all for unknown top-level tables → user-named profiles.
     #[serde(flatten)]
@@ -220,6 +226,7 @@ struct ProfileRaw {
     env_pass: Option<Vec<String>>,
     autocommit: Option<bool>,
     workspace: Option<WorkspaceRaw>,
+    display: Option<bool>,
 }
 
 /// `run` accepts either a single shell string or an exec-form array.
@@ -349,6 +356,11 @@ impl AppRaw {
             .or(self.workspace)
             .map(WorkspaceMode::from)
             .unwrap_or_default();
+        let display = profile
+            .as_ref()
+            .and_then(|p| p.display)
+            .or(self.display)
+            .unwrap_or(false);
 
         // Container name: explicit `name`, else basename of image's repo.
         let name = self
@@ -367,6 +379,7 @@ impl AppRaw {
             env_pass,
             autocommit,
             workspace,
+            display,
         })
     }
 }
@@ -387,6 +400,7 @@ fn looks_like_legacy_nested(p: &ProfileRaw) -> bool {
         && p.env_pass.is_none()
         && p.autocommit.is_none()
         && p.workspace.is_none()
+        && p.display.is_none()
 }
 
 /// Extract a sensible container name from an image ref. `python:3.12-slim`

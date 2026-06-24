@@ -226,6 +226,11 @@ enum Cmd {
         /// Skip the implicit workspace bind-mount at /workspace.
         #[arg(long)]
         no_workspace: bool,
+        /// Pass the host display (X11/Wayland) into the container so a GUI app
+        /// renders on the host desktop. Off by default — it exposes the host
+        /// display socket to the workload, weakening isolation.
+        #[arg(long)]
+        display: bool,
         /// Command + args to run, passed through verbatim. A leading `-` is
         /// fine; use `--` if the first token would look like a hako flag.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -234,14 +239,14 @@ enum Cmd {
     /// Run a Linux executable from the HOST filesystem through hako.
     ///
     /// The host system directories are bind-mounted read-only (so a
-    /// dynamically-linked binary resolves its loader + libraries), the display
-    /// is passed through automatically (X11/Wayland, incl. WSLg), and the
-    /// process runs under hako's namespaces + seccomp. This is the "I
-    /// downloaded a Linux app, just run it" path — a convenience sandbox, not
-    /// a reproducible versioned container.
+    /// dynamically-linked binary resolves its loader + libraries) and the
+    /// process runs under hako's namespaces + seccomp. Pass `--display` to
+    /// render a GUI app on the host desktop. This is the "I downloaded a Linux
+    /// app, just run it" path — a convenience sandbox, not a reproducible
+    /// versioned container.
     /// Examples:
-    ///   `hako run-host /usr/bin/xeyes`        — render a GUI app on the desktop
-    ///   `hako run-host ~/Downloads/app.bin`   — run a downloaded binary
+    ///   `hako run-host --display /usr/bin/xeyes`  — render a GUI app
+    ///   `hako run-host ~/Downloads/app.bin`       — run a downloaded binary
     /// Network is isolated. Linux only (bridged from Windows/macOS).
     RunHost {
         /// Run the binary against a CONTAINER's filesystem instead of the
@@ -251,6 +256,10 @@ enum Cmd {
         /// libc (musl → alpine, glibc → debian). Omit for host libraries.
         #[arg(long = "in", value_name = "CONTAINER")]
         in_container: Option<String>,
+        /// Pass the host display (X11/Wayland) through so a GUI app renders on
+        /// the host desktop. Off by default (weakens isolation).
+        #[arg(long)]
+        display: bool,
         /// The host executable to run, followed by its arguments. Everything
         /// here is passed through verbatim (the first token is the binary
         /// path, absolute or relative to cwd). Use `--` if the binary's own
@@ -306,6 +315,11 @@ enum Cmd {
         /// Output path for the bundle executable.
         #[arg(short = 'o', long, default_value = "app.hako")]
         output: PathBuf,
+        /// Bake in display passthrough so the bundled app renders its GUI on
+        /// the host desktop. Off by default (the bundle runs headless unless
+        /// the workspace's hako.toml sets `display = true`).
+        #[arg(long)]
+        display: bool,
         /// Command to run inside it (default: the container's interactive
         /// shell). Must come last; passed through verbatim.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -763,17 +777,28 @@ fn run() -> io::Result<ExitCode> {
             detach,
             volumes,
             no_workspace,
+            display,
             command,
-        } => cmd::runtime::run(&ctx, branch, detach, volumes, no_workspace, command),
+        } => cmd::runtime::run(
+            &ctx,
+            branch,
+            detach,
+            volumes,
+            no_workspace,
+            display,
+            command,
+        ),
         Cmd::RunHost {
             in_container,
+            display,
             command,
-        } => cmd::runtime::run_host(&ctx, in_container, command),
+        } => cmd::runtime::run_host(&ctx, in_container, display, command),
         Cmd::Bundle {
             container,
             output,
+            display,
             cmd,
-        } => cmd::bundle::create(&ctx, container, cmd, output),
+        } => cmd::bundle::create(&ctx, container, cmd, output, display),
         Cmd::Ps { all } => cmd::runtime::ps(&ctx, all),
         Cmd::Logs { id, follow } => cmd::runtime::logs(&ctx, id, follow),
         Cmd::Exec { id, command } => cmd::runtime::exec(&ctx, id, command),

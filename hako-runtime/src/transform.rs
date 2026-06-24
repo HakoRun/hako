@@ -719,13 +719,16 @@ fn container_init(
     setup_bind_mounts(root, net_isolated)?;
     setup_special_mounts(root)?;
     setup_user_volumes(root, volumes)?;
-    // Always-on display passthrough: if a display server is reachable on the
-    // host (native X/Wayland, or WSLg on Windows), expose its sockets inside
-    // the container. A non-GUI workload simply never opens them; a GUI app
-    // renders on the host desktop. No flag — mirrors WSLg's own behavior.
-    // The matching DISPLAY/WAYLAND_DISPLAY/XDG_RUNTIME_DIR env vars are
-    // inherited by the workload through execvp, so nothing else is needed.
-    setup_display(root);
+    // Display passthrough — OPT-IN ONLY (HAKO_DISPLAY set). Exposing the host's
+    // X11/Wayland socket to the workload weakens isolation (X11 has no
+    // intra-client isolation: a container app could screenshot/keylog the host
+    // session), so it is off by default for every `run`/`apply`. The CLI sets
+    // HAKO_DISPLAY=1 when the user opts in via `--display`, a bundle baked with
+    // `--display`, or `display = true` in hako.toml. When enabled, the matching
+    // DISPLAY/WAYLAND_DISPLAY/XDG_RUNTIME_DIR env vars are inherited via execvp.
+    if env::var_os("HAKO_DISPLAY").is_some_and(|v| v != "0" && !v.is_empty()) {
+        setup_display(root);
+    }
 
     // For detached mode, redirect stdout/stderr to log files BEFORE pivot_root
     // (the log paths are on the host filesystem, not the new root).

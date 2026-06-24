@@ -78,13 +78,14 @@ fn launch(payload: &[u8]) -> io::Result<ExitCode> {
         std::fs::write(cache.join(".ready"), b"")?;
     }
 
-    // Manifest: container \0 branch \0 arg0 \0 arg1 ...
+    // Manifest: container \0 branch \0 display("1"/"0") \0 arg0 \0 arg1 ...
     let manifest = std::fs::read(cache.join("manifest"))?;
     let mut fields = manifest
         .split(|b| *b == 0)
         .map(|s| String::from_utf8_lossy(s).into_owned());
     let container = fields.next().unwrap_or_default();
     let branch = fields.next().unwrap_or_default();
+    let display = fields.next().as_deref() == Some("1");
     let cmd: Vec<String> = fields.collect();
 
     // Re-exec ourselves as the normal CLI against the extracted workspace.
@@ -95,9 +96,11 @@ fn launch(payload: &[u8]) -> io::Result<ExitCode> {
         .arg(cache.join("ws"))
         .arg("-c")
         .arg(&container)
-        .arg("run")
-        .arg(&branch)
-        .args(&cmd);
+        .arg("run");
+    if display {
+        c.arg("--display");
+    }
+    c.arg(&branch).args(&cmd);
     let status = c.status()?;
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
@@ -126,7 +129,12 @@ pub fn create(
     container: String,
     cmd: Vec<String>,
     output: PathBuf,
+    display: bool,
 ) -> io::Result<ExitCode> {
+    // Bake display passthrough in if asked, or if the workspace's hako.toml
+    // opts in. Off by default — a bundle runs headless unless the author
+    // chose otherwise.
+    let display = display || ctx.cfg.app.as_ref().is_some_and(|a| a.display);
     let repo = ctx.state.open_container(&container).map_err(|e| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -171,11 +179,13 @@ pub fn create(
     drop(dst_repo);
     drop(dst_state);
 
-    // Manifest: container \0 branch \0 cmd...
+    // Manifest: container \0 branch \0 display("1"/"0") \0 cmd...
     let mut manifest = Vec::new();
     manifest.extend_from_slice(container.as_bytes());
     manifest.push(0);
     manifest.extend_from_slice(branch.as_bytes());
+    manifest.push(0);
+    manifest.extend_from_slice(if display { b"1" } else { b"0" });
     for a in &cmd {
         manifest.push(0);
         manifest.extend_from_slice(a.as_bytes());
