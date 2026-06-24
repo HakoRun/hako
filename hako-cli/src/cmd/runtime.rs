@@ -75,11 +75,25 @@ pub fn run_host(
     command: Vec<String>,
 ) -> io::Result<ExitCode> {
     set_display_env(ctx, display);
-    // command[0] is the host binary path; the rest are its arguments.
-    let path = command
+    // command[0] is the host binary path; the rest are its arguments. Resolve
+    // it to a canonical absolute path: this turns `./app`, `app`, `../app`,
+    // and symlinks into a real absolute path with no `.`/`..` components — so
+    // the mount target derived from it (push_bin_dir) can never become `/`,
+    // the cwd, or a path above the container root. The in-container exec path
+    // (command[0]) is rewritten to match, so it resolves to the mounted file.
+    let raw = command
         .first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "run-host needs a path"))?
         .clone();
+    let abs = std::fs::canonicalize(&raw).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("run-host: cannot resolve binary {:?}: {}", raw, e),
+        )
+    })?;
+    let path = abs.to_string_lossy().to_string();
+    let mut command = command;
+    command[0] = path.clone();
 
     match in_container.as_deref() {
         None => run_host_on_host(ctx, &path, command),
@@ -147,19 +161,30 @@ fn run_host_in_container(
     Ok(exit_code_from(code))
 }
 
-/// Mount the binary's own directory read-only at the same path, so the
-/// in-container command path resolves to the host file.
+/// Mount the binary read-only so the in-container command path resolves to the
+/// host file. `path` MUST be canonical+absolute (run_host guarantees this).
+/// Normally we mount the binary's parent directory (so sibling resources
+/// resolve); but for a root-level binary (`/app`, parent `/`) we mount just the
+/// file — never the whole host root over the container rootfs.
 fn push_bin_dir(volumes: &mut Vec<VolumeMount>, path: &str) {
     use std::path::{Path, PathBuf};
-    if let Some(dir) = Path::new(path).parent() {
-        let dir_s = dir.to_string_lossy().to_string();
-        if !dir_s.is_empty() && !volumes.iter().any(|v| v.container == dir_s) {
-            volumes.push(VolumeMount {
-                host: PathBuf::from(dir),
-                container: dir_s,
-                readonly: true,
-            });
+    let p = Path::new(path);
+    let (host, container) = match p.parent() {
+        // Root-level binary: mount the file itself, not all of `/`.
+        Some(parent) if parent == Path::new("/") => (p.to_path_buf(), path.to_string()),
+        // Normal case: mount the containing directory.
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            (PathBuf::from(parent), parent.to_string_lossy().to_string())
         }
+        // No usable parent — shouldn't happen for a canonical absolute path.
+        _ => return,
+    };
+    if !volumes.iter().any(|v| v.container == container) {
+        volumes.push(VolumeMount {
+            host,
+            container,
+            readonly: true,
+        });
     }
 }
 
@@ -190,34 +215,119 @@ enum Libc {
     Glibc,
 }
 
-/// Detect a binary's libc by finding its ELF interpreter (PT_INTERP) string.
-/// `ld-musl-*` → musl, `ld-linux-*` → glibc. Static binaries have no
-/// interpreter and are rejected with a hint to choose a container explicitly.
+/// Detect a binary's libc from its ELF `PT_INTERP` program header (the dynamic
+/// loader path): `ld-musl-*` → musl, `ld-linux*`/`ld.so` → glibc. Parses the
+/// ELF/program-header structures and reads exactly the interpreter string —
+/// not a substring scan (which would false-match the literal "ld-musl" sitting
+/// in some glibc binary's `.rodata`). Reads only the header + interp bytes, so
+/// a huge file isn't slurped into memory. Static binaries have no PT_INTERP and
+/// are rejected with a hint to choose a container explicitly.
 fn detect_libc(path: &str) -> io::Result<Libc> {
-    let data = std::fs::read(path)?;
-    if data.len() < 4 || &data[..4] != b"\x7fELF" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} is not an ELF binary; `--in auto` needs an ELF", path),
-        ));
-    }
-    // The interpreter path is a null-terminated string near the file start.
-    let hay = &data[..data.len().min(512 * 1024)];
-    let find = |needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
-    if find(b"ld-musl") {
+    let interp = read_elf_interp(path)?;
+    if interp.contains("ld-musl") {
         Ok(Libc::Musl)
-    } else if find(b"ld-linux") {
+    } else if interp.contains("ld-linux") || interp.contains("ld.so") {
         Ok(Libc::Glibc)
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "could not detect libc for {} (no ld-musl/ld-linux interpreter — likely static); \
-                 pass `--in <container>` explicitly",
-                path
+                "could not classify interpreter {:?} for {}; pass `--in <container>` explicitly",
+                interp, path
             ),
         ))
     }
+}
+
+/// Read the `PT_INTERP` interpreter string from an ELF file. Errors if the file
+/// isn't ELF or has no interpreter (static binary). Handles ELF32/64 and both
+/// endiannesses; reads only the header, program-header table, and interp.
+fn read_elf_interp(path: &str) -> io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let bad = |m: String| io::Error::new(io::ErrorKind::InvalidInput, m);
+    let mut f = std::fs::File::open(path)?;
+
+    let mut e = [0u8; 64];
+    f.read_exact(&mut e)
+        .map_err(|_| bad(format!("{} is too small to be an ELF", path)))?;
+    if &e[..4] != b"\x7fELF" {
+        return Err(bad(format!(
+            "{} is not an ELF binary; `--in auto` needs an ELF",
+            path
+        )));
+    }
+    let is64 = e[4] == 2; // EI_CLASS: 1=32-bit, 2=64-bit
+    let le = e[5] != 2; // EI_DATA: 1=little, 2=big
+    let u16a = |b: &[u8]| {
+        let a = [b[0], b[1]];
+        if le {
+            u16::from_le_bytes(a)
+        } else {
+            u16::from_be_bytes(a)
+        }
+    };
+    let u32a = |b: &[u8]| {
+        let a = [b[0], b[1], b[2], b[3]];
+        if le {
+            u32::from_le_bytes(a)
+        } else {
+            u32::from_be_bytes(a)
+        }
+    };
+    let u64a = |b: &[u8]| {
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&b[..8]);
+        if le {
+            u64::from_le_bytes(a)
+        } else {
+            u64::from_be_bytes(a)
+        }
+    };
+
+    // Program-header table location, entry size, count (offsets differ by class).
+    let (phoff, phentsize, phnum) = if is64 {
+        (u64a(&e[32..40]), u16a(&e[54..56]), u16a(&e[56..58]))
+    } else {
+        (u32a(&e[28..32]) as u64, u16a(&e[42..44]), u16a(&e[44..46]))
+    };
+    if phnum == 0 || phnum > 4096 {
+        return Err(bad(format!(
+            "{}: implausible program-header count {}",
+            path, phnum
+        )));
+    }
+
+    let mut ph = vec![0u8; phentsize as usize];
+    for i in 0..phnum {
+        f.seek(SeekFrom::Start(phoff + i as u64 * phentsize as u64))?;
+        f.read_exact(&mut ph)
+            .map_err(|_| bad(format!("{}: truncated program header", path)))?;
+        let p_type = u32a(&ph[0..4]);
+        if p_type != 3 {
+            continue; // PT_INTERP == 3
+        }
+        let (p_offset, p_filesz) = if is64 {
+            (u64a(&ph[8..16]), u64a(&ph[32..40]))
+        } else {
+            (u32a(&ph[4..8]) as u64, u32a(&ph[16..20]) as u64)
+        };
+        if p_filesz == 0 || p_filesz > 4096 {
+            return Err(bad(format!(
+                "{}: implausible interpreter length {}",
+                path, p_filesz
+            )));
+        }
+        let mut buf = vec![0u8; p_filesz as usize];
+        f.seek(SeekFrom::Start(p_offset))?;
+        f.read_exact(&mut buf)
+            .map_err(|_| bad(format!("{}: truncated interpreter string", path)))?;
+        let s = buf.split(|b| *b == 0).next().unwrap_or(&[]);
+        return Ok(String::from_utf8_lossy(s).into_owned());
+    }
+    Err(bad(format!(
+        "{} has no PT_INTERP (likely a static binary); pass `--in <container>` explicitly",
+        path
+    )))
 }
 
 /// `hako <unknown-subcommand> [args...]` — clap routes here when the first

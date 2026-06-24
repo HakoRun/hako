@@ -231,8 +231,11 @@ enum Cmd {
         /// display socket to the workload, weakening isolation.
         #[arg(long)]
         display: bool,
-        /// Command + args to run, passed through verbatim. A leading `-` is
-        /// fine; use `--` if the first token would look like a hako flag.
+        /// Command + args to run, passed through verbatim. Most guest flags
+        /// pass through, but a first token that collides with one of hako run's
+        /// own flags (`-d`, `-v`, `--no-workspace`, `--display`) is taken by
+        /// hako — put `--` before the command to force everything through
+        /// (e.g. `hako run alpine -- top -d`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },

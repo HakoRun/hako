@@ -1115,6 +1115,17 @@ fn setup_sysfs(root: &str, net_isolated: bool) -> Result<(), RuntimeError> {
 /// since the kernel's MS_BIND ignores rw/ro flags on the initial mount.
 fn setup_user_volumes(root: &str, volumes: &[VolumeMount]) -> Result<(), RuntimeError> {
     for v in volumes {
+        // Defense in depth: the container target must be absolute and contain
+        // no `..` component, so it can never resolve to the rootfs itself or
+        // escape above it. VolumeMount::parse enforces absolute for user `-v`
+        // specs but not `..`, and run-host builds VolumeMounts directly — so
+        // re-validate here, the last gate before the mount syscall.
+        if !Path::new(&v.container).is_absolute() || v.container.split('/').any(|c| c == "..") {
+            return Err(io_other(format!(
+                "refusing unsafe mount target {:?} (must be absolute, no `..`)",
+                v.container
+            )));
+        }
         let host = v.host.canonicalize().map_err(|e| {
             io_other(format!(
                 "volume host {} cannot be resolved: {}",

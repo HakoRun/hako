@@ -293,21 +293,35 @@ fn extract_w_flag_windows(args: &[String]) -> (Option<String>, Vec<String>) {
     (workdir, out)
 }
 
-/// Translate the binary path of a `run-host` invocation from a Windows path
-/// to a WSL path, so `hako run-host C:\Users\me\app` works from a Windows
-/// shell. Only the binary path — the first token after `run-host`, skipping an
-/// optional `--` — is rewritten; the program's own arguments pass through
-/// verbatim (we can't know whether they're paths the guest will interpret).
+/// Translate the binary path of a `run-host` invocation from a Windows path to
+/// a WSL path, so `hako run-host [--in X] [--display] C:\Users\me\app` works
+/// from a Windows shell. We skip run-host's own options (`--in <val>`/`--in=`,
+/// `--display`, and a `--` terminator) to find the first positional — the
+/// binary path — and rewrite only that; the program's own arguments pass
+/// through verbatim (we can't know whether they're paths the guest interprets).
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn translate_run_host_path_windows(mut args: Vec<String>) -> Vec<String> {
-    if let Some(pos) = args.iter().position(|a| a == "run-host") {
-        let mut i = pos + 1;
-        if args.get(i).map(String::as_str) == Some("--") {
-            i += 1;
+    let Some(pos) = args.iter().position(|a| a == "run-host") else {
+        return args;
+    };
+    let mut i = pos + 1;
+    while let Some(tok) = args.get(i).map(String::as_str) {
+        match tok {
+            // Terminator: the next token is the binary path, options are done.
+            "--" => {
+                i += 1;
+                break;
+            }
+            // `--in <value>` consumes a following value token.
+            "--in" => i += 2,
+            // `--in=value` / `--display` / any other leading option: one token.
+            _ if tok.starts_with('-') => i += 1,
+            // First non-option token — the binary path.
+            _ => break,
         }
-        if let Some(p) = args.get(i) {
-            args[i] = win_to_wsl_path(Path::new(p));
-        }
+    }
+    if let Some(p) = args.get(i) {
+        args[i] = win_to_wsl_path(Path::new(p));
     }
     args
 }
@@ -348,6 +362,41 @@ mod tests {
             out,
             vec!["run-host", "/mnt/c/Users/me/app", r"--config=C:\keep"]
         );
+    }
+
+    #[test]
+    fn run_host_path_translated_past_in_and_display_options() {
+        // `--in <container>` (value) and `--display` (flag) precede the binary
+        // path; the path must still be the token that gets translated.
+        let args = vec![
+            "run-host".to_string(),
+            "--in".to_string(),
+            "alpine".to_string(),
+            "--display".to_string(),
+            r"C:\Users\me\app".to_string(),
+            r"--guestflag=C:\keep".to_string(),
+        ];
+        let out = translate_run_host_path_windows(args);
+        assert_eq!(
+            out,
+            vec![
+                "run-host",
+                "--in",
+                "alpine",
+                "--display",
+                "/mnt/c/Users/me/app",
+                r"--guestflag=C:\keep"
+            ]
+        );
+
+        // `--in=value` (equals form) likewise.
+        let args2 = vec![
+            "run-host".to_string(),
+            "--in=debian".to_string(),
+            r"C:\x\y".to_string(),
+        ];
+        let out2 = translate_run_host_path_windows(args2);
+        assert_eq!(out2, vec!["run-host", "--in=debian", "/mnt/c/x/y"]);
     }
 
     #[test]
