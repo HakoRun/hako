@@ -69,13 +69,34 @@ fn read_appended_payload(exe: &Path) -> io::Result<Option<Vec<u8>>> {
 /// Extract (once) and run the bundled container's command.
 fn launch(payload: &[u8]) -> io::Result<ExitCode> {
     let id = hako::Hash::of(payload).to_hex()[..12].to_string();
-    let cache = bundle_cache_dir().join(&id);
+    let base = bundle_cache_dir();
+    let cache = base.join(&id);
+    // `.ready` is written INSIDE the temp dir *before* the dir is moved into
+    // place, so the cache appears atomically and complete — never half-
+    // extracted. Concurrent launches each extract to their own temp dir and
+    // race to rename; the loser sees the cache already present and discards.
     if !cache.join(".ready").exists() {
-        let _ = std::fs::remove_dir_all(&cache);
-        std::fs::create_dir_all(&cache)?;
+        std::fs::create_dir_all(&base)?;
+        let tmp = base.join(format!(".{id}.tmp.{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp)?;
         let gz = flate2::read::GzDecoder::new(payload);
-        tar::Archive::new(gz).unpack(&cache)?;
-        std::fs::write(cache.join(".ready"), b"")?;
+        tar::Archive::new(gz).unpack(&tmp)?;
+        std::fs::write(tmp.join(".ready"), b"")?;
+        // Atomically publish by renaming our temp dir into place.
+        if std::fs::rename(&tmp, &cache).is_err() {
+            if cache.join(".ready").exists() {
+                // Another process published first — discard our temp.
+                let _ = std::fs::remove_dir_all(&tmp);
+            } else {
+                // A stale/partial cache is in the way (e.g. an older hako, or a
+                // crash). Replace it, then retry the publish once.
+                let _ = std::fs::remove_dir_all(&cache);
+                std::fs::rename(&tmp, &cache).map_err(|e| {
+                    io::Error::other(format!("failed to publish bundle cache: {e}"))
+                })?;
+            }
+        }
     }
 
     // Manifest: container \0 branch \0 display("1"/"0") \0 arg0 \0 arg1 ...
@@ -201,15 +222,24 @@ pub fn create(
         tarball.into_inner()?.finish()?
     };
 
-    // The runtime the bundle ships must be a *Linux* hako (the app always runs
-    // in Linux). Prefer the embedded, cross-compiled, release-stripped binary;
-    // fall back to the running binary in a dev build (itself native Linux hako).
-    let embedded = crate::host_bridge::embedded_for_host();
-    let base: Vec<u8> = if embedded.is_empty() {
-        std::fs::read(std::env::current_exe()?)?
-    } else {
-        embedded.to_vec()
-    };
+    // The bundle's base binary is the LAUNCHER, which must be native to the OS
+    // the bundle runs on (a bundle targets the platform it's built on: an ELF
+    // on Linux, a PE on Windows, a Mach-O on macOS). So we always bake the
+    // host-native running binary. On Linux it is also the runtime (runs the
+    // container natively); on Windows/macOS it is the launcher that bridges to
+    // WSL/Lima, where — for full self-containment — it injects its OWN embedded
+    // Linux binary (an `--features embedded` build). Without that feature the
+    // target's WSL/Lima must already have a current hako, so warn.
+    if !cfg!(target_os = "linux") && !crate::host_bridge::has_embedded_binary() {
+        eprintln!(
+            "hako: warning: building a {} bundle without an embedded Linux \
+             runtime (--features embedded). It will run on {0}, but the target \
+             machine's WSL/Lima must already have a current hako installed; it \
+             is not fully self-contained.",
+            std::env::consts::OS
+        );
+    }
+    let base: Vec<u8> = std::fs::read(std::env::current_exe()?)?;
 
     // Assemble: base binary + payload + trailer(magic, payload_len).
     let mut out = std::fs::File::create(&output)?;
@@ -245,8 +275,17 @@ pub fn create(
         output.display(),
         size
     );
+    // A bundle is native to the platform it was built on — say which, rather
+    // than implying it's portable across OSes.
+    let target = match std::env::consts::OS {
+        "linux" => "Linux".to_string(),
+        "windows" => "Windows (uses WSL2)".to_string(),
+        "macos" => "macOS (uses Lima)".to_string(),
+        other => other.to_string(),
+    };
     println!(
-        "a single native executable; run it directly: {}",
+        "a single native executable for {}; run it directly: {}",
+        target,
         output.display()
     );
     Ok(ExitCode::SUCCESS)
