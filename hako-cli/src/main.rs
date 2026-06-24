@@ -73,6 +73,9 @@ enum Cmd {
         src: PathBuf,
         /// Destination path in the vfs
         dst: String,
+        /// Overwrite an existing file at the destination.
+        #[arg(short = 'f', long)]
+        force: bool,
     },
     /// Export a vfs file or directory to the host. `src` may be `<ref>:<path>`.
     Export {
@@ -318,9 +321,12 @@ enum Cmd {
         /// Output path for the bundle executable.
         #[arg(short = 'o', long, default_value = "app.hako")]
         output: PathBuf,
-        /// Bake in display passthrough so the bundled app renders its GUI on
-        /// the host desktop. Off by default (the bundle runs headless unless
-        /// the workspace's hako.toml sets `display = true`).
+        /// Overwrite the output file if it already exists.
+        #[arg(short = 'f', long)]
+        force: bool,
+        /// Record that the bundled app wants display passthrough (a GUI). This
+        /// is only a request — whoever RUNS the bundle must consent by setting
+        /// HAKO_DISPLAY=1; it never auto-grants display access to the host.
         #[arg(long)]
         display: bool,
         /// Command to run inside it (default: the container's interactive
@@ -708,7 +714,7 @@ fn run() -> io::Result<ExitCode> {
         Cmd::Del { path } => cmd::files::del(&ctx, path),
         Cmd::Cp { src, dst } => cmd::files::cp(&ctx, src, dst),
         Cmd::Mv { src, dst } => cmd::files::mv(&ctx, src, dst),
-        Cmd::Import { src, dst } => cmd::files::import(&ctx, src, dst),
+        Cmd::Import { src, dst, force } => cmd::files::import(&ctx, src, dst, force),
         Cmd::Export { src, dst, force } => cmd::files::export(&ctx, src, dst, force),
 
         // Navigation
@@ -799,9 +805,10 @@ fn run() -> io::Result<ExitCode> {
         Cmd::Bundle {
             container,
             output,
+            force,
             display,
             cmd,
-        } => cmd::bundle::create(&ctx, container, cmd, output, display),
+        } => cmd::bundle::create(&ctx, container, cmd, output, force, display),
         Cmd::Ps { all } => cmd::runtime::ps(&ctx, all),
         Cmd::Logs { id, follow } => cmd::runtime::logs(&ctx, id, follow),
         Cmd::Exec { id, command } => cmd::runtime::exec(&ctx, id, command),

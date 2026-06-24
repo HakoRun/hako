@@ -869,6 +869,14 @@ fn apply_seccomp() -> Result<(), RuntimeError> {
         // block outright.
         libc::SYS_open_by_handle_at,
         libc::SYS_name_to_handle_at,
+        // Cross-process inspection/injection. The workload is uid 0 in its own
+        // userns, so without these it still can't debug or read the memory of a
+        // sibling it spawns (e.g. via a setuid helper) — preserving in-container
+        // privilege separation. Docker's default profile blocks ptrace for the
+        // same reason. PID 1 (the reaper) is unfiltered and needs none of these.
+        libc::SYS_ptrace,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
     ];
     let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
         denied.iter().map(|&n| (n, Vec::new())).collect();

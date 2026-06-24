@@ -225,8 +225,13 @@ pub fn merge(
         branch,
         repo.current_branch()?.unwrap_or_default()
     );
+    let cur = repo.current_branch()?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot merge with a detached HEAD — check out a branch first",
+        )
+    })?;
     let commit = repo.commit(merged_root, vec![head, theirs], &author, &msg, now_secs())?;
-    let cur = repo.current_branch()?.unwrap();
     repo.write_ref(&cur, commit)?;
     println!(
         "merged {} into {} as {}",

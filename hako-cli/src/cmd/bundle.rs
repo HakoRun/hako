@@ -106,10 +106,29 @@ fn launch(payload: &[u8]) -> io::Result<ExitCode> {
         .map(|s| String::from_utf8_lossy(s).into_owned());
     let container = fields.next().unwrap_or_default();
     let branch = fields.next().unwrap_or_default();
-    let display = fields.next().as_deref() == Some("1");
+    let wants_display = fields.next().as_deref() == Some("1");
     let cmd: Vec<String> = fields.collect();
 
-    // Re-exec ourselves as the normal CLI against the extracted workspace.
+    // Display passthrough is RUNNER-consented, not bundle-author-controlled.
+    // The baked `display` bit is only a request: granting it lets this (foreign)
+    // executable reach the host's X11/Wayland session — screenshots, keystrokes.
+    // So we never force it on from the manifest; the runner opts in by setting
+    // HAKO_DISPLAY=1 themselves (which flows through to the runtime). If the
+    // bundle wants a GUI but the runner hasn't consented, run headless and say
+    // how to allow it — rather than silently widening the sandbox.
+    let runner_consented =
+        std::env::var_os("HAKO_DISPLAY").is_some_and(|v| v != "0" && !v.is_empty());
+    if wants_display && !runner_consented {
+        eprintln!(
+            "hako: this bundle can render a GUI on your desktop, which grants it \
+             access to your display session (X11/Wayland — it could read your \
+             screen and keystrokes). To allow it, re-run with HAKO_DISPLAY=1."
+        );
+    }
+
+    // Re-exec ourselves as the normal CLI against the extracted workspace. We do
+    // NOT pass --display; if the runner set HAKO_DISPLAY it is inherited here and
+    // reaches the runtime on its own.
     let exe = std::env::current_exe()?;
     let mut c = Command::new(&exe);
     c.env(GUARD_ENV, "1")
@@ -117,11 +136,9 @@ fn launch(payload: &[u8]) -> io::Result<ExitCode> {
         .arg(cache.join("ws"))
         .arg("-c")
         .arg(&container)
-        .arg("run");
-    if display {
-        c.arg("--display");
-    }
-    c.arg(&branch).args(&cmd);
+        .arg("run")
+        .arg(&branch)
+        .args(&cmd);
     let status = c.status()?;
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
@@ -150,8 +167,18 @@ pub fn create(
     container: String,
     cmd: Vec<String>,
     output: PathBuf,
+    force: bool,
     display: bool,
 ) -> io::Result<ExitCode> {
+    if !force && output.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} already exists; pass --force to overwrite",
+                output.display()
+            ),
+        ));
+    }
     // Bake display passthrough in if asked, or if the workspace's hako.toml
     // opts in. Off by default — a bundle runs headless unless the author
     // chose otherwise.

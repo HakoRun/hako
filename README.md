@@ -80,10 +80,16 @@ binary, see [BUILD.md](BUILD.md).
 | **Version control** | `commit`, `log`, `branch`, `checkout`, `merge`, `diff`, `tag` |
 | **Containers** | `containers`, `new-container`, `del-container`, `is` |
 | **OCI** | `pull` |
-| **Runtime** (Linux / bridged) | `run`, `exec`, `ps`, `logs`, `stop`, `reap` |
+| **Runtime** (Linux / bridged) | `run`, `run-host`, `exec`, `ps`, `logs`, `stop`, `reap` |
+| **Packaging** | `bundle` (container → single self-contained executable) |
 | **Sync** | `fetch`, `push` |
 | **Config** | `apply` (reads `hako.toml`) |
 | **Maintenance** | `gc`, `fsck`, `mount`, `bootstrap` |
+
+`run-host <path>` runs a Linux executable straight from the host filesystem
+through hako's sandbox (add `--display` for a GUI app); `bundle <container>`
+packages a container plus its command into one runnable file that needs no
+prior hako install on the target.
 
 `cat`, `ls`, `export`, and `tree` accept a `<ref>:<path>` argument to read from
 any commit, branch, or tag (e.g. `hako cat main:/etc/hosts`). Run
