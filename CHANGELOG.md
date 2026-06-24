@@ -4,10 +4,28 @@ All notable changes to hako are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims
 to follow [Semantic Versioning](https://semver.org/) once it reaches a release.
 
-## [Unreleased]
+## [0.1.1] — 2026-06-10
 
-Pre-release. No versioned releases have been published yet; this section tracks
-the current state of `main`.
+### Added
+- **Release hardening:** the published release now includes a `SHA256SUMS.txt`
+  (with a keyless cosign signature) so downloads can be verified.
+- `--help` documents the `hako is` / `hako as` / unknown-command-runs-in-container
+  ergonomics, and bare `hako` now prints help.
+
+### Changed
+- CI gained a native **arm64** isolation run (the aarch64 binary is now exercised,
+  not just cross-compiled) and a PR-time build of the Windows/macOS embedded
+  wrappers (so embedded/cross breakage is caught before a release tag). Release
+  and CI builds use `--locked`; a tag/version guard prevents mislabeled releases.
+
+### Fixed
+- Removed a stale `build.sh` and corrected "Linux + macOS only" doc/help strings
+  to "Linux only" (FUSE is Linux-only since the libfuse drop).
+
+## [0.1.0] — 2026-06-10
+
+First release. Static Linux binaries (x86_64 / aarch64) plus Windows/macOS
+wrappers that embed the Linux runtime and auto-bootstrap WSL2 / Lima.
 
 ### Added
 - Content-addressed, version-controlled filesystem: BLAKE3 prolly-tree store
@@ -48,4 +66,5 @@ multi-tenant sandbox — cgroup limits require a delegated cgroup v2 (skipped
 otherwise), `:ro` volumes aren't recursively read-only, and ephemeral `run`
 writes create orphan store objects until `gc`.
 
-[Unreleased]: https://github.com/HakoRun/hako/commits/main
+[0.1.1]: https://github.com/HakoRun/hako/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/HakoRun/hako/releases/tag/v0.1.0

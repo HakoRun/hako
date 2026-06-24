@@ -1,4 +1,4 @@
-//! FUSE mount of a hako tree. Linux + macOS only.
+//! FUSE mount of a hako tree. Linux only.
 //!
 //! Two modes:
 //!   - **Read-only** (`mount`, `mount_session`): the tree is fixed at mount

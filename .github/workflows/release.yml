@@ -5,22 +5,42 @@ name: release
 #   - Windows / macOS: host wrappers with the matching Linux runtime EMBEDDED
 #     (`--features embedded`), so they auto-bootstrap a WSL2 distro / Lima VM.
 #
-# Push a `vX.Y.Z` tag to build AND publish. Run via the Actions "Run workflow"
-# button (workflow_dispatch) to build + upload artifacts only (a dry run, no
-# release is published).
+# Push a `vX.Y.Z` tag to build AND publish (with SHA256SUMS + a cosign
+# signature). Run via the Actions "Run workflow" button (workflow_dispatch) to
+# build + upload artifacts only (a dry run, no release is published).
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
 
+# Least privilege by default; only `publish` is granted write + OIDC.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  # 0. On a tag, the tag must match the workspace version, or we'd publish
+  #    mislabeled binaries. No-op on workflow_dispatch (dry run).
+  guard:
+    name: version guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches Cargo version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          ver=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          tag="${GITHUB_REF_NAME#v}"
+          echo "Cargo version: $ver   tag: $tag"
+          if [ "$ver" != "$tag" ]; then
+            echo "::error::tag v$tag does not match workspace version $ver"
+            exit 1
+          fi
+
   # 1. The Linux runtime binaries — static musl, no libfuse/glibc dependency.
   linux:
     name: linux (${{ matrix.target }})
+    needs: guard
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -41,7 +61,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --target ${{ matrix.target }} -p hako-cli
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p hako-cli
       - run: cp target/${{ matrix.target }}/release/hako "${{ matrix.asset }}"
       - uses: actions/upload-artifact@v4
         with:
@@ -64,7 +84,7 @@ jobs:
       # `embedded_for_host()` on a Windows (x86_64) host embeds vendored/hako-linux-x64.
       - run: copy dl\hako-linux-x86_64 vendored\hako-linux-x64
         shell: cmd
-      - run: cargo build --release -p hako-cli --features embedded
+      - run: cargo build --release --locked -p hako-cli --features embedded
       - run: copy target\release\hako.exe hako-windows-x86_64.exe
         shell: cmd
       - uses: actions/upload-artifact@v4
@@ -87,7 +107,7 @@ jobs:
           path: dl
       # `embedded_for_host()` on an arm64 macOS host embeds vendored/hako-linux-arm64.
       - run: cp dl/hako-linux-aarch64 vendored/hako-linux-arm64
-      - run: cargo build --release -p hako-cli --features embedded
+      - run: cargo build --release --locked -p hako-cli --features embedded
       - run: cp target/release/hako hako-macos-arm64
       - uses: actions/upload-artifact@v4
         with:
@@ -95,17 +115,34 @@ jobs:
           path: hako-macos-arm64
           if-no-files-found: error
 
-  # 4. Publish the Release (only on a version tag; a dry run stops here).
+  # 4. Publish the Release with checksums + a keyless cosign signature
+  #    (only on a version tag; a dry run stops at the build jobs).
   publish:
     name: publish release
     needs: [linux, windows, macos]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write # create the release
+      id-token: write # cosign keyless (OIDC)
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum hako-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign checksums (keyless)
+        # Best-effort: a signing hiccup must not block a checksummed release.
+        continue-on-error: true
+        run: |
+          cosign sign-blob --yes dist/SHA256SUMS.txt \
+            --output-signature dist/SHA256SUMS.txt.sig \
+            --output-certificate dist/SHA256SUMS.txt.pem
       - name: List artifacts
         run: ls -la dist
       - uses: softprops/action-gh-release@v2
