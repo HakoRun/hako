@@ -51,9 +51,31 @@ pub fn pull_into(
         "hako: pulling {}/{}:{} ({}/{}) into container {}",
         image_ref.registry, image_ref.repo, image_ref.reference, os, arch, container
     );
-    if !state.list_containers()?.iter().any(|c| c == container) {
+    // Track whether THIS call created the container, so a mid-pull failure
+    // (network drop, registry 5xx, bad layer) doesn't leave a half-created,
+    // empty container behind for `hako containers` to list and a later op to
+    // trip over. We roll it back on error; an existing container is untouched.
+    let newly_created = !state.list_containers()?.iter().any(|c| c == container);
+    if newly_created {
         state.create_container(container)?;
     }
+    let outcome = pull_into_inner(state, image_ref, container, os, arch, per_layer);
+    if outcome.is_err() && newly_created {
+        let _ = state.delete_container(container);
+    }
+    outcome
+}
+
+/// The fetch-and-commit body of `pull_into`, separated so the caller can roll
+/// back a freshly-created container if any step here fails.
+fn pull_into_inner(
+    state: &State,
+    image_ref: &ImageRef,
+    container: &str,
+    os: &str,
+    arch: &str,
+    per_layer: bool,
+) -> io::Result<Hash> {
     let repo = state.open_container(container)?;
     let scoped = ScopedFs::new(repo.store());
     let base = repo.working_tree()?;

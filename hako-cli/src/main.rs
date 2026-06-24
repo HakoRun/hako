@@ -292,8 +292,13 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
-    /// Send SIGTERM to a runtime instance's supervising process. Unix only.
-    Stop { id: String },
+    /// Stop a runtime instance: SIGTERM by default (graceful), or `--force`
+    /// for SIGKILL when a workload ignores SIGTERM. Unix only.
+    Stop {
+        id: String,
+        #[arg(short = 'f', long)]
+        force: bool,
+    },
     /// Remove a runtime instance's state. Refuses if running unless --force.
     Reap {
         id: String,
@@ -812,7 +817,7 @@ fn run() -> io::Result<ExitCode> {
         Cmd::Ps { all } => cmd::runtime::ps(&ctx, all),
         Cmd::Logs { id, follow } => cmd::runtime::logs(&ctx, id, follow),
         Cmd::Exec { id, command } => cmd::runtime::exec(&ctx, id, command),
-        Cmd::Stop { id } => cmd::runtime::stop(&ctx, id),
+        Cmd::Stop { id, force } => cmd::runtime::stop(&ctx, id, force),
         Cmd::Reap { id, force } => cmd::runtime::reap(&ctx, id, force),
 
         // Maintenance

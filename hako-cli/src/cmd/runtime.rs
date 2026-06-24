@@ -467,9 +467,9 @@ pub fn exec(ctx: &Ctx<'_>, id: String, command: Vec<String>) -> io::Result<ExitC
     Ok(exit_code_from(code))
 }
 
-pub fn stop(ctx: &Ctx<'_>, id: String) -> io::Result<ExitCode> {
+pub fn stop(ctx: &Ctx<'_>, id: String, force: bool) -> io::Result<ExitCode> {
     let runtime_root = ctx.workdir.join(DOT_HAKO);
-    hako_runtime::instances::stop(&runtime_root, &id).map_err(runtime_to_io)?;
+    hako_runtime::instances::stop(&runtime_root, &id, force).map_err(runtime_to_io)?;
     Ok(ExitCode::SUCCESS)
 }
 
