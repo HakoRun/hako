@@ -6,9 +6,60 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+/// Byte budget for the in-memory read-through cache. The cache only accelerates
+/// reads — every chunk is authoritative on disk and `get` re-reads (and
+/// re-verifies) on a miss — so eviction is always safe; it just costs a reread.
+/// Bounding it prevents unbounded RAM growth on a long-lived process that
+/// touches a large working set (e.g. a FUSE server over a multi-GB image).
+const CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// A size-bounded chunk cache. Not an LRU (no access ordering is tracked);
+/// when over budget it evicts arbitrary entries, which is fine for a pure
+/// read accelerator. Tracks total bytes so the budget check is O(1).
+#[derive(Default)]
+struct Cache {
+    map: HashMap<Hash, Vec<u8>>,
+    bytes: usize,
+}
+
+impl Cache {
+    fn get(&self, hash: &Hash) -> Option<Vec<u8>> {
+        self.map.get(hash).cloned()
+    }
+
+    fn contains(&self, hash: &Hash) -> bool {
+        self.map.contains_key(hash)
+    }
+
+    fn remove(&mut self, hash: &Hash) {
+        if let Some(v) = self.map.remove(hash) {
+            self.bytes -= v.len();
+        }
+    }
+
+    /// Insert unless already present, then evict down to the budget.
+    fn store(&mut self, hash: Hash, data: Vec<u8>) {
+        // Never let a single chunk larger than the whole budget evict everything
+        // else only to not fit anyway — just skip caching it.
+        if data.len() > CACHE_BUDGET_BYTES || self.map.contains_key(&hash) {
+            return;
+        }
+        self.bytes += data.len();
+        self.map.insert(hash, data);
+        while self.bytes > CACHE_BUDGET_BYTES {
+            let Some(victim) = self.map.keys().next().copied() else {
+                break;
+            };
+            if let Some(v) = self.map.remove(&victim) {
+                self.bytes -= v.len();
+            }
+        }
+    }
+}
+
 pub struct FsStore {
     root: PathBuf,
-    cache: Mutex<HashMap<Hash, Vec<u8>>>,
+    cache: Mutex<Cache>,
 }
 
 impl FsStore {
@@ -16,7 +67,7 @@ impl FsStore {
         fs::create_dir_all(&root)?;
         Ok(Self {
             root,
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(Cache::default()),
         })
     }
 
@@ -53,11 +104,7 @@ impl ChunkStore for FsStore {
         let path = self.chunk_path(&hash);
 
         if path.exists() {
-            self.cache
-                .lock()
-                .unwrap()
-                .entry(hash)
-                .or_insert_with(|| data.to_vec());
+            self.cache.lock().unwrap().store(hash, data.to_vec());
             return Ok(hash);
         }
 
@@ -91,20 +138,20 @@ impl ChunkStore for FsStore {
 
         let _ = fsync_dir(parent);
 
-        self.cache.lock().unwrap().insert(hash, data.to_vec());
+        self.cache.lock().unwrap().store(hash, data.to_vec());
         Ok(hash)
     }
 
     fn get(&self, hash: &Hash) -> io::Result<Option<Vec<u8>>> {
         if let Some(data) = self.cache.lock().unwrap().get(hash) {
-            return Ok(Some(data.clone()));
+            return Ok(Some(data));
         }
 
         let path = self.chunk_path(hash);
         match fs::read(&path) {
             Ok(data) => {
                 if Hash::of(&data) == *hash {
-                    self.cache.lock().unwrap().insert(*hash, data.clone());
+                    self.cache.lock().unwrap().store(*hash, data.clone());
                     Ok(Some(data))
                 } else {
                     // Bit rot: treat as missing rather than serve corrupted bytes.
@@ -117,7 +164,7 @@ impl ChunkStore for FsStore {
     }
 
     fn has(&self, hash: &Hash) -> io::Result<bool> {
-        if self.cache.lock().unwrap().contains_key(hash) {
+        if self.cache.lock().unwrap().contains(hash) {
             return Ok(true);
         }
         Ok(self.chunk_path(hash).exists())
@@ -274,5 +321,40 @@ mod tests {
         // 'zz' is unlikely to match any blake3 hex prefix; if collision, the test
         // becomes flaky — extremely improbable.
         assert!(s.find_by_prefix("zzzzzzzz").unwrap().is_empty());
+    }
+
+    #[test]
+    fn cache_is_bounded_and_still_serves_after_eviction() {
+        let (_d, s) = store();
+        // Write more than the budget so eviction must occur. 1 MiB chunks.
+        let chunk_mb = 1usize;
+        let count = (CACHE_BUDGET_BYTES / (chunk_mb * 1024 * 1024)) + 8;
+        let mut hashes = Vec::new();
+        for i in 0..count {
+            let mut data = vec![0u8; chunk_mb * 1024 * 1024];
+            data[..8].copy_from_slice(&(i as u64).to_le_bytes()); // make each distinct
+            hashes.push(s.put(&data).unwrap());
+        }
+        // Cache stayed within budget despite writing well past it.
+        assert!(
+            s.cache.lock().unwrap().bytes <= CACHE_BUDGET_BYTES,
+            "cache exceeded budget"
+        );
+        // Every chunk is still retrievable — evicted ones are re-read from disk.
+        for (i, h) in hashes.iter().enumerate() {
+            let got = s.get(h).unwrap().expect("chunk must still be readable");
+            assert_eq!(&got[..8], &(i as u64).to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn oversized_chunk_is_not_cached() {
+        let (_d, s) = store();
+        // A chunk larger than the whole budget shouldn't be cached (or evict all).
+        let big = vec![7u8; CACHE_BUDGET_BYTES + 1024];
+        let h = s.put(&big).unwrap();
+        assert!(!s.cache.lock().unwrap().contains(&h));
+        // Still durably stored and readable from disk.
+        assert_eq!(s.get(&h).unwrap().map(|v| v.len()), Some(big.len()));
     }
 }
