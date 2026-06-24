@@ -95,12 +95,23 @@ pub fn mv(ctx: &Ctx<'_>, src: String, dst: String) -> io::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-pub fn import(ctx: &Ctx<'_>, src: PathBuf, dst: String) -> io::Result<ExitCode> {
+pub fn import(ctx: &Ctx<'_>, src: PathBuf, dst: String, force: bool) -> io::Result<ExitCode> {
     let dst = apply_cwd(ctx.session, &dst);
     let mut count = 0u64;
     with_target_mut(ctx.state, ctx.default_container, &dst, |repo, p| {
         let scoped = ScopedFs::new(repo.store());
         let root = repo.working_tree()?;
+        // Don't silently clobber an existing vfs file (symmetric with export's
+        // --force). Importing INTO a directory still merges, as expected.
+        if !force && scoped.is_file(&root, p)? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} already exists in the container; pass --force to overwrite",
+                    p
+                ),
+            ));
+        }
         let new_root = import_path(&scoped, &root, &src, p, &mut count)?;
         repo.set_working(new_root)
     })?;

@@ -8,6 +8,7 @@ use hako::{Config, Session, State};
 use std::path::Path;
 
 pub mod apply;
+pub mod bundle;
 pub mod files;
 pub mod maintenance;
 pub mod nav;

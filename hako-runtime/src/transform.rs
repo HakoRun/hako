@@ -193,6 +193,14 @@ pub fn run_container_detached(
             // captured to the instance log files by `redirect_output`.
             detach_stdio();
 
+            // Become a session leader NOW — before run_inner's inner fork
+            // spawns the FUSE server and the command/workload subtree — so the
+            // *entire* detached tree leaves the launching shell's session. Done
+            // after detach_stdio (stdio already points at /dev/null, so losing
+            // the controlling terminal is harmless). Best-effort: a failure
+            // here shouldn't abort the spawn. (Issue #17.)
+            let _ = setsid();
+
             let exit_code = match run_inner(
                 store,
                 root,
@@ -427,7 +435,7 @@ fn run_inner(
         }
         ForkResult::Parent { child } => {
             drop(shell_sock);
-            run_fuse_server(store, root, fuse_sock, child, detached, detached_state)
+            run_fuse_server(store, root, fuse_sock, child, detached_state)
         }
     }
 }
@@ -439,7 +447,6 @@ fn run_fuse_server(
     root: Hash,
     sync_sock: UnixStream,
     child: Pid,
-    detached: bool,
     detached_state: Option<(PathBuf, String)>,
 ) -> Result<i32, RuntimeError> {
     // Mount FUSE in the background, READ-WRITE so the container has a writable
@@ -451,11 +458,9 @@ fn run_fuse_server(
     let _session = hako::fuse::mount_session_rw(store, root, Path::new(MOUNTPOINT))
         .map_err(|e| io_other(format!("mount FUSE rw: {}", e)))?;
 
-    // For detached mode, become a session leader after FUSE is set up so we
-    // detach cleanly from the controlling terminal.
-    if detached {
-        setsid().map_err(|e| io_other(format!("setsid: {}", e)))?;
-    }
+    // (Detachment from the controlling terminal is handled earlier, in the
+    // detached supervisor before the inner fork, so the whole tree — not just
+    // this FUSE server — leaves the launching shell's session. See issue #17.)
 
     // Signal the command-setup process that the mount is ready.
     let mut sock = sync_sock;
@@ -714,6 +719,16 @@ fn container_init(
     setup_bind_mounts(root, net_isolated)?;
     setup_special_mounts(root)?;
     setup_user_volumes(root, volumes)?;
+    // Display passthrough — OPT-IN ONLY (HAKO_DISPLAY set). Exposing the host's
+    // X11/Wayland socket to the workload weakens isolation (X11 has no
+    // intra-client isolation: a container app could screenshot/keylog the host
+    // session), so it is off by default for every `run`/`apply`. The CLI sets
+    // HAKO_DISPLAY=1 when the user opts in via `--display`, a bundle baked with
+    // `--display`, or `display = true` in hako.toml. When enabled, the matching
+    // DISPLAY/WAYLAND_DISPLAY/XDG_RUNTIME_DIR env vars are inherited via execvp.
+    if env::var_os("HAKO_DISPLAY").is_some_and(|v| v != "0" && !v.is_empty()) {
+        setup_display(root);
+    }
 
     // For detached mode, redirect stdout/stderr to log files BEFORE pivot_root
     // (the log paths are on the host filesystem, not the new root).
@@ -854,6 +869,14 @@ fn apply_seccomp() -> Result<(), RuntimeError> {
         // block outright.
         libc::SYS_open_by_handle_at,
         libc::SYS_name_to_handle_at,
+        // Cross-process inspection/injection. The workload is uid 0 in its own
+        // userns, so without these it still can't debug or read the memory of a
+        // sibling it spawns (e.g. via a setuid helper) — preserving in-container
+        // privilege separation. Docker's default profile blocks ptrace for the
+        // same reason. PID 1 (the reaper) is unfiltered and needs none of these.
+        libc::SYS_ptrace,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
     ];
     let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
         denied.iter().map(|&n| (n, Vec::new())).collect();
@@ -1100,6 +1123,17 @@ fn setup_sysfs(root: &str, net_isolated: bool) -> Result<(), RuntimeError> {
 /// since the kernel's MS_BIND ignores rw/ro flags on the initial mount.
 fn setup_user_volumes(root: &str, volumes: &[VolumeMount]) -> Result<(), RuntimeError> {
     for v in volumes {
+        // Defense in depth: the container target must be absolute and contain
+        // no `..` component, so it can never resolve to the rootfs itself or
+        // escape above it. VolumeMount::parse enforces absolute for user `-v`
+        // specs but not `..`, and run-host builds VolumeMounts directly — so
+        // re-validate here, the last gate before the mount syscall.
+        if !Path::new(&v.container).is_absolute() || v.container.split('/').any(|c| c == "..") {
+            return Err(io_other(format!(
+                "refusing unsafe mount target {:?} (must be absolute, no `..`)",
+                v.container
+            )));
+        }
         let host = v.host.canonicalize().map_err(|e| {
             io_other(format!(
                 "volume host {} cannot be resolved: {}",
@@ -1144,6 +1178,51 @@ fn setup_user_volumes(root: &str, volumes: &[VolumeMount]) -> Result<(), Runtime
         }
     }
     Ok(())
+}
+
+/// Best-effort display passthrough. Binds the host's X11 and/or Wayland
+/// sockets into the container so a GUI workload can render on the host
+/// desktop (native X/Wayland, or WSLg when bridged from Windows). Entirely
+/// silent and non-fatal: any missing piece is skipped, so a headless host or
+/// a non-GUI workload is unaffected. The DISPLAY / WAYLAND_DISPLAY /
+/// XDG_RUNTIME_DIR env vars are inherited by the workload via execvp.
+fn setup_display(root: &str) {
+    // X11: the Unix-socket directory. Mounted into the container's private
+    // tmpfs /tmp so that DISPLAY=:N resolves to /tmp/.X11-unix/XN inside.
+    let x11 = "/tmp/.X11-unix";
+    if Path::new(x11).is_dir() {
+        let target = format!("{}{}", root, x11);
+        if fs::create_dir_all(&target).is_ok() {
+            let _ = bind_mount(x11, target.as_str(), MsFlags::MS_BIND | MsFlags::MS_REC);
+        }
+    }
+
+    // Wayland: $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY (default wayland-0). Resolve
+    // symlinks (WSLg points /run/user/<uid>/wayland-0 at /mnt/wslg) and bind
+    // the real socket at the same in-container path the env var advertises.
+    // The runtime dir is backed by a fresh tmpfs so the socket mountpoint goes
+    // there, not into the rootfs tree (which would otherwise leak a /run/user
+    // stub into an `apply` commit — and future-proofs a read-only root).
+    if let Ok(xdg) = env::var("XDG_RUNTIME_DIR") {
+        let disp = env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
+        let sock = Path::new(&xdg).join(&disp);
+        if let Ok(real) = sock.canonicalize() {
+            let run_dir = format!("{}/{}", root, xdg.trim_start_matches('/'));
+            if fs::create_dir_all(&run_dir).is_ok() {
+                let _ = mount_kind(
+                    "tmpfs",
+                    &run_dir,
+                    "tmpfs",
+                    MsFlags::empty(),
+                    Some("mode=700"),
+                );
+                let target = format!("{}/{}", run_dir, disp);
+                if fs::write(&target, "").is_ok() {
+                    let _ = bind_mount(real, target.as_str(), MsFlags::MS_BIND);
+                }
+            }
+        }
+    }
 }
 
 fn pivot_into(new_root: &str) -> Result<(), RuntimeError> {

@@ -293,7 +293,7 @@ pub fn remove(workdir: &Path, id: &str, force: bool) -> Result<(), RuntimeError>
 /// finished starting). Validates start_time first to avoid signalling a
 /// recycled pid.
 #[cfg(target_os = "linux")]
-pub fn stop(workdir: &Path, id: &str) -> Result<(), RuntimeError> {
+pub fn stop(workdir: &Path, id: &str, force: bool) -> Result<(), RuntimeError> {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
     let (pid, recorded_start) = read_nspid_with_starttime(workdir, id)
@@ -305,13 +305,23 @@ pub fn stop(workdir: &Path, id: &str) -> Result<(), RuntimeError> {
             id, pid
         )));
     }
-    kill(Pid::from_raw(pid as i32), Signal::SIGTERM)
+    // SIGTERM is graceful (the init forwards it to the workload). `--force`
+    // sends SIGKILL straight to the container's PID 1, which the kernel
+    // delivers to the whole PID namespace — the reliable last resort for a
+    // workload that ignores SIGTERM (otherwise the instance + its FUSE mount
+    // would leak). Mirrors `docker stop` vs `docker kill`.
+    let sig = if force {
+        Signal::SIGKILL
+    } else {
+        Signal::SIGTERM
+    };
+    kill(Pid::from_raw(pid as i32), sig)
         .map_err(|e| RuntimeError::Other(format!("kill {}: {}", pid, e)))?;
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn stop(_workdir: &Path, _id: &str) -> Result<(), RuntimeError> {
+pub fn stop(_workdir: &Path, _id: &str, _force: bool) -> Result<(), RuntimeError> {
     Err(RuntimeError::UnsupportedPlatform {
         operation: "hako stop",
         hint: "Signalling runtime instances happens on the Linux runtime host. \

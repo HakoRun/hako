@@ -52,7 +52,9 @@ pub fn ensure_runtime() -> io::Result<()> {
     }
 
     // Distro exists. If we have an embedded binary, keep the installed
-    // copy in sync. If we don't, trust whatever the user installed manually.
+    // copy in sync. If we don't, the WSL hako was installed out-of-band and
+    // can silently drift from this wrapper — warn on a version mismatch so a
+    // stale runtime doesn't surface as a confusing downstream error.
     if has_embedded_binary() {
         let want = binary_hash();
         if read_installed_hash(&distro).as_deref() != Some(&want) {
@@ -60,8 +62,85 @@ pub fn ensure_runtime() -> io::Result<()> {
             inject_binary(&distro)?;
             write_installed_hash(&distro, &want)?;
         }
+    } else {
+        warn_on_version_skew(&distro);
     }
     Ok(())
+}
+
+/// Best-effort warning when the hako installed in `distro` reports a different
+/// version than this wrapper, or can't report one at all (missing/stale). Only
+/// reached in non-embedded builds, where nothing keeps the WSL binary in sync.
+///
+/// Cached: once the distro's hako matches this wrapper, a marker file records
+/// the agreed version and the (cold, ~1s) `wsl -- hako --version` probe is
+/// skipped on every subsequent command — it only re-runs when this wrapper is
+/// upgraded (the marker no longer matches) or while a mismatch persists (we
+/// don't write the marker until they agree, so the warning keeps showing).
+///
+/// Note: compares the crate version string, so it catches release-to-release
+/// drift but not same-version code drift — an embedded build (exact hash sync)
+/// is the only thing that guarantees byte-for-byte parity. A binary too old to
+/// answer `--version` trips the "couldn't determine" branch.
+fn warn_on_version_skew(distro: &str) {
+    let want = env!("CARGO_PKG_VERSION");
+    let marker = skew_marker_path(distro);
+    // Fast path: we already verified this wrapper version against the distro.
+    if let Some(m) = &marker {
+        if fs::read_to_string(m).is_ok_and(|s| s.trim() == want) {
+            return;
+        }
+    }
+    match wsl_hako_version(distro) {
+        Some(got) if got == want => {
+            // In sync — remember it so we skip the probe next time.
+            if let Some(m) = &marker {
+                if let Some(parent) = m.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(m, want);
+            }
+        }
+        Some(got) => eprintln!(
+            "hako: WARNING: the hako in WSL distro '{distro}' is {got}, but this \
+             wrapper is {want}. Runtime commands run inside WSL, so they use \
+             {got}. Update it with `wsl -d {distro} -- cargo install --force \
+             hako-cli`, or rebuild this wrapper with --features embedded to \
+             keep it auto-synced."
+        ),
+        None => eprintln!(
+            "hako: WARNING: couldn't determine the hako version in WSL distro \
+             '{distro}' — it may be missing or too old. If runtime commands \
+             fail, update it with `wsl -d {distro} -- cargo install --force \
+             hako-cli`."
+        ),
+    }
+}
+
+/// Windows-side marker recording the last wrapper version verified in sync with
+/// `distro`, under the same `%LOCALAPPDATA%\hako\runtime\<distro>` tree.
+fn skew_marker_path(distro: &str) -> Option<std::path::PathBuf> {
+    wsl_install_dir(distro)
+        .ok()
+        .map(|d| d.join(".skew-checked"))
+}
+
+/// Run `hako --version` inside `distro` and parse the version out of its
+/// `hako X.Y.Z` output. Robust to a banner/MOTD on either side: returns the
+/// first whitespace token that begins with a digit (the `X.Y.Z`), not a fixed
+/// position. None if it can't run or prints no version-like token.
+fn wsl_hako_version(distro: &str) -> Option<String> {
+    let out = Command::new("wsl")
+        .args(["-d", distro, "--", "hako", "--version"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace()
+        .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .map(|s| s.to_string())
 }
 
 fn require_wsl_available() -> io::Result<()> {

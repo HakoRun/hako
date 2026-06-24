@@ -26,12 +26,18 @@ pub const DOT_HAKO: &str = ".hako";
         Run/exec need a Linux runtime; on Windows/macOS they bridge into a WSL2 distro / Lima VM."
 )]
 struct Cli {
-    /// Workspace directory containing .hako (defaults to current dir)
-    #[arg(short = 'w', long, global = true)]
+    /// Workspace directory containing .hako (defaults to current dir).
+    /// A context flag: must appear before the subcommand (e.g.
+    /// `hako -w /path run ...`), so it never collides with a guest program's
+    /// own `-w`/`--workdir` in `run`/`run-host`/`exec`.
+    #[arg(short = 'w', long)]
     workdir: Option<PathBuf>,
 
-    /// Default container (overrides session container if set)
-    #[arg(short = 'c', long, global = true)]
+    /// Default container, overriding the session identity for this one command.
+    /// A context flag: must appear before the subcommand (e.g.
+    /// `hako -c ubuntu ls /`), so it never collides with a guest program's own
+    /// `-c` (use `hako is`/`as` for the durable/sugared forms).
+    #[arg(short = 'c', long)]
     container: Option<String>,
 
     #[command(subcommand)]
@@ -67,6 +73,9 @@ enum Cmd {
         src: PathBuf,
         /// Destination path in the vfs
         dst: String,
+        /// Overwrite an existing file at the destination.
+        #[arg(short = 'f', long)]
+        force: bool,
     },
     /// Export a vfs file or directory to the host. `src` may be `<ref>:<path>`.
     Export {
@@ -220,7 +229,48 @@ enum Cmd {
         /// Skip the implicit workspace bind-mount at /workspace.
         #[arg(long)]
         no_workspace: bool,
-        #[arg(trailing_var_arg = true)]
+        /// Pass the host display (X11/Wayland) into the container so a GUI app
+        /// renders on the host desktop. Off by default — it exposes the host
+        /// display socket to the workload, weakening isolation.
+        #[arg(long)]
+        display: bool,
+        /// Command + args to run, passed through verbatim. Most guest flags
+        /// pass through, but a first token that collides with one of hako run's
+        /// own flags (`-d`, `-v`, `--no-workspace`, `--display`) is taken by
+        /// hako — put `--` before the command to force everything through
+        /// (e.g. `hako run alpine -- top -d`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Run a Linux executable from the HOST filesystem through hako.
+    ///
+    /// The host system directories are bind-mounted read-only (so a
+    /// dynamically-linked binary resolves its loader + libraries) and the
+    /// process runs under hako's namespaces + seccomp. Pass `--display` to
+    /// render a GUI app on the host desktop. This is the "I downloaded a Linux
+    /// app, just run it" path — a convenience sandbox, not a reproducible
+    /// versioned container.
+    /// Examples:
+    ///   `hako run-host --display /usr/bin/xeyes`  — render a GUI app
+    ///   `hako run-host ~/Downloads/app.bin`       — run a downloaded binary
+    /// Network is isolated. Linux only (bridged from Windows/macOS).
+    RunHost {
+        /// Run the binary against a CONTAINER's filesystem instead of the
+        /// host's — its libraries come from the container, so an Alpine/musl
+        /// or other cross-distro binary works. Pass a container name, or
+        /// `auto` to pick (and pull if missing) a base image from the binary's
+        /// libc (musl → alpine, glibc → debian). Omit for host libraries.
+        #[arg(long = "in", value_name = "CONTAINER")]
+        in_container: Option<String>,
+        /// Pass the host display (X11/Wayland) through so a GUI app renders on
+        /// the host desktop. Off by default (weakens isolation).
+        #[arg(long)]
+        display: bool,
+        /// The host executable to run, followed by its arguments. Everything
+        /// here is passed through verbatim (the first token is the binary
+        /// path, absolute or relative to cwd). Use `--` if the binary's own
+        /// flags would otherwise look like hako flags.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
     /// List runtime instances (running and exited).
@@ -239,11 +289,16 @@ enum Cmd {
     Exec {
         /// Instance id (or unique prefix)
         id: String,
-        #[arg(trailing_var_arg = true, required = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
-    /// Send SIGTERM to a runtime instance's supervising process. Unix only.
-    Stop { id: String },
+    /// Stop a runtime instance: SIGTERM by default (graceful), or `--force`
+    /// for SIGKILL when a workload ignores SIGTERM. Unix only.
+    Stop {
+        id: String,
+        #[arg(short = 'f', long)]
+        force: bool,
+    },
     /// Remove a runtime instance's state. Refuses if running unless --force.
     Reap {
         id: String,
@@ -260,6 +315,30 @@ enum Cmd {
     },
     /// Verify the object graph is intact. Exit 1 if problems found.
     Fsck,
+
+    /// Package a container + command into a single self-contained executable
+    /// that runs the app through hako — no prior hako install or workspace
+    /// needed on the target. (First cut: a Unix self-extracting bundle; the
+    /// native Windows `.exe` stub is WIP.)
+    Bundle {
+        /// Container to package.
+        container: String,
+        /// Output path for the bundle executable.
+        #[arg(short = 'o', long, default_value = "app.hako")]
+        output: PathBuf,
+        /// Overwrite the output file if it already exists.
+        #[arg(short = 'f', long)]
+        force: bool,
+        /// Record that the bundled app wants display passthrough (a GUI). This
+        /// is only a request — whoever RUNS the bundle must consent by setting
+        /// HAKO_DISPLAY=1; it never auto-grants display access to the host.
+        #[arg(long)]
+        display: bool,
+        /// Command to run inside it (default: the container's interactive
+        /// shell). Must come last; passed through verbatim.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
+    },
 
     /// Pre-warm the host runtime: idempotently set up the WSL distro
     /// (Windows) / Lima VM (macOS) and inject the embedded Linux hako
@@ -318,7 +397,7 @@ impl Cmd {
     /// user's WSL/Lima env via `host_bridge`. Read-only commands stay native.
     fn needs_linux_runtime(&self) -> bool {
         match self {
-            Cmd::Run { .. } | Cmd::Exec { .. } | Cmd::External(_) => true,
+            Cmd::Run { .. } | Cmd::RunHost { .. } | Cmd::Exec { .. } | Cmd::External(_) => true,
             // `apply --dry-run` parses hako.toml and prints the plan
             // without touching the runtime — no reason to pay the WSL/Lima
             // round-trip just to print 4 lines.
@@ -348,7 +427,11 @@ impl Cmd {
             | Cmd::Stop { .. } => false,
             // Long-running: holding the lock would block every other CLI
             // invocation for the lifetime of the container/mount.
-            Cmd::Mount { .. } | Cmd::Run { .. } | Cmd::Exec { .. } | Cmd::External(_) => false,
+            Cmd::Mount { .. }
+            | Cmd::Run { .. }
+            | Cmd::RunHost { .. }
+            | Cmd::Exec { .. }
+            | Cmd::External(_) => false,
             // Branch / tag list mode (no name) is read-only.
             Cmd::Branch { name: None, .. } => false,
             Cmd::Tag { name: None, .. } => false,
@@ -363,6 +446,16 @@ impl Cmd {
 }
 
 fn main() -> ExitCode {
+    // If this binary is a self-contained bundle (a hako binary with a payload
+    // appended), run the baked container command instead of the normal CLI.
+    match cmd::bundle::maybe_run_as_bundle() {
+        Ok(Some(code)) => return code,
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("hako: bundle: {}", e);
+            return ExitCode::FAILURE;
+        }
+    }
     match run() {
         Ok(code) => code,
         Err(e) => {
@@ -402,6 +495,10 @@ fn strip_globals(args: &[String]) -> (Option<PathBuf>, Option<String>, Vec<Strin
         } else if let Some(v) = a.strip_prefix("--container=") {
             container = Some(v.to_string());
             i += 1;
+        } else if a == "--" {
+            // Explicit end-of-options: everything after `--` is the guest
+            // command, passed through verbatim. Drop the `--` itself.
+            return (workdir, container, args[i + 1..].to_vec());
         } else {
             return (workdir, container, args[i..].to_vec());
         }
@@ -490,10 +587,16 @@ fn run() -> io::Result<ExitCode> {
     }
 
     // For every other command: if -w was passed, use it verbatim. Otherwise
-    // walk up from cwd looking for `.hako/`, like git looks for `.git/`.
+    // fall back to $HAKO_WORKDIR (the host bridge sets this, via WSLENV path
+    // translation, so a Windows workspace path with spaces survives the
+    // wsl.exe boundary). Otherwise walk up from cwd looking for `.hako/`, like
+    // git looks for `.git/`.
     let workdir = match cli.workdir.clone() {
         Some(w) => w,
-        None => find_workspace_root(&cwd)?,
+        None => match std::env::var_os("HAKO_WORKDIR") {
+            Some(w) if !w.is_empty() => PathBuf::from(w),
+            _ => find_workspace_root(&cwd)?,
+        },
     };
 
     let dot = workdir.join(DOT_HAKO);
@@ -616,7 +719,7 @@ fn run() -> io::Result<ExitCode> {
         Cmd::Del { path } => cmd::files::del(&ctx, path),
         Cmd::Cp { src, dst } => cmd::files::cp(&ctx, src, dst),
         Cmd::Mv { src, dst } => cmd::files::mv(&ctx, src, dst),
-        Cmd::Import { src, dst } => cmd::files::import(&ctx, src, dst),
+        Cmd::Import { src, dst, force } => cmd::files::import(&ctx, src, dst, force),
         Cmd::Export { src, dst, force } => cmd::files::export(&ctx, src, dst, force),
 
         // Navigation
@@ -688,12 +791,33 @@ fn run() -> io::Result<ExitCode> {
             detach,
             volumes,
             no_workspace,
+            display,
             command,
-        } => cmd::runtime::run(&ctx, branch, detach, volumes, no_workspace, command),
+        } => cmd::runtime::run(
+            &ctx,
+            branch,
+            detach,
+            volumes,
+            no_workspace,
+            display,
+            command,
+        ),
+        Cmd::RunHost {
+            in_container,
+            display,
+            command,
+        } => cmd::runtime::run_host(&ctx, in_container, display, command),
+        Cmd::Bundle {
+            container,
+            output,
+            force,
+            display,
+            cmd,
+        } => cmd::bundle::create(&ctx, container, cmd, output, force, display),
         Cmd::Ps { all } => cmd::runtime::ps(&ctx, all),
         Cmd::Logs { id, follow } => cmd::runtime::logs(&ctx, id, follow),
         Cmd::Exec { id, command } => cmd::runtime::exec(&ctx, id, command),
-        Cmd::Stop { id } => cmd::runtime::stop(&ctx, id),
+        Cmd::Stop { id, force } => cmd::runtime::stop(&ctx, id, force),
         Cmd::Reap { id, force } => cmd::runtime::reap(&ctx, id, force),
 
         // Maintenance

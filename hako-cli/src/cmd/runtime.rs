@@ -18,8 +18,10 @@ pub fn run(
     detach: bool,
     volumes: Vec<String>,
     no_workspace: bool,
+    display: bool,
     command: Vec<String>,
 ) -> io::Result<ExitCode> {
+    set_display_env(ctx, display);
     let volumes = build_volumes(ctx, &volumes, no_workspace)?;
     let repo = ctx.state.open_container(ctx.default_container)?;
     if detach {
@@ -41,6 +43,291 @@ pub fn run(
             .map_err(runtime_to_io)?;
         Ok(exit_code_from(code))
     }
+}
+
+/// Opt display passthrough on for the runtime call about to be made. The
+/// runtime reads `HAKO_DISPLAY`; setting it here (before the in-process fork
+/// in `hako_runtime::transform`) propagates it to the container. Honors the
+/// explicit `--display` flag OR `display = true` in the workspace's hako.toml.
+/// Off otherwise — passthrough weakens isolation, so it is never the default.
+fn set_display_env(ctx: &Ctx<'_>, flag: bool) {
+    let from_cfg = ctx.cfg.app.as_ref().is_some_and(|a| a.display);
+    if flag || from_cfg {
+        std::env::set_var("HAKO_DISPLAY", "1");
+    }
+}
+
+/// `hako run-host [--in <container>|auto] <path> [args...]` — run a Linux
+/// binary from the host filesystem through hako, with display passthrough.
+///
+/// Three modes, differing in where the binary's *libraries* come from:
+///   - default — the host system (bind-mounted read-only). Best for a binary
+///     matching the host libc, a static binary, or an AppImage.
+///   - `--in <container>` — that container's rootfs (only the binary is mounted
+///     in). Lets a cross-distro binary (e.g. Alpine/musl) run against the
+///     libraries it actually needs.
+///   - `--in auto` — detect the binary's libc and pick (pulling if missing) a
+///     base image: musl → alpine, glibc → debian.
+pub fn run_host(
+    ctx: &Ctx<'_>,
+    in_container: Option<String>,
+    display: bool,
+    command: Vec<String>,
+) -> io::Result<ExitCode> {
+    set_display_env(ctx, display);
+    // command[0] is the host binary path; the rest are its arguments. Resolve
+    // it to a canonical absolute path: this turns `./app`, `app`, `../app`,
+    // and symlinks into a real absolute path with no `.`/`..` components — so
+    // the mount target derived from it (push_bin_dir) can never become `/`,
+    // the cwd, or a path above the container root. The in-container exec path
+    // (command[0]) is rewritten to match, so it resolves to the mounted file.
+    let raw = command
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "run-host needs a path"))?
+        .clone();
+    let abs = std::fs::canonicalize(&raw).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("run-host: cannot resolve binary {:?}: {}", raw, e),
+        )
+    })?;
+    let path = abs.to_string_lossy().to_string();
+    let mut command = command;
+    command[0] = path.clone();
+
+    match in_container.as_deref() {
+        None => run_host_on_host(ctx, &path, command),
+        Some("auto") => {
+            let container = resolve_auto_container(ctx, &path)?;
+            run_host_in_container(ctx, &container, &path, command)
+        }
+        Some(name) => run_host_in_container(ctx, name, &path, command),
+    }
+}
+
+/// Tier 1: libraries from the host system.
+fn run_host_on_host(ctx: &Ctx<'_>, path: &str, command: Vec<String>) -> io::Result<ExitCode> {
+    use std::path::{Path, PathBuf};
+    // Read-only binds of the host system, so a dynamically-linked binary finds
+    // its interpreter (/lib64/ld-*.so) and libraries. Only existing dirs added.
+    let mut volumes: Vec<VolumeMount> = ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/opt"]
+        .iter()
+        .filter(|d| Path::new(d).exists())
+        .map(|d| VolumeMount {
+            host: PathBuf::from(d),
+            container: (*d).to_string(),
+            readonly: true,
+        })
+        .collect();
+    push_bin_dir(&mut volumes, path);
+
+    let repo = ctx.state.open_container(ctx.default_container)?;
+    let branch = repo
+        .current_branch()?
+        .ok_or_else(|| io::Error::other("current container has no current branch"))?;
+    let code = hako_runtime::transform::run_container(&repo, &branch, command, &volumes)
+        .map_err(runtime_to_io)?;
+    Ok(exit_code_from(code))
+}
+
+/// Tiers 2/3: libraries from `container`'s rootfs; only the binary is mounted in.
+fn run_host_in_container(
+    ctx: &Ctx<'_>,
+    container: &str,
+    path: &str,
+    command: Vec<String>,
+) -> io::Result<ExitCode> {
+    let mut volumes: Vec<VolumeMount> = Vec::new();
+    push_bin_dir(&mut volumes, path);
+
+    let repo = ctx.state.open_container(container).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "container '{}' not found ({}). Pull it first (`hako pull {}`), or use `--in auto`.",
+                container, e, container
+            ),
+        )
+    })?;
+    let branch = repo
+        .current_branch()?
+        .ok_or_else(|| io::Error::other("container has no current branch"))?;
+    eprintln!(
+        "hako: running {} against container '{}' (libraries from the container)",
+        path, container
+    );
+    let code = hako_runtime::transform::run_container(&repo, &branch, command, &volumes)
+        .map_err(runtime_to_io)?;
+    Ok(exit_code_from(code))
+}
+
+/// Mount the binary read-only so the in-container command path resolves to the
+/// host file. `path` MUST be canonical+absolute (run_host guarantees this).
+/// Normally we mount the binary's parent directory (so sibling resources
+/// resolve); but for a root-level binary (`/app`, parent `/`) we mount just the
+/// file — never the whole host root over the container rootfs.
+fn push_bin_dir(volumes: &mut Vec<VolumeMount>, path: &str) {
+    use std::path::{Path, PathBuf};
+    let p = Path::new(path);
+    let (host, container) = match p.parent() {
+        // Root-level binary: mount the file itself, not all of `/`.
+        Some(parent) if parent == Path::new("/") => (p.to_path_buf(), path.to_string()),
+        // Normal case: mount the containing directory.
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            (PathBuf::from(parent), parent.to_string_lossy().to_string())
+        }
+        // No usable parent — shouldn't happen for a canonical absolute path.
+        _ => return,
+    };
+    if !volumes.iter().any(|v| v.container == container) {
+        volumes.push(VolumeMount {
+            host,
+            container,
+            readonly: true,
+        });
+    }
+}
+
+/// Tier 3: detect the binary's libc and resolve a container to run it against,
+/// pulling a base image if no suitable container exists yet.
+fn resolve_auto_container(ctx: &Ctx<'_>, path: &str) -> io::Result<String> {
+    let (libc, distro, image) = match detect_libc(path)? {
+        Libc::Musl => ("musl", "alpine", "alpine"),
+        Libc::Glibc => ("glibc", "debian", "debian"),
+    };
+    eprintln!("hako: detected {} binary → base image '{}'", libc, image);
+
+    // Reuse an existing container of that name if present (it may already have
+    // the binary's other shared-lib deps installed); otherwise pull the base.
+    if ctx.state.list_containers()?.iter().any(|c| c == distro) {
+        eprintln!("hako: reusing existing container '{}'", distro);
+    } else {
+        let image_ref = hako::ImageRef::parse(image).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("bad image ref: {}", e))
+        })?;
+        crate::cmd::oci::pull_into(ctx.state, &image_ref, distro, "linux", "amd64", false)?;
+    }
+    Ok(distro.to_string())
+}
+
+enum Libc {
+    Musl,
+    Glibc,
+}
+
+/// Detect a binary's libc from its ELF `PT_INTERP` program header (the dynamic
+/// loader path): `ld-musl-*` → musl, `ld-linux*`/`ld.so` → glibc. Parses the
+/// ELF/program-header structures and reads exactly the interpreter string —
+/// not a substring scan (which would false-match the literal "ld-musl" sitting
+/// in some glibc binary's `.rodata`). Reads only the header + interp bytes, so
+/// a huge file isn't slurped into memory. Static binaries have no PT_INTERP and
+/// are rejected with a hint to choose a container explicitly.
+fn detect_libc(path: &str) -> io::Result<Libc> {
+    let interp = read_elf_interp(path)?;
+    if interp.contains("ld-musl") {
+        Ok(Libc::Musl)
+    } else if interp.contains("ld-linux") || interp.contains("ld.so") {
+        Ok(Libc::Glibc)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "could not classify interpreter {:?} for {}; pass `--in <container>` explicitly",
+                interp, path
+            ),
+        ))
+    }
+}
+
+/// Read the `PT_INTERP` interpreter string from an ELF file. Errors if the file
+/// isn't ELF or has no interpreter (static binary). Handles ELF32/64 and both
+/// endiannesses; reads only the header, program-header table, and interp.
+fn read_elf_interp(path: &str) -> io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let bad = |m: String| io::Error::new(io::ErrorKind::InvalidInput, m);
+    let mut f = std::fs::File::open(path)?;
+
+    let mut e = [0u8; 64];
+    f.read_exact(&mut e)
+        .map_err(|_| bad(format!("{} is too small to be an ELF", path)))?;
+    if &e[..4] != b"\x7fELF" {
+        return Err(bad(format!(
+            "{} is not an ELF binary; `--in auto` needs an ELF",
+            path
+        )));
+    }
+    let is64 = e[4] == 2; // EI_CLASS: 1=32-bit, 2=64-bit
+    let le = e[5] != 2; // EI_DATA: 1=little, 2=big
+    let u16a = |b: &[u8]| {
+        let a = [b[0], b[1]];
+        if le {
+            u16::from_le_bytes(a)
+        } else {
+            u16::from_be_bytes(a)
+        }
+    };
+    let u32a = |b: &[u8]| {
+        let a = [b[0], b[1], b[2], b[3]];
+        if le {
+            u32::from_le_bytes(a)
+        } else {
+            u32::from_be_bytes(a)
+        }
+    };
+    let u64a = |b: &[u8]| {
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&b[..8]);
+        if le {
+            u64::from_le_bytes(a)
+        } else {
+            u64::from_be_bytes(a)
+        }
+    };
+
+    // Program-header table location, entry size, count (offsets differ by class).
+    let (phoff, phentsize, phnum) = if is64 {
+        (u64a(&e[32..40]), u16a(&e[54..56]), u16a(&e[56..58]))
+    } else {
+        (u32a(&e[28..32]) as u64, u16a(&e[42..44]), u16a(&e[44..46]))
+    };
+    if phnum == 0 || phnum > 4096 {
+        return Err(bad(format!(
+            "{}: implausible program-header count {}",
+            path, phnum
+        )));
+    }
+
+    let mut ph = vec![0u8; phentsize as usize];
+    for i in 0..phnum {
+        f.seek(SeekFrom::Start(phoff + i as u64 * phentsize as u64))?;
+        f.read_exact(&mut ph)
+            .map_err(|_| bad(format!("{}: truncated program header", path)))?;
+        let p_type = u32a(&ph[0..4]);
+        if p_type != 3 {
+            continue; // PT_INTERP == 3
+        }
+        let (p_offset, p_filesz) = if is64 {
+            (u64a(&ph[8..16]), u64a(&ph[32..40]))
+        } else {
+            (u32a(&ph[4..8]) as u64, u32a(&ph[16..20]) as u64)
+        };
+        if p_filesz == 0 || p_filesz > 4096 {
+            return Err(bad(format!(
+                "{}: implausible interpreter length {}",
+                path, p_filesz
+            )));
+        }
+        let mut buf = vec![0u8; p_filesz as usize];
+        f.seek(SeekFrom::Start(p_offset))?;
+        f.read_exact(&mut buf)
+            .map_err(|_| bad(format!("{}: truncated interpreter string", path)))?;
+        let s = buf.split(|b| *b == 0).next().unwrap_or(&[]);
+        return Ok(String::from_utf8_lossy(s).into_owned());
+    }
+    Err(bad(format!(
+        "{} has no PT_INTERP (likely a static binary); pass `--in <container>` explicitly",
+        path
+    )))
 }
 
 /// `hako <unknown-subcommand> [args...]` — clap routes here when the first
@@ -180,9 +467,9 @@ pub fn exec(ctx: &Ctx<'_>, id: String, command: Vec<String>) -> io::Result<ExitC
     Ok(exit_code_from(code))
 }
 
-pub fn stop(ctx: &Ctx<'_>, id: String) -> io::Result<ExitCode> {
+pub fn stop(ctx: &Ctx<'_>, id: String, force: bool) -> io::Result<ExitCode> {
     let runtime_root = ctx.workdir.join(DOT_HAKO);
-    hako_runtime::instances::stop(&runtime_root, &id).map_err(runtime_to_io)?;
+    hako_runtime::instances::stop(&runtime_root, &id, force).map_err(runtime_to_io)?;
     Ok(ExitCode::SUCCESS)
 }
 
