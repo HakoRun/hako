@@ -4,7 +4,7 @@ use super::Ctx;
 use crate::helpers::{
     apply_cwd, apply_host_meta, bytes_to_path, container_and_path, container_fs_path,
     create_host_symlink, entry_meta, host_meta, path_to_bytes, render_container_status,
-    resolve_tree, split_ref_path, with_target, with_target_mut, META_CTL, META_STATUS,
+    resolve_tree, route, split_ref_path, with_target, with_target_mut, META_CTL, META_STATUS,
 };
 use hako::fs::{DEFAULT_FILE_MODE, DEFAULT_SYMLINK_MODE};
 use hako::{Hash, RouteTarget, ScopedFs};
@@ -48,7 +48,7 @@ pub fn write(
     // Meta surface: writing under /containers/<name> that is NOT a filesystem
     // path (i.e. not under root/) targets a control/meta node. `ctl` dispatches
     // a control verb; other meta nodes are read-only.
-    if let RouteTarget::Container { name, path: sub } = RouteTarget::parse(&path) {
+    if let RouteTarget::Container { name, path: sub } = route(&path, ctx.default_container) {
         if container_fs_path(&sub).is_none() {
             if sub == META_CTL {
                 return dispatch_ctl(ctx, &name, &bytes);
@@ -155,7 +155,7 @@ pub fn cat(ctx: &Ctx<'_>, path: String) -> io::Result<ExitCode> {
     // both read the synthetic status readout. A ref (`<ref>:<path>`) always means
     // the filesystem tree, so meta interception only applies without a ref.
     if refspec.is_none() {
-        if let RouteTarget::Container { name, path } = RouteTarget::parse(&rest) {
+        if let RouteTarget::Container { name, path } = route(&rest, ctx.default_container) {
             if container_fs_path(&path).is_none() {
                 // Not a filesystem path → the meta surface.
                 // `proc/` is runtime-backed: reading it bridges to the Linux
@@ -289,8 +289,8 @@ pub fn export(ctx: &Ctx<'_>, src: String, dst: PathBuf, force: bool) -> io::Resu
 /// workspace's chunk store, so cross-container copies don't duplicate file content
 /// chunks — only tree nodes change.
 fn two_target_cp(ctx: &Ctx<'_>, src: &str, dst: &str, is_move: bool) -> io::Result<()> {
-    let src_t = RouteTarget::parse(src);
-    let dst_t = RouteTarget::parse(dst);
+    let src_t = route(src, ctx.default_container);
+    let dst_t = route(dst, ctx.default_container);
     let (src_container, src_path) = container_and_path(&src_t, ctx.default_container)?;
     let (dst_container, dst_path) = container_and_path(&dst_t, ctx.default_container)?;
 

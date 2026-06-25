@@ -2,7 +2,7 @@
 
 use super::Ctx;
 use crate::helpers::{
-    apply_cwd, container_fs_path, print_diff, resolve_cd, resolve_tree, split_ref_path,
+    apply_cwd, container_fs_path, print_diff, resolve_cd, resolve_tree, route, split_ref_path,
     with_target, with_target_resolved, META_NODES, ROOT_BOUNDARY,
 };
 use hako::fs::DirKind;
@@ -14,7 +14,7 @@ pub fn ls(ctx: &Ctx<'_>, path: Option<String>) -> io::Result<ExitCode> {
     let path = path.unwrap_or_default();
     let (refspec, rest) = split_ref_path(&path);
     let rest = apply_cwd(ctx.session, rest);
-    match RouteTarget::parse(&rest) {
+    match route(&rest, ctx.default_container) {
         RouteTarget::ContainersList => {
             for c in ctx.state.list_containers()? {
                 println!("{}/", c);

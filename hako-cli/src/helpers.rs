@@ -62,34 +62,38 @@ pub fn collapse_dotdot(path: &str) -> String {
 /// Returns (new_container, new_cwd). Handles `/containers/<name>/...` for
 /// switching containers and resolves `..` / `.` segments.
 pub fn resolve_cd(session: &Session, raw: &str) -> io::Result<(String, String)> {
-    if raw == "/containers" || raw == "/containers/" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "/containers is virtual; cd into a specific container",
-        ));
-    }
-    if let Some(rest) = raw.strip_prefix("/containers/") {
-        let (name, sub) = match rest.split_once('/') {
-            Some((n, p)) => (n.to_string(), p.to_string()),
-            None => (rest.to_string(), String::new()),
-        };
-        // The session cwd is a filesystem path. Entering a container lands at
-        // its filesystem root; deeper fs paths must go through `root/`. A meta
-        // node (e.g. `status`) isn't a directory you can cd into.
-        let cwd = if sub.is_empty() || sub == ROOT_BOUNDARY {
-            "/".to_string()
-        } else if let Some(fs) = sub.strip_prefix("root/") {
-            format!("/{}", fs)
-        } else {
+    // The /containers namespace is only navigable from the host context; from a
+    // guest, `/containers/...` is just a path in the guest's own filesystem.
+    if is_host_context(&session.container) {
+        if raw == "/containers" || raw == "/containers/" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "cannot cd into /containers/{name}/{sub}; \
-                     the container filesystem is under /containers/{name}/root/"
-                ),
+                "/containers is virtual; cd into a specific container",
             ));
-        };
-        return Ok((name, collapse_dotdot(&cwd)));
+        }
+        if let Some(rest) = raw.strip_prefix("/containers/") {
+            let (name, sub) = match rest.split_once('/') {
+                Some((n, p)) => (n.to_string(), p.to_string()),
+                None => (rest.to_string(), String::new()),
+            };
+            // The session cwd is a filesystem path. Entering a container lands at
+            // its filesystem root; deeper fs paths must go through `root/`. A meta
+            // node (e.g. `status`) isn't a directory you can cd into.
+            let cwd = if sub.is_empty() || sub == ROOT_BOUNDARY {
+                "/".to_string()
+            } else if let Some(fs) = sub.strip_prefix("root/") {
+                format!("/{}", fs)
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "cannot cd into /containers/{name}/{sub}; \
+                         the container filesystem is under /containers/{name}/root/"
+                    ),
+                ));
+            };
+            return Ok((name, collapse_dotdot(&cwd)));
+        }
     }
     let absolute = apply_cwd(session, raw);
     Ok((session.container.clone(), collapse_dotdot(&absolute)))
@@ -177,11 +181,40 @@ pub fn is_hex_prefix(s: &str) -> bool {
 // Multi-target dispatch (RouteTarget-aware)
 // ============================================================================
 
+/// The host container. The workspace-level prefixes (`/containers`,
+/// `/workspace`, `/peers`) are recognized *only* when this is the active
+/// container. From any other (guest) container they are ordinary paths in the
+/// guest's own filesystem — so a guest image is never shadowed by hako's
+/// namespace, and the workspace is reachable only from the host.
+///
+/// Must match the default container seeded by `hako-core`'s `State::init`.
+pub const HOST_CONTAINER: &str = "hako";
+
+/// True when the active container is the host, so workspace prefixes resolve.
+pub fn is_host_context(active_container: &str) -> bool {
+    active_container == HOST_CONTAINER
+}
+
+/// Parse a path into a route, honoring host-vs-guest context. The workspace
+/// prefixes resolve only from the host container; from a guest every path is
+/// guest-local (`Local`), so `/containers/...` reads the guest's own filesystem
+/// rather than the workspace.
+pub fn route(path: &str, active_container: &str) -> RouteTarget {
+    let target = RouteTarget::parse(path);
+    if is_host_context(active_container) {
+        return target;
+    }
+    match target {
+        RouteTarget::Local(_) => target,
+        _ => RouteTarget::Local(path.trim_start_matches('/').to_string()),
+    }
+}
+
 pub fn with_target<F>(state: &State, default_container: &str, path: &str, f: F) -> io::Result<()>
 where
     F: FnOnce(&Repo<'_>, &str) -> io::Result<()>,
 {
-    let target = RouteTarget::parse(path);
+    let target = route(path, default_container);
     with_target_resolved(state, default_container, target, f)
 }
 
@@ -695,8 +728,8 @@ mod tests {
 
     #[test]
     fn resolve_cd_switches_container() {
-        let s = sess("main", "/x");
-        // Filesystem paths are addressed under the `root/` boundary.
+        let s = sess("hako", "/x"); // host context — workspace prefixes resolve
+                                    // Filesystem paths are addressed under the `root/` boundary.
         assert_eq!(
             resolve_cd(&s, "/containers/alpha/root/sub").unwrap(),
             ("alpha".into(), "/sub".into())
@@ -720,7 +753,7 @@ mod tests {
     fn resolve_cd_rejects_non_root_container_path() {
         // Under the `root/` layout, addressing the filesystem without `root/`
         // (the pre-migration form) is no longer a valid cd target.
-        let s = sess("main", "/x");
+        let s = sess("hako", "/x");
         assert!(resolve_cd(&s, "/containers/alpha/etc").is_err());
         // A meta node is not a directory you can cd into.
         assert!(resolve_cd(&s, "/containers/alpha/status").is_err());
@@ -728,9 +761,25 @@ mod tests {
 
     #[test]
     fn resolve_cd_rejects_containers_root() {
-        let s = sess("main", "/");
+        let s = sess("hako", "/");
         assert!(resolve_cd(&s, "/containers").is_err());
         assert!(resolve_cd(&s, "/containers/").is_err());
+    }
+
+    #[test]
+    fn resolve_cd_from_a_guest_treats_containers_as_local() {
+        // From a guest container, /containers is not the workspace namespace —
+        // it's an ordinary path in the guest's own filesystem, so cd neither
+        // switches containers nor errors.
+        let s = sess("ubuntu", "/");
+        assert_eq!(
+            resolve_cd(&s, "/containers/alpha/root").unwrap(),
+            ("ubuntu".into(), "/containers/alpha/root".into())
+        );
+        assert_eq!(
+            resolve_cd(&s, "/containers").unwrap(),
+            ("ubuntu".into(), "/containers".into())
+        );
     }
 
     #[test]
@@ -740,5 +789,45 @@ mod tests {
         assert_eq!(container_fs_path(""), None); // container dir itself
         assert_eq!(container_fs_path("status"), None); // meta node
         assert_eq!(container_fs_path("rootfs"), None); // not the `root` segment
+    }
+
+    #[test]
+    fn route_resolves_workspace_prefixes_only_from_the_host() {
+        // From the host (hako), the workspace prefixes resolve.
+        assert_eq!(
+            route("/containers", HOST_CONTAINER),
+            RouteTarget::ContainersList
+        );
+        assert_eq!(
+            route("/containers/ubuntu/root/etc", HOST_CONTAINER),
+            RouteTarget::Container {
+                name: "ubuntu".into(),
+                path: "root/etc".into()
+            }
+        );
+
+        // From a guest, the same paths are guest-local — never the workspace.
+        assert_eq!(
+            route("/containers", "ubuntu"),
+            RouteTarget::Local("containers".into())
+        );
+        assert_eq!(
+            route("/containers/debian/root/etc", "ubuntu"),
+            RouteTarget::Local("containers/debian/root/etc".into())
+        );
+        assert_eq!(
+            route("/peers/x", "ubuntu"),
+            RouteTarget::Local("peers/x".into())
+        );
+
+        // Ordinary paths are guest-local in both contexts.
+        assert_eq!(
+            route("/etc/hosts", HOST_CONTAINER),
+            RouteTarget::Local("etc/hosts".into())
+        );
+        assert_eq!(
+            route("/etc/hosts", "ubuntu"),
+            RouteTarget::Local("etc/hosts".into())
+        );
     }
 }
