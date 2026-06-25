@@ -961,3 +961,46 @@ fn init(workdir: &std::path::Path, path: Option<PathBuf>) -> io::Result<ExitCode
     }
     Ok(ExitCode::SUCCESS)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proc_paths_need_the_linux_runtime() {
+        // A container `proc/` read is runtime-backed → must bridge to Linux.
+        assert!(is_container_proc_path("/containers/alpine/proc"));
+        assert!(is_container_proc_path("/containers/alpine/proc/1"));
+        assert!(is_container_proc_path("/containers/alpine/proc/1/status"));
+    }
+
+    #[test]
+    fn non_proc_paths_stay_native() {
+        // The filesystem and the store-backed meta nodes are not bridged.
+        assert!(!is_container_proc_path("/containers/alpine/root/etc/hosts"));
+        assert!(!is_container_proc_path("/containers/alpine/status"));
+        assert!(!is_container_proc_path("/containers/alpine/ctl"));
+        assert!(!is_container_proc_path("/containers/alpine")); // the container dir
+        assert!(!is_container_proc_path("/containers/alpine/procfs")); // not the proc node
+        assert!(!is_container_proc_path("/etc/hosts")); // active-container fs path
+        assert!(!is_container_proc_path("/containers")); // the container list
+    }
+
+    #[test]
+    fn cmd_classification_routes_proc_reads() {
+        // Cat/Ls/Tree pick up the proc-path classification; nothing else does.
+        assert!(Cmd::Cat {
+            path: "/containers/alpine/proc/1/status".into()
+        }
+        .needs_linux_runtime());
+        assert!(!Cmd::Cat {
+            path: "/containers/alpine/status".into()
+        }
+        .needs_linux_runtime());
+        assert!(Cmd::Ls {
+            path: Some("/containers/alpine/proc".into())
+        }
+        .needs_linux_runtime());
+        assert!(!Cmd::Ls { path: None }.needs_linux_runtime());
+    }
+}
