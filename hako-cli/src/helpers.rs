@@ -70,10 +70,26 @@ pub fn resolve_cd(session: &Session, raw: &str) -> io::Result<(String, String)> 
     }
     if let Some(rest) = raw.strip_prefix("/containers/") {
         let (name, sub) = match rest.split_once('/') {
-            Some((n, p)) => (n.to_string(), format!("/{}", p)),
-            None => (rest.to_string(), "/".to_string()),
+            Some((n, p)) => (n.to_string(), p.to_string()),
+            None => (rest.to_string(), String::new()),
         };
-        return Ok((name, collapse_dotdot(&sub)));
+        // The session cwd is a filesystem path. Entering a container lands at
+        // its filesystem root; deeper fs paths must go through `root/`. A meta
+        // node (e.g. `status`) isn't a directory you can cd into.
+        let cwd = if sub.is_empty() || sub == ROOT_BOUNDARY {
+            "/".to_string()
+        } else if let Some(fs) = sub.strip_prefix("root/") {
+            format!("/{}", fs)
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot cd into /containers/{name}/{sub}; \
+                     the container filesystem is under /containers/{name}/root/"
+                ),
+            ));
+        };
+        return Ok((name, collapse_dotdot(&cwd)));
     }
     let absolute = apply_cwd(session, raw);
     Ok((session.container.clone(), collapse_dotdot(&absolute)))
@@ -196,8 +212,20 @@ where
             f(&repo, &p)
         }
         RouteTarget::Container { name, path } => {
+            // The container filesystem lives under `root/`. A bare container
+            // path or a meta name (e.g. `status`) is not a filesystem path and
+            // must be handled by the meta surface, not raw fs ops.
+            let fs = container_fs_path(&path).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "/containers/{name}/{path} is not a filesystem path; \
+                         the container filesystem is under /containers/{name}/root/"
+                    ),
+                )
+            })?;
             let repo = state.open_container(&name)?;
-            f(&repo, &path)
+            f(&repo, fs)
         }
         RouteTarget::ContainersList => Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -220,12 +248,90 @@ pub fn container_and_path<'a>(
 ) -> io::Result<(&'a str, &'a str)> {
     match target {
         RouteTarget::Local(p) => Ok((default_container, p.as_str())),
-        RouteTarget::Container { name, path } => Ok((name.as_str(), path.as_str())),
+        RouteTarget::Container { name, path } => {
+            // Filesystem only — require the `root/` boundary (see container_fs_path).
+            let fs = container_fs_path(path).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "/containers/{name}/{path} is not a filesystem path; \
+                         the container filesystem is under /containers/{name}/root/"
+                    ),
+                )
+            })?;
+            Ok((name.as_str(), fs))
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "this path is not a container path",
         )),
     }
+}
+
+// ============================================================================
+// Container meta surface (the /containers/<name> everything-is-a-file view)
+// ============================================================================
+
+/// The boundary segment under which a container's filesystem (rootfs) lives.
+/// Everything at `/containers/<name>/root/...` is the container's filesystem;
+/// everything else under `/containers/<name>/` is the synthetic meta surface.
+/// Sandboxing the rootfs under `root/` makes meta nodes collision-proof: a
+/// container that ships its own `/proc` lives at `…/root/proc`, never clashing
+/// with a future meta `…/proc`.
+pub const ROOT_BOUNDARY: &str = "root";
+
+/// The reserved leaf name exposed by the container meta surface alongside a
+/// container's filesystem. Sits beside `root/` at `/containers/<name>/status`.
+pub const META_STATUS: &str = "status";
+
+/// The control node: writing a verb to `/containers/<name>/ctl` runs a control
+/// action (e.g. `commit <msg>`) on the container — the Plan 9 ctl-file model.
+/// Reading it returns a usage summary.
+pub const META_CTL: &str = "ctl";
+
+/// Interpret the sub-path after `/containers/<name>` (the raw `path` from
+/// `RouteTarget::Container`, with no leading slash) under the `root/` layout.
+///
+/// Returns `Some(fs_path)` when it addresses the container **filesystem** (the
+/// sub-path is `root` or `root/...`), with the `root` boundary stripped off.
+/// Returns `None` when it addresses the container directory itself (empty) or a
+/// meta node (e.g. `status`) — i.e. anything that is *not* a filesystem path.
+pub fn container_fs_path(sub: &str) -> Option<&str> {
+    if sub == ROOT_BOUNDARY {
+        return Some("");
+    }
+    sub.strip_prefix("root/")
+}
+
+/// Render a one-container status summary as bytes, for `cat /containers/<name>`.
+/// Pure `Repo` — no runtime/instance data — so it stays in hako-core's
+/// read-only, dependency-light world and needs no workspace lock.
+///
+/// Reports the active branch, the short HEAD commit (or "(no commits yet)"),
+/// and whether the working tree differs from HEAD.
+pub fn render_container_status(repo: &Repo<'_>, name: &str) -> io::Result<Vec<u8>> {
+    use std::fmt::Write as _;
+    let branch = repo
+        .current_branch()?
+        .unwrap_or_else(|| "(detached)".into());
+    let head = repo.head_commit()?;
+    let head_tree = repo.head_tree()?;
+    let work_tree = repo.working_tree()?;
+    let dirty = head_tree != work_tree;
+
+    let mut s = String::new();
+    let _ = writeln!(s, "container: {}", name);
+    let _ = writeln!(s, "branch:    {}", branch);
+    match head {
+        Some(h) => {
+            let _ = writeln!(s, "head:      {}", &h.to_hex()[..12]);
+        }
+        None => {
+            let _ = writeln!(s, "head:      (no commits yet)");
+        }
+    }
+    let _ = writeln!(s, "working:   {}", if dirty { "modified" } else { "clean" });
+    Ok(s.into_bytes())
 }
 
 // ============================================================================
@@ -584,9 +690,15 @@ mod tests {
     #[test]
     fn resolve_cd_switches_container() {
         let s = sess("main", "/x");
+        // Filesystem paths are addressed under the `root/` boundary.
         assert_eq!(
-            resolve_cd(&s, "/containers/alpha/sub").unwrap(),
+            resolve_cd(&s, "/containers/alpha/root/sub").unwrap(),
             ("alpha".into(), "/sub".into())
+        );
+        // `root` itself, and a bare container, both land at the filesystem root.
+        assert_eq!(
+            resolve_cd(&s, "/containers/alpha/root").unwrap(),
+            ("alpha".into(), "/".into())
         );
         assert_eq!(
             resolve_cd(&s, "/containers/beta").unwrap(),
@@ -599,9 +711,28 @@ mod tests {
     }
 
     #[test]
+    fn resolve_cd_rejects_non_root_container_path() {
+        // Under the `root/` layout, addressing the filesystem without `root/`
+        // (the pre-migration form) is no longer a valid cd target.
+        let s = sess("main", "/x");
+        assert!(resolve_cd(&s, "/containers/alpha/etc").is_err());
+        // A meta node is not a directory you can cd into.
+        assert!(resolve_cd(&s, "/containers/alpha/status").is_err());
+    }
+
+    #[test]
     fn resolve_cd_rejects_containers_root() {
         let s = sess("main", "/");
         assert!(resolve_cd(&s, "/containers").is_err());
         assert!(resolve_cd(&s, "/containers/").is_err());
+    }
+
+    #[test]
+    fn container_fs_path_boundary() {
+        assert_eq!(container_fs_path("root"), Some(""));
+        assert_eq!(container_fs_path("root/etc/hosts"), Some("etc/hosts"));
+        assert_eq!(container_fs_path(""), None); // container dir itself
+        assert_eq!(container_fs_path("status"), None); // meta node
+        assert_eq!(container_fs_path("rootfs"), None); // not the `root` segment
     }
 }

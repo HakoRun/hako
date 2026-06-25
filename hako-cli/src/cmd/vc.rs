@@ -11,6 +11,14 @@ use std::process::ExitCode;
 
 pub fn commit(ctx: &Ctx<'_>, message: String, author: String) -> io::Result<ExitCode> {
     let repo = ctx.state.open_container(ctx.default_container)?;
+    commit_repo(&repo, &message, &author)
+}
+
+/// Commit a repo's working tree onto its current branch. Shared by the `commit`
+/// command and the container `ctl` control node (`write …/ctl "commit <msg>"`),
+/// so both go through identical snapshot semantics. Returns exit code 1 (and a
+/// stderr note) when there is nothing to commit, mirroring the CLI behavior.
+pub fn commit_repo(repo: &hako::Repo<'_>, message: &str, author: &str) -> io::Result<ExitCode> {
     let work = repo.working_tree()?;
     let head = repo.head_commit()?;
     // Propagate (don't swallow) a failure to load HEAD: a corrupt/missing HEAD
@@ -26,7 +34,7 @@ pub fn commit(ctx: &Ctx<'_>, message: String, author: String) -> io::Result<Exit
     }
     let parents = head.into_iter().collect();
     let ts = now_secs();
-    let commit = repo.commit(work, parents, &author, &message, ts)?;
+    let commit = repo.commit(work, parents, author, message, ts)?;
     let branch = repo
         .current_branch()?
         .ok_or_else(|| io::Error::other("detached HEAD"))?;

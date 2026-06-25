@@ -2,8 +2,8 @@
 
 use super::Ctx;
 use crate::helpers::{
-    apply_cwd, print_diff, resolve_cd, resolve_tree, split_ref_path, with_target,
-    with_target_resolved,
+    apply_cwd, container_fs_path, print_diff, resolve_cd, resolve_tree, split_ref_path,
+    with_target, with_target_resolved, META_CTL, META_STATUS, ROOT_BOUNDARY,
 };
 use hako::fs::DirKind;
 use hako::{Hash, RouteTarget, ScopedFs, Session};
@@ -19,6 +19,18 @@ pub fn ls(ctx: &Ctx<'_>, path: Option<String>) -> io::Result<ExitCode> {
             for c in ctx.state.list_containers()? {
                 println!("{}/", c);
             }
+        }
+        // The container "directory" itself: list the synthetic surface — the
+        // filesystem under `root/` plus the meta nodes (e.g. `status`). The
+        // rootfs entries themselves are listed via `ls /containers/<name>/root`.
+        RouteTarget::Container { name, path }
+            if refspec.is_none() && container_fs_path(&path).is_none() && path.is_empty() =>
+        {
+            // Validate the container exists (open errors with NotFound otherwise).
+            let _ = ctx.state.open_container(&name)?;
+            println!("{}/", ROOT_BOUNDARY);
+            println!("{} (meta)", META_STATUS);
+            println!("{} (meta)", META_CTL);
         }
         target => {
             with_target_resolved(ctx.state, ctx.default_container, target, |repo, p| {
@@ -75,7 +87,7 @@ pub fn cd(ctx: &Ctx<'_>, path: String) -> io::Result<ExitCode> {
     if !key.is_empty() && !scoped.is_dir(&root, key)? {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("not a directory: /containers/{}{}", new_container, new_cwd),
+            format!("not a directory: {}", fs_address(&new_container, &new_cwd)),
         ));
     }
     let new_session = Session {
@@ -83,8 +95,20 @@ pub fn cd(ctx: &Ctx<'_>, path: String) -> io::Result<ExitCode> {
         cwd: new_cwd.clone(),
     };
     ctx.state.write_session(&new_session)?;
-    println!("/containers/{}{}", new_container, new_cwd);
+    println!("{}", fs_address(&new_container, &new_cwd));
     Ok(ExitCode::SUCCESS)
+}
+
+/// Format a container + filesystem cwd as an addressable path under the `root/`
+/// boundary: `(alpine, "/")` → `/containers/alpine/root`,
+/// `(alpine, "/etc")` → `/containers/alpine/root/etc`.
+fn fs_address(container: &str, cwd: &str) -> String {
+    let cwd = cwd.trim_end_matches('/');
+    if cwd.is_empty() {
+        format!("/containers/{}/{}", container, ROOT_BOUNDARY)
+    } else {
+        format!("/containers/{}/{}{}", container, ROOT_BOUNDARY, cwd)
+    }
 }
 
 /// Switch the workspace's identity to `branch`. If no container by that
@@ -119,14 +143,12 @@ pub fn switch_identity(ctx: &Ctx<'_>, branch: String) -> io::Result<ExitCode> {
 
 pub fn pwd(ctx: &Ctx<'_>) -> io::Result<ExitCode> {
     // Reflect the effective default container (config-aware), not the bare
-    // session value, so `pwd` matches what other commands route to.
-    let cwd = ctx.session.cwd.as_str();
-    if cwd == "/" {
-        // Drop the trailing slash for a cleaner display at root.
-        println!("/containers/{}", ctx.default_container);
-    } else {
-        println!("/containers/{}{}", ctx.default_container, cwd);
-    }
+    // session value, so `pwd` matches what other commands route to. The cwd is
+    // a filesystem path, so it renders under the `root/` boundary.
+    println!(
+        "{}",
+        fs_address(ctx.default_container, ctx.session.cwd.as_str())
+    );
     Ok(ExitCode::SUCCESS)
 }
 

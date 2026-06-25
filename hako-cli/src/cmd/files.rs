@@ -2,14 +2,22 @@
 
 use super::Ctx;
 use crate::helpers::{
-    apply_cwd, apply_host_meta, bytes_to_path, container_and_path, create_host_symlink, entry_meta,
-    host_meta, path_to_bytes, resolve_tree, split_ref_path, with_target, with_target_mut,
+    apply_cwd, apply_host_meta, bytes_to_path, container_and_path, container_fs_path,
+    create_host_symlink, entry_meta, host_meta, path_to_bytes, render_container_status,
+    resolve_tree, split_ref_path, with_target, with_target_mut, META_CTL, META_STATUS,
 };
 use hako::fs::{DEFAULT_FILE_MODE, DEFAULT_SYMLINK_MODE};
 use hako::{Hash, RouteTarget, ScopedFs};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+/// Usage text returned by `cat /containers/<name>/ctl`. The control node is
+/// write-driven: `hako write /containers/<name>/ctl "<command>"`.
+const CTL_USAGE: &str = "\
+ctl — write a command to control this container:
+  hako write /containers/<name>/ctl \"commit [message]\"   snapshot the working tree
+";
 
 pub fn write(
     ctx: &Ctx<'_>,
@@ -35,6 +43,23 @@ pub fn write(
         buf
     };
     let path = apply_cwd(ctx.session, &path);
+    // Meta surface: writing under /containers/<name> that is NOT a filesystem
+    // path (i.e. not under root/) targets a control/meta node. `ctl` dispatches
+    // a control verb; other meta nodes are read-only.
+    if let RouteTarget::Container { name, path: sub } = RouteTarget::parse(&path) {
+        if container_fs_path(&sub).is_none() {
+            if sub == META_CTL {
+                return dispatch_ctl(ctx, &name, &bytes);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "/containers/{name}/{sub} is not writable; write the filesystem under \
+                     /containers/{name}/root/, or a command to /containers/{name}/ctl"
+                ),
+            ));
+        }
+    }
     with_target_mut(ctx.state, ctx.default_container, &path, |repo, p| {
         let scoped = ScopedFs::new(repo.store());
         let root = repo.working_tree()?;
@@ -44,9 +69,73 @@ pub fn write(
     Ok(ExitCode::SUCCESS)
 }
 
+/// Dispatch a container control verb written to `/containers/<name>/ctl`.
+/// The body is a text command: the first token is the verb, the rest its
+/// argument (the Plan 9 ctl-file model). Holds the workspace lock via the
+/// `write` command, so the dispatched action is serialized.
+///
+/// Supported today: `commit [message]` — snapshot the container's working tree.
+/// Instance verbs (start/stop/exec) are intentionally not here yet: they are
+/// instance-addressed and platform-specific, so they land in a later pass.
+fn dispatch_ctl(ctx: &Ctx<'_>, name: &str, body: &[u8]) -> io::Result<ExitCode> {
+    let text = std::str::from_utf8(body)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "ctl command must be UTF-8"))?
+        .trim();
+    let mut parts = text.splitn(2, char::is_whitespace);
+    let verb = parts.next().unwrap_or("");
+    let arg = parts.next().unwrap_or("").trim();
+    match verb {
+        "" => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ctl: empty command; try `commit [message]`",
+        )),
+        "commit" => {
+            let repo = ctx.state.open_container(name)?;
+            let message = if arg.is_empty() {
+                "commit via ctl"
+            } else {
+                arg
+            };
+            super::vc::commit_repo(&repo, message, "ctl")
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("ctl: unsupported command {other:?}; supported: commit [message]"),
+        )),
+    }
+}
+
 pub fn cat(ctx: &Ctx<'_>, path: String) -> io::Result<ExitCode> {
     let (refspec, rest) = split_ref_path(&path);
     let rest = apply_cwd(ctx.session, rest);
+    // Meta surface: under the `root/` layout, the container filesystem is at
+    // `/containers/<name>/root/...`; anything else under the container is meta.
+    // `cat /containers/<name>` (the container dir) and `cat /containers/<name>/status`
+    // both read the synthetic status readout. A ref (`<ref>:<path>`) always means
+    // the filesystem tree, so meta interception only applies without a ref.
+    if refspec.is_none() {
+        if let RouteTarget::Container { name, path } = RouteTarget::parse(&rest) {
+            if container_fs_path(&path).is_none() {
+                // Not a filesystem path → the meta surface.
+                if path.is_empty() || path == META_STATUS {
+                    let repo = ctx.state.open_container(&name)?;
+                    let bytes = render_container_status(&repo, &name)?;
+                    io::stdout().write_all(&bytes)?;
+                    return Ok(ExitCode::SUCCESS);
+                }
+                if path == META_CTL {
+                    // The control node reads back its usage (it is write-driven).
+                    let _ = ctx.state.open_container(&name)?; // validate it exists
+                    io::stdout().write_all(CTL_USAGE.as_bytes())?;
+                    return Ok(ExitCode::SUCCESS);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no such meta node: /containers/{name}/{path}"),
+                ));
+            }
+        }
+    }
     with_target(ctx.state, ctx.default_container, &rest, |repo, p| {
         let scoped = ScopedFs::new(repo.store());
         let root = match refspec {

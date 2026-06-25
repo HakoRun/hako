@@ -186,3 +186,161 @@ fn runs_outside_a_workspace_fail_cleanly() {
         err(&o)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Container meta surface + the `root/` boundary (Option B layout): the rootfs
+// lives at /containers/<name>/root/..., and meta nodes (status, …) sit beside
+// it at /containers/<name>/. The seeded default container is named `hako`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cat_container_dir_shows_status_readout() {
+    // `cat /containers/<name>` (the container directory) reads a synthetic
+    // status readout instead of erroring.
+    let d = workspace();
+    let readout = ok(d.path(), &["cat", "/containers/hako"]);
+    assert!(
+        readout.contains("container: hako"),
+        "status readout should name the container: {readout}"
+    );
+    assert!(
+        readout.contains("branch:") && readout.contains("working:"),
+        "status readout should report branch and working state: {readout}"
+    );
+    // The status node is also addressable by its listed name.
+    assert_eq!(
+        ok(d.path(), &["cat", "/containers/hako/status"]),
+        readout,
+        "cat .../status should match cat of the container dir"
+    );
+}
+
+#[test]
+fn ls_container_dir_lists_root_and_meta() {
+    // Listing the container directory surfaces the `root/` filesystem boundary
+    // and the synthetic `status` meta entry — not the rootfs contents directly.
+    let d = workspace();
+    let listing = ok(d.path(), &["ls", "/containers/hako"]);
+    assert!(
+        listing.contains("root/"),
+        "container dir ls should show the root/ filesystem boundary: {listing}"
+    );
+    assert!(
+        listing.contains("status"),
+        "container dir ls should surface the synthetic status entry: {listing}"
+    );
+    assert!(
+        !listing.contains("bin"),
+        "container dir ls should NOT list rootfs entries directly: {listing}"
+    );
+}
+
+#[test]
+fn ls_container_root_shows_rootfs() {
+    // The rootfs itself is listed under the `root/` boundary.
+    let d = workspace();
+    let listing = ok(d.path(), &["ls", "/containers/hako/root"]);
+    assert!(
+        listing.contains("bin"),
+        "ls of /containers/<name>/root should show the seeded rootfs: {listing}"
+    );
+}
+
+#[test]
+fn container_status_reflects_uncommitted_changes() {
+    // Writing into a container without committing flips the readout to
+    // "modified"; this exercises the working-tree-vs-HEAD comparison.
+    let d = workspace();
+    ok(d.path(), &["write", "/etc/motd", "hi"]);
+    let readout = ok(d.path(), &["cat", "/containers/hako"]);
+    assert!(
+        readout.contains("working:   modified"),
+        "status should report a dirty working tree after an uncommitted write: {readout}"
+    );
+}
+
+#[test]
+fn cat_container_fs_requires_root_boundary() {
+    // Under Option B, reading the filesystem cross-container goes through
+    // `root/`; the pre-migration form is rejected, and the file is readable via
+    // the `root/` path.
+    let d = workspace();
+    ok(d.path(), &["write", "/greeting.txt", "hello"]);
+    assert_eq!(
+        ok(d.path(), &["cat", "/containers/hako/root/greeting.txt"]),
+        "hello"
+    );
+    let o = hako(d.path(), &["cat", "/containers/hako/greeting.txt"]);
+    assert!(
+        !o.status.success(),
+        "addressing the fs without root/ should fail under Option B"
+    );
+    assert!(
+        !err(&o).contains("panicked"),
+        "rejection should be a clean error: {}",
+        err(&o)
+    );
+}
+
+#[test]
+fn ctl_node_is_listed_and_readable() {
+    // The control node appears in the container directory listing and reads
+    // back its usage.
+    let d = workspace();
+    let listing = ok(d.path(), &["ls", "/containers/hako"]);
+    assert!(
+        listing.contains("ctl"),
+        "container dir ls should surface the ctl node: {listing}"
+    );
+    let usage = ok(d.path(), &["cat", "/containers/hako/ctl"]);
+    assert!(
+        usage.contains("commit"),
+        "ctl usage should mention the commit verb: {usage}"
+    );
+}
+
+#[test]
+fn ctl_commit_snapshots_the_working_tree() {
+    // Writing `commit <msg>` to the ctl node snapshots the container, exactly
+    // like `hako commit` — the Plan 9 control-via-a-file model.
+    let d = workspace();
+    ok(d.path(), &["write", "/etc/motd", "hi"]);
+    // Before: dirty.
+    assert!(ok(d.path(), &["cat", "/containers/hako"]).contains("working:   modified"));
+    // Control it by writing to ctl.
+    ok(
+        d.path(),
+        &["write", "/containers/hako/ctl", "commit set motd via ctl"],
+    );
+    // After: clean, and the message shows up in the log.
+    assert!(ok(d.path(), &["cat", "/containers/hako"]).contains("working:   clean"));
+    assert!(ok(d.path(), &["log"]).contains("set motd via ctl"));
+}
+
+#[test]
+fn ctl_rejects_unknown_verb_cleanly() {
+    let d = workspace();
+    let o = hako(
+        d.path(),
+        &["write", "/containers/hako/ctl", "frobnicate now"],
+    );
+    assert!(!o.status.success(), "unknown ctl verb should fail");
+    assert!(
+        err(&o).contains("unsupported") && !err(&o).contains("panicked"),
+        "unknown verb should be a clean, descriptive error: {}",
+        err(&o)
+    );
+}
+
+#[test]
+fn writing_a_readonly_meta_node_is_rejected() {
+    // `status` is read-only; only `ctl` accepts writes among the meta nodes.
+    let d = workspace();
+    let o = hako(d.path(), &["write", "/containers/hako/status", "x"]);
+    assert!(!o.status.success(), "writing status should fail");
+    assert!(
+        !err(&o).contains("panicked"),
+        "rejection should be clean: {}",
+        err(&o)
+    );
+}
