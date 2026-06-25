@@ -32,6 +32,15 @@ pub fn ls(ctx: &Ctx<'_>, path: Option<String>) -> io::Result<ExitCode> {
             for node in META_NODES {
                 println!("{} (meta)", node);
             }
+            println!("{}/ (meta)", crate::cmd::proc_meta::META_PROC);
+        }
+        // `proc/` and `proc/<pid>` are runtime-backed: listing reads /proc on
+        // the kernel the container runs on (bridged from Windows/macOS).
+        RouteTarget::Container { name, path }
+            if refspec.is_none() && crate::cmd::proc_meta::proc_subpath(&path).is_some() =>
+        {
+            let sub = crate::cmd::proc_meta::proc_subpath(&path).unwrap();
+            return crate::cmd::proc_meta::ls(ctx, &name, sub);
         }
         target => {
             with_target_resolved(ctx.state, ctx.default_container, target, |repo, p| {

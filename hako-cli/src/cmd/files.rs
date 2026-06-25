@@ -158,6 +158,11 @@ pub fn cat(ctx: &Ctx<'_>, path: String) -> io::Result<ExitCode> {
         if let RouteTarget::Container { name, path } = RouteTarget::parse(&rest) {
             if container_fs_path(&path).is_none() {
                 // Not a filesystem path → the meta surface.
+                // `proc/` is runtime-backed: reading it bridges to the Linux
+                // runtime (see `Cmd::needs_linux_runtime`).
+                if let Some(procsub) = crate::cmd::proc_meta::proc_subpath(&path) {
+                    return crate::cmd::proc_meta::cat(ctx, &name, procsub);
+                }
                 if path.is_empty() || path == META_STATUS {
                     let repo = ctx.state.open_container(&name)?;
                     let bytes = render_container_status(&repo, &name)?;

@@ -13,6 +13,7 @@ pub mod files;
 pub mod maintenance;
 pub mod nav;
 pub mod oci;
+pub mod proc_meta;
 pub mod runtime;
 pub mod sync;
 pub mod vc;

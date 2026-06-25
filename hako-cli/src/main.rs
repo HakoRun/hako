@@ -391,6 +391,19 @@ enum Cmd {
     External(Vec<String>),
 }
 
+/// Whether a `cat`/`ls`/`tree` path targets a container's `proc/` meta surface
+/// (`/containers/<name>/proc[/...]`), which reads live process state and so must
+/// run on the Linux runtime. Only the absolute form is detected here — the
+/// bridge decision runs before the session cwd is loaded, so a relative
+/// `proc/...` while cd'd into a container isn't auto-bridged (a v1 limitation).
+fn is_container_proc_path(path: &str) -> bool {
+    matches!(
+        hako::RouteTarget::parse(path),
+        hako::RouteTarget::Container { path: sub, .. }
+            if crate::cmd::proc_meta::proc_subpath(&sub).is_some()
+    )
+}
+
 impl Cmd {
     /// Whether this command requires the Linux runtime (namespaces, FUSE,
     /// pivot_root). On non-Linux hosts these are auto-forwarded into the
@@ -402,6 +415,14 @@ impl Cmd {
             // without touching the runtime — no reason to pay the WSL/Lima
             // round-trip just to print 4 lines.
             Cmd::Apply { dry_run, .. } => !dry_run,
+            // Reading a container's live processes (`/containers/<name>/proc/...`)
+            // reads /proc on the kernel the container runs on, so it must bridge
+            // like run/exec to work from Windows/macOS via WSL2/Lima.
+            Cmd::Cat { path } => is_container_proc_path(path),
+            Cmd::Ls { path: Some(path) } => is_container_proc_path(path),
+            Cmd::Tree {
+                path: Some(path), ..
+            } => is_container_proc_path(path),
             _ => false,
         }
     }
