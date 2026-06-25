@@ -344,3 +344,39 @@ fn writing_a_readonly_meta_node_is_rejected() {
         err(&o)
     );
 }
+
+#[test]
+fn ctl_branch_and_tag_create_refs() {
+    // The control plane also covers the cross-platform VC verbs: `branch` and
+    // `tag` each create a ref at HEAD, driven entirely by writing to ctl.
+    let d = workspace();
+    ok(d.path(), &["write", "/a.txt", "one"]);
+    ok(d.path(), &["write", "/containers/hako/ctl", "commit first"]);
+
+    ok(
+        d.path(),
+        &["write", "/containers/hako/ctl", "branch feature-x"],
+    );
+    assert!(
+        ok(d.path(), &["branch"]).contains("feature-x"),
+        "ctl `branch` should create a listed branch"
+    );
+
+    ok(d.path(), &["write", "/containers/hako/ctl", "tag v1"]);
+    // The tag resolves as a ref, so `<tag>:<path>` reads its tree.
+    assert_eq!(ok(d.path(), &["cat", "v1:/a.txt"]).trim(), "one");
+}
+
+#[test]
+fn ctl_verb_missing_argument_errors_cleanly() {
+    // `branch`/`tag` require a name; omitting it is a clean, descriptive error
+    // (the arg check fires before any repo work).
+    let d = workspace();
+    let o = hako(d.path(), &["write", "/containers/hako/ctl", "branch"]);
+    assert!(!o.status.success(), "branch with no name should fail");
+    assert!(
+        err(&o).contains("needs an argument") && !err(&o).contains("panicked"),
+        "missing-arg error should be clean and descriptive: {}",
+        err(&o)
+    );
+}

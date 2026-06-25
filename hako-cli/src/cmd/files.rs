@@ -17,6 +17,8 @@ use std::process::ExitCode;
 const CTL_USAGE: &str = "\
 ctl — write a command to control this container:
   hako write /containers/<name>/ctl \"commit [message]\"   snapshot the working tree
+  hako write /containers/<name>/ctl \"branch <name>\"      create a branch at HEAD
+  hako write /containers/<name>/ctl \"tag <name>\"         tag HEAD
 ";
 
 pub fn write(
@@ -74,9 +76,10 @@ pub fn write(
 /// argument (the Plan 9 ctl-file model). Holds the workspace lock via the
 /// `write` command, so the dispatched action is serialized.
 ///
-/// Supported today: `commit [message]` — snapshot the container's working tree.
-/// Instance verbs (start/stop/exec) are intentionally not here yet: they are
-/// instance-addressed and platform-specific, so they land in a later pass.
+/// Supported today (all container-addressed and cross-platform): `commit
+/// [message]`, `branch <name>`, `tag <name>`. Instance verbs (start/stop/exec)
+/// are intentionally not here yet: they are instance-addressed and
+/// platform-specific, so they land in a later pass.
 fn dispatch_ctl(ctx: &Ctx<'_>, name: &str, body: &[u8]) -> io::Result<ExitCode> {
     let text = std::str::from_utf8(body)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "ctl command must be UTF-8"))?
@@ -98,11 +101,49 @@ fn dispatch_ctl(ctx: &Ctx<'_>, name: &str, body: &[u8]) -> io::Result<ExitCode> 
             };
             super::vc::commit_repo(&repo, message, "ctl")
         }
+        "branch" => {
+            let new_branch = require_ctl_arg(verb, arg, "<name>")?;
+            let repo = ctx.state.open_container(name)?;
+            let target = repo
+                .head_commit()?
+                .ok_or_else(|| io::Error::other("no HEAD commit to branch from"))?;
+            repo.write_ref(new_branch, target)?;
+            println!(
+                "created branch {} at {}",
+                new_branch,
+                &target.to_hex()[..12]
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        "tag" => {
+            let tag_name = require_ctl_arg(verb, arg, "<name>")?;
+            let repo = ctx.state.open_container(name)?;
+            let target = repo
+                .head_commit()?
+                .ok_or_else(|| io::Error::other("no HEAD commit to tag"))?;
+            repo.write_tag(tag_name, target)?;
+            println!("tagged {} at {}", tag_name, &target.to_hex()[..12]);
+            Ok(ExitCode::SUCCESS)
+        }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("ctl: unsupported command {other:?}; supported: commit [message]"),
+            format!(
+                "ctl: unsupported command {other:?}; \
+                 supported: commit [message], branch <name>, tag <name>"
+            ),
         )),
     }
+}
+
+/// Require a non-empty argument for a ctl verb, with a usage-shaped error.
+fn require_ctl_arg<'a>(verb: &str, arg: &'a str, shape: &str) -> io::Result<&'a str> {
+    if arg.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("ctl: `{verb}` needs an argument: {verb} {shape}"),
+        ));
+    }
+    Ok(arg)
 }
 
 pub fn cat(ctx: &Ctx<'_>, path: String) -> io::Result<ExitCode> {
