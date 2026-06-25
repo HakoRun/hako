@@ -3,7 +3,7 @@
 use super::Ctx;
 use crate::helpers::{
     apply_cwd, container_fs_path, print_diff, resolve_cd, resolve_tree, split_ref_path,
-    with_target, with_target_resolved, META_CTL, META_STATUS, ROOT_BOUNDARY,
+    with_target, with_target_resolved, META_NODES, ROOT_BOUNDARY,
 };
 use hako::fs::DirKind;
 use hako::{Hash, RouteTarget, ScopedFs, Session};
@@ -29,8 +29,9 @@ pub fn ls(ctx: &Ctx<'_>, path: Option<String>) -> io::Result<ExitCode> {
             // Validate the container exists (open errors with NotFound otherwise).
             let _ = ctx.state.open_container(&name)?;
             println!("{}/", ROOT_BOUNDARY);
-            println!("{} (meta)", META_STATUS);
-            println!("{} (meta)", META_CTL);
+            for node in META_NODES {
+                println!("{} (meta)", node);
+            }
         }
         target => {
             with_target_resolved(ctx.state, ctx.default_container, target, |repo, p| {

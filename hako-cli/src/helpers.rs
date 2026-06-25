@@ -289,6 +289,12 @@ pub const META_STATUS: &str = "status";
 /// Reading it returns a usage summary.
 pub const META_CTL: &str = "ctl";
 
+/// The reserved meta-node leaf names that sit beside `root/` in a container
+/// directory. `ls` lists these; the `cat`/`write` interceptors handle each by
+/// name. Keeping the listed set in one place is what stops `ls` from drifting
+/// out of sync with the interceptors as nodes are added.
+pub const META_NODES: &[&str] = &[META_STATUS, META_CTL];
+
 /// Interpret the sub-path after `/containers/<name>` (the raw `path` from
 /// `RouteTarget::Container`, with no leading slash) under the `root/` layout.
 ///
