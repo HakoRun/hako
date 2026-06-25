@@ -45,25 +45,74 @@ pub fn proc_subpath(sub: &str) -> Option<&str> {
 // Linux reader
 // ============================================================================
 
-/// The host pids of the named container's processes that we expose. v1: the
-/// recorded PID-1 (`nspid`) of each *running* instance of this container. The
-/// instance metadata is what vouches that these pids belong to the container.
+/// The host pids of the named container's processes. Every host-visible process
+/// whose PID namespace matches one of the container's running instances — the
+/// instance's recorded PID-1 (`nspid`) identifies the namespace, and all
+/// processes sharing it are the container's process tree (v2: not just PID-1).
+///
+/// Security: the match is by PID-namespace inode, so only processes actually in
+/// the container's namespace are returned — never unrelated host processes. As a
+/// guard, a namespace that resolves to *our own* (the host) is ignored, so a
+/// bogus or host `nspid` can never enumerate every process on the machine. A
+/// process we can't stat (another user's) is skipped, not exposed.
 #[cfg(target_os = "linux")]
 fn container_pids(ctx: &Ctx<'_>, name: &str) -> io::Result<Vec<u32>> {
+    use std::collections::HashSet;
     let runtime_root = ctx.workdir.join(crate::DOT_HAKO);
     let instances = hako_runtime::instances::list(&runtime_root)
         .map_err(|e| io::Error::other(e.to_string()))?;
-    let mut pids = Vec::new();
+
+    // PID-namespace inodes of this container's running instances, excluding our
+    // own (the host) namespace — the safety guard against a host/bogus nspid.
+    let own_ns = pid_ns_inode(std::process::id());
+    let mut ns_inodes: HashSet<u64> = HashSet::new();
     for inst in instances {
         if inst.config.branch == name && inst.is_running() {
             if let Some((nspid, _)) =
                 hako_runtime::instances::read_nspid_with_starttime(&runtime_root, &inst.id)
             {
-                pids.push(nspid);
+                if let Some(ino) = pid_ns_inode(nspid) {
+                    if Some(ino) != own_ns {
+                        ns_inodes.insert(ino);
+                    }
+                }
             }
         }
     }
+    if ns_inodes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Every host-visible process in one of those namespaces.
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let Some(pid) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue; // non-numeric /proc entries (cpuinfo, self, …)
+        };
+        if let Some(ino) = pid_ns_inode(pid) {
+            if ns_inodes.contains(&ino) {
+                pids.push(pid);
+            }
+        }
+    }
+    pids.sort_unstable();
     Ok(pids)
+}
+
+/// The inode of a process's PID namespace (`/proc/<pid>/ns/pid`). Processes in
+/// the same PID namespace share this inode. `None` if unreadable (the process
+/// is gone, or it's another user's and we lack permission) — which the caller
+/// treats as "not in this container."
+#[cfg(target_os = "linux")]
+fn pid_ns_inode(pid: u32) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(format!("/proc/{pid}/ns/pid"))
+        .ok()
+        .map(|m| m.ino())
 }
 
 /// `ls /containers/<name>/proc[/<pid>]`.
