@@ -229,6 +229,16 @@ fn ls_container_dir_lists_root_and_meta() {
         listing.contains("status"),
         "container dir ls should surface the synthetic status entry: {listing}"
     );
+    // The whole META_NODES registry is listed: the ctl control node and the
+    // runtime-backed proc/ directory, alongside status.
+    assert!(
+        listing.contains("ctl"),
+        "container dir ls should surface the ctl control node: {listing}"
+    );
+    assert!(
+        listing.contains("proc/"),
+        "container dir ls should surface the proc/ meta directory: {listing}"
+    );
     assert!(
         !listing.contains("bin"),
         "container dir ls should NOT list rootfs entries directly: {listing}"
