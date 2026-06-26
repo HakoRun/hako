@@ -29,13 +29,17 @@ tempfile = "3"
 # single-node FS/dev build carries no crypto/transport weight.
 ed25519-dalek = { version = "2", optional = true }
 getrandom = { version = "0.2", optional = true }
+# The peer registry (.hako/peers.toml) — read + write, so the default `toml`
+# features (parse + display), unlike hako-core's parse-only use.
+serde = { workspace = true, optional = true }
+toml = { version = "0.8", optional = true }
 
 [features]
 default = []
 # The distributed/cluster surface (Phase 1+): node identity and static peers
 # now, the `serve` daemon + wire protocol later. Gated so the base binary
 # stays lean — see docs/distributed.md.
-cluster = ["dep:ed25519-dalek", "dep:getrandom"]
+cluster = ["dep:ed25519-dalek", "dep:getrandom", "dep:serde", "dep:toml"]
 # Embeds a pre-built Linux hako binary into the host (Windows/macOS)
 # wrapper, so `hako apply` etc. can auto-bootstrap a WSL distro / Lima
 # VM without requiring the user to install hako separately inside.

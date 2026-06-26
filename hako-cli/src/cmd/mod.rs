@@ -15,6 +15,8 @@ pub mod identity;
 pub mod maintenance;
 pub mod nav;
 pub mod oci;
+#[cfg(feature = "cluster")]
+pub mod peers;
 pub mod proc_meta;
 pub mod runtime;
 pub mod sync;

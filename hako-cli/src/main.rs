@@ -44,6 +44,22 @@ struct Cli {
     cmd: Cmd,
 }
 
+/// Subcommands of `hako peer` — the static cluster registry (docs/distributed.md).
+#[cfg(feature = "cluster")]
+#[derive(Subcommand)]
+enum PeerCmd {
+    /// Add (or update) a peer: its network address and Ed25519 public key
+    Add {
+        name: String,
+        address: String,
+        pubkey: String,
+    },
+    /// List configured peers
+    List,
+    /// Remove a peer
+    Remove { name: String },
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Initialize a new hako workspace
@@ -178,6 +194,12 @@ enum Cmd {
     /// Show this node's cluster identity (its Ed25519 public key)
     #[cfg(feature = "cluster")]
     Id,
+    /// Manage cluster peers (the static .hako/peers.toml registry)
+    #[cfg(feature = "cluster")]
+    Peer {
+        #[command(subcommand)]
+        cmd: PeerCmd,
+    },
 
     // ------------------------------------------------------------ Mount
     /// Mount a tree (ref or working) as a read-only filesystem at `mountpoint`.
@@ -701,6 +723,16 @@ fn run() -> io::Result<ExitCode> {
         // Cluster (docs/distributed.md)
         #[cfg(feature = "cluster")]
         Cmd::Id => cmd::identity::show(&ctx),
+        #[cfg(feature = "cluster")]
+        Cmd::Peer { cmd } => match cmd {
+            PeerCmd::Add {
+                name,
+                address,
+                pubkey,
+            } => cmd::peers::add(&ctx, name, address, pubkey),
+            PeerCmd::List => cmd::peers::list(&ctx),
+            PeerCmd::Remove { name } => cmd::peers::remove(&ctx, name),
+        },
         Cmd::NewContainer { name } => {
             state.create_container(&name)?;
             println!("created container {}", name);
