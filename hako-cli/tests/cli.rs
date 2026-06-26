@@ -399,59 +399,66 @@ fn ctl_verb_missing_argument_errors_cleanly() {
 #[cfg(target_os = "linux")]
 #[test]
 fn proc_meta_exposes_the_container_tree_and_rejects_host_processes() {
-    use std::process::{Command, Stdio};
-    use std::time::Duration;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
 
-    fn quiet(cmd: &mut Command) -> &mut Command {
+    // Kill (and reap) spawned helpers even if an assertion panics mid-test.
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn spawn_quiet(cmd: &mut Command) -> std::io::Result<Child> {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .spawn()
     }
 
     let d = workspace();
 
     // A control process in the HOST namespace — must never be exposed.
-    let mut host_proc = quiet(&mut Command::new("sleep").arg("60"))
-        .spawn()
-        .expect("spawn host sleep");
-    let host_pid = host_proc.id();
+    let host = KillOnDrop(spawn_quiet(Command::new("sleep").arg("60")).expect("spawn host sleep"));
+    let host_pid = host.0.id();
 
     // A real container PID namespace: an unshared PID-1 (bash) with two children.
-    let unshared = quiet(Command::new("unshare").args([
+    let unshared = match spawn_quiet(Command::new("unshare").args([
         "-Upf",
         "--mount-proc",
         "--kill-child",
         "bash",
         "-c",
         "sleep 60 & sleep 61 & wait",
-    ]))
-    .spawn();
-    let mut unshared = match unshared {
-        Ok(c) => c,
+    ])) {
+        Ok(c) => KillOnDrop(c),
         Err(_) => {
-            let _ = host_proc.kill();
             eprintln!("SKIP: `unshare` unavailable");
             return;
         }
     };
-    std::thread::sleep(Duration::from_millis(400));
 
-    // The namespaced PID-1 is unshare's (forked) child.
-    let children =
-        std::fs::read_to_string(format!("/proc/{u}/task/{u}/children", u = unshared.id()))
-            .unwrap_or_default();
-    let nspid: u32 = match children
-        .split_whitespace()
-        .next()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(p) => p,
-        None => {
-            let _ = host_proc.kill();
-            let _ = unshared.kill();
+    // Poll for the namespaced PID-1 (unshare's forked child) rather than racing a
+    // fixed sleep; skip cleanly if no namespace appears (userns disabled).
+    let read_nspid = || -> Option<u32> {
+        std::fs::read_to_string(format!("/proc/{u}/task/{u}/children", u = unshared.0.id()))
+            .ok()?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let nspid = loop {
+        if let Some(p) = read_nspid() {
+            break p;
+        }
+        if Instant::now() >= deadline {
             eprintln!("SKIP: could not create a PID namespace (unprivileged userns disabled?)");
             return;
         }
+        std::thread::sleep(Duration::from_millis(50));
     };
 
     // Fabricate a running instance of the default `hako` container whose PID-1
@@ -466,8 +473,19 @@ fn proc_meta_exposes_the_container_tree_and_rejects_host_processes() {
     std::fs::write(rd.join("pid"), nspid.to_string()).unwrap();
     std::fs::write(rd.join("nspid"), nspid.to_string()).unwrap();
 
+    // Poll `ls` until the children settle into the full tree (PID-1 + 2 sleeps)
+    // rather than asserting against a fixed delay.
+    let count = |s: &str| s.lines().filter(|l| !l.trim().is_empty()).count();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let listing = loop {
+        let l = ok(d.path(), &["ls", "/containers/hako/proc"]);
+        if count(&l) >= 3 || Instant::now() >= deadline {
+            break l;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
     // ls enumerates the container's *tree* (PID-1 + children), not the host.
-    let listing = ok(d.path(), &["ls", "/containers/hako/proc"]);
     let listed: Vec<&str> = listing.lines().filter(|l| !l.trim().is_empty()).collect();
     assert!(
         listed
@@ -514,6 +532,5 @@ fn proc_meta_exposes_the_container_tree_and_rejects_host_processes() {
     );
     assert!(!o.status.success(), "proc/<pid>/mem must not be exposed");
 
-    let _ = host_proc.kill();
-    let _ = unshared.kill();
+    // `host` and `unshared` are killed + reaped on drop (including on panic).
 }
