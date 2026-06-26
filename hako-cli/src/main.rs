@@ -174,6 +174,11 @@ enum Cmd {
     /// Delete a container
     DelContainer { name: String },
 
+    // ------------------------------------------------------------ Cluster (docs/distributed.md)
+    /// Show this node's cluster identity (its Ed25519 public key)
+    #[cfg(feature = "cluster")]
+    Id,
+
     // ------------------------------------------------------------ Mount
     /// Mount a tree (ref or working) as a read-only filesystem at `mountpoint`.
     /// Linux only. Blocks until unmounted.
@@ -692,6 +697,10 @@ fn run() -> io::Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+
+        // Cluster (docs/distributed.md)
+        #[cfg(feature = "cluster")]
+        Cmd::Id => cmd::identity::show(&ctx),
         Cmd::NewContainer { name } => {
             state.create_container(&name)?;
             println!("created container {}", name);

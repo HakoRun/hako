@@ -24,9 +24,18 @@ flate2 = "1"
 # in $TMP before `limactl copy` ships it into the VM. RAII cleanup so a
 # crash mid-copy doesn't leak a ~10 MiB file in /tmp.
 tempfile = "3"
+# Cluster node identity (Phase 1): an Ed25519 keypair is the node's stable id.
+# Optional — only the `cluster` feature pulls in the crypto stack, so the
+# single-node FS/dev build carries no crypto/transport weight.
+ed25519-dalek = { version = "2", optional = true }
+getrandom = { version = "0.2", optional = true }
 
 [features]
 default = []
+# The distributed/cluster surface (Phase 1+): node identity and static peers
+# now, the `serve` daemon + wire protocol later. Gated so the base binary
+# stays lean — see docs/distributed.md.
+cluster = ["dep:ed25519-dalek", "dep:getrandom"]
 # Embeds a pre-built Linux hako binary into the host (Windows/macOS)
 # wrapper, so `hako apply` etc. can auto-bootstrap a WSL distro / Lima
 # VM without requiring the user to install hako separately inside.
