@@ -380,3 +380,130 @@ fn ctl_verb_missing_argument_errors_cleanly() {
         err(&o)
     );
 }
+
+// The proc/ reader runs against the host kernel's /proc, so it needs a real PID
+// namespace — the cross-platform suite can't reach it. This Linux-only test
+// codifies the security boundary: a container's process *tree* is exposed, while
+// a host process (a different PID namespace) is rejected. Skips cleanly where
+// unprivileged user namespaces aren't available (e.g. a hardened CI runner).
+#[cfg(target_os = "linux")]
+#[test]
+fn proc_meta_exposes_the_container_tree_and_rejects_host_processes() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    fn quiet(cmd: &mut Command) -> &mut Command {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+    }
+
+    let d = workspace();
+
+    // A control process in the HOST namespace — must never be exposed.
+    let mut host_proc = quiet(&mut Command::new("sleep").arg("60"))
+        .spawn()
+        .expect("spawn host sleep");
+    let host_pid = host_proc.id();
+
+    // A real container PID namespace: an unshared PID-1 (bash) with two children.
+    let unshared = quiet(Command::new("unshare").args([
+        "-Upf",
+        "--mount-proc",
+        "--kill-child",
+        "bash",
+        "-c",
+        "sleep 60 & sleep 61 & wait",
+    ]))
+    .spawn();
+    let mut unshared = match unshared {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = host_proc.kill();
+            eprintln!("SKIP: `unshare` unavailable");
+            return;
+        }
+    };
+    std::thread::sleep(Duration::from_millis(400));
+
+    // The namespaced PID-1 is unshare's (forked) child.
+    let children =
+        std::fs::read_to_string(format!("/proc/{u}/task/{u}/children", u = unshared.id()))
+            .unwrap_or_default();
+    let nspid: u32 = match children
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(p) => p,
+        None => {
+            let _ = host_proc.kill();
+            let _ = unshared.kill();
+            eprintln!("SKIP: could not create a PID namespace (unprivileged userns disabled?)");
+            return;
+        }
+    };
+
+    // Fabricate a running instance of the default `hako` container whose PID-1
+    // is the unshared process.
+    let rd = d.path().join(".hako/runtime/test-proc");
+    std::fs::create_dir_all(&rd).unwrap();
+    std::fs::write(
+        rd.join("config.json"),
+        r#"{"branch":"hako","command":["bash"],"started_unix":1}"#,
+    )
+    .unwrap();
+    std::fs::write(rd.join("pid"), nspid.to_string()).unwrap();
+    std::fs::write(rd.join("nspid"), nspid.to_string()).unwrap();
+
+    // ls enumerates the container's *tree* (PID-1 + children), not the host.
+    let listing = ok(d.path(), &["ls", "/containers/hako/proc"]);
+    let listed: Vec<&str> = listing.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(
+        listed
+            .iter()
+            .any(|l| l.trim_end_matches('/') == nspid.to_string()),
+        "the container PID-1 should be listed: {listing}"
+    );
+    assert!(
+        listed.len() >= 2,
+        "the process *tree* (PID-1 + children) should be listed, got: {listing}"
+    );
+    assert!(
+        !listed
+            .iter()
+            .any(|l| l.trim_end_matches('/') == host_pid.to_string()),
+        "a host-namespace process must never appear: {listing}"
+    );
+
+    // cat reads a container process.
+    assert!(
+        !ok(
+            d.path(),
+            &["cat", &format!("/containers/hako/proc/{nspid}/comm")]
+        )
+        .is_empty(),
+        "comm of a container process should read"
+    );
+
+    // SECURITY: the host process must be rejected (different PID namespace).
+    let o = hako(
+        d.path(),
+        &["cat", &format!("/containers/hako/proc/{host_pid}/comm")],
+    );
+    assert!(
+        !o.status.success() && !err(&o).contains("panicked"),
+        "host process must not be readable through proc/: {}",
+        err(&o)
+    );
+
+    // mem is never exposed.
+    let o = hako(
+        d.path(),
+        &["cat", &format!("/containers/hako/proc/{nspid}/mem")],
+    );
+    assert!(!o.status.success(), "proc/<pid>/mem must not be exposed");
+
+    let _ = host_proc.kill();
+    let _ = unshared.kill();
+}

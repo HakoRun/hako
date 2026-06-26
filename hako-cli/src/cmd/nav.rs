@@ -3,7 +3,7 @@
 use super::Ctx;
 use crate::helpers::{
     apply_cwd, container_fs_path, print_diff, resolve_cd, resolve_tree, route, split_ref_path,
-    with_target, with_target_resolved, META_NODES, ROOT_BOUNDARY,
+    with_target, with_target_resolved, MetaNodeKind, META_NODES, ROOT_BOUNDARY,
 };
 use hako::fs::DirKind;
 use hako::{Hash, RouteTarget, ScopedFs, Session};
@@ -29,10 +29,12 @@ pub fn ls(ctx: &Ctx<'_>, path: Option<String>) -> io::Result<ExitCode> {
             // Validate the container exists (open errors with NotFound otherwise).
             let _ = ctx.state.open_container(&name)?;
             println!("{}/", ROOT_BOUNDARY);
-            for node in META_NODES {
-                println!("{} (meta)", node);
+            for (node, kind) in META_NODES {
+                match kind {
+                    MetaNodeKind::Leaf => println!("{} (meta)", node),
+                    MetaNodeKind::Dir => println!("{}/ (meta)", node),
+                }
             }
-            println!("{}/ (meta)", crate::cmd::proc_meta::META_PROC);
         }
         // `proc/` and `proc/<pid>` are runtime-backed: listing reads /proc on
         // the kernel the container runs on (bridged from Windows/macOS).

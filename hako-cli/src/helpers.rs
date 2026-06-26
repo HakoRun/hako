@@ -261,8 +261,9 @@ where
             f(&repo, fs)
         }
         RouteTarget::ContainersList => Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "/containers is a virtual list, not writable",
+            io::ErrorKind::InvalidInput,
+            "/containers is the virtual container list — address a container as \
+             /containers/<name>/root/<path> (or `hako ls /containers`)",
         )),
         RouteTarget::Workspace(_) => Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -322,11 +323,24 @@ pub const META_STATUS: &str = "status";
 /// Reading it returns a usage summary.
 pub const META_CTL: &str = "ctl";
 
-/// The reserved meta-node leaf names that sit beside `root/` in a container
-/// directory. `ls` lists these; the `cat`/`write` interceptors handle each by
-/// name. Keeping the listed set in one place is what stops `ls` from drifting
-/// out of sync with the interceptors as nodes are added.
-pub const META_NODES: &[&str] = &[META_STATUS, META_CTL];
+/// How `ls` renders a meta node beside `root/`.
+pub enum MetaNodeKind {
+    /// A readable file (`status`, `ctl`).
+    Leaf,
+    /// A directory (`proc/`).
+    Dir,
+}
+
+/// The reserved meta nodes that sit beside `root/` in a container directory, and
+/// how `ls` lists each: store-backed leaves (`status`, `ctl`) plus the
+/// runtime-backed `proc/` directory. Keeping the whole set in one place is what
+/// stops `ls` from drifting out of sync with the `cat`/`write` interceptors as
+/// nodes are added.
+pub const META_NODES: &[(&str, MetaNodeKind)] = &[
+    (META_STATUS, MetaNodeKind::Leaf),
+    (META_CTL, MetaNodeKind::Leaf),
+    (crate::cmd::proc_meta::META_PROC, MetaNodeKind::Dir),
+];
 
 /// Interpret the sub-path after `/containers/<name>` (the raw `path` from
 /// `RouteTarget::Container`, with no leading slash) under the `root/` layout.

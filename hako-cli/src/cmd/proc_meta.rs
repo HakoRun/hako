@@ -11,9 +11,13 @@
 //! ## Security
 //!
 //! Only pids that provably belong to the named container are exposed — never
-//! arbitrary host processes. v1 restricts to each running instance's recorded
-//! PID-1 (`nspid`), which the instance metadata vouches for. `mem` is
-//! deliberately never exposed.
+//! arbitrary host processes. Matching is by PID-namespace inode: a process is
+//! the container's iff its `/proc/<pid>/ns/pid` inode matches a running
+//! instance's recorded PID-1 (`nspid`); the host's own namespace is excluded, so
+//! a bogus or host `nspid` can never enumerate the machine. `cat` re-checks the
+//! inode *after* reading to close a pid-recycle race (a pid that dies and is
+//! recycled to a non-container process mid-read is discarded, not leaked). `mem`
+//! is deliberately never exposed.
 
 use super::Ctx;
 use std::io;
@@ -45,27 +49,18 @@ pub fn proc_subpath(sub: &str) -> Option<&str> {
 // Linux reader
 // ============================================================================
 
-/// The host pids of the named container's processes. Every host-visible process
-/// whose PID namespace matches one of the container's running instances — the
-/// instance's recorded PID-1 (`nspid`) identifies the namespace, and all
-/// processes sharing it are the container's process tree (v2: not just PID-1).
-///
-/// Security: the match is by PID-namespace inode, so only processes actually in
-/// the container's namespace are returned — never unrelated host processes. As a
-/// guard, a namespace that resolves to *our own* (the host) is ignored, so a
-/// bogus or host `nspid` can never enumerate every process on the machine. A
-/// process we can't stat (another user's) is skipped, not exposed.
+/// The PID-namespace inodes of the named container's *running* instances,
+/// excluding our own (the host) namespace as a guard against a host/bogus
+/// `nspid`. A process belongs to the container iff its `ns/pid` inode is in this
+/// set. Cheap (one stat per instance) — both the membership check and the full
+/// enumeration build on it.
 #[cfg(target_os = "linux")]
-fn container_pids(ctx: &Ctx<'_>, name: &str) -> io::Result<Vec<u32>> {
-    use std::collections::HashSet;
+fn container_ns_inodes(ctx: &Ctx<'_>, name: &str) -> io::Result<std::collections::HashSet<u64>> {
     let runtime_root = ctx.workdir.join(crate::DOT_HAKO);
     let instances = hako_runtime::instances::list(&runtime_root)
         .map_err(|e| io::Error::other(e.to_string()))?;
-
-    // PID-namespace inodes of this container's running instances, excluding our
-    // own (the host) namespace — the safety guard against a host/bogus nspid.
     let own_ns = pid_ns_inode(std::process::id());
-    let mut ns_inodes: HashSet<u64> = HashSet::new();
+    let mut set = std::collections::HashSet::new();
     for inst in instances {
         if inst.config.branch == name && inst.is_running() {
             if let Some((nspid, _)) =
@@ -73,17 +68,25 @@ fn container_pids(ctx: &Ctx<'_>, name: &str) -> io::Result<Vec<u32>> {
             {
                 if let Some(ino) = pid_ns_inode(nspid) {
                     if Some(ino) != own_ns {
-                        ns_inodes.insert(ino);
+                        set.insert(ino);
                     }
                 }
             }
         }
     }
+    Ok(set)
+}
+
+/// Every host-visible pid in the container's process tree — each process whose
+/// PID namespace matches the container (v2: the whole tree, not just PID-1). A
+/// full `/proc` scan, so only `ls` (which must list them all) uses it; a single
+/// pid is checked in O(1) via [`pid_in_container`].
+#[cfg(target_os = "linux")]
+fn container_pids(ctx: &Ctx<'_>, name: &str) -> io::Result<Vec<u32>> {
+    let ns_inodes = container_ns_inodes(ctx, name)?;
     if ns_inodes.is_empty() {
         return Ok(Vec::new());
     }
-
-    // Every host-visible process in one of those namespaces.
     let mut pids = Vec::new();
     for entry in std::fs::read_dir("/proc")? {
         let Some(pid) = entry?
@@ -103,6 +106,15 @@ fn container_pids(ctx: &Ctx<'_>, name: &str) -> io::Result<Vec<u32>> {
     Ok(pids)
 }
 
+/// Whether `pid` belongs to the container, in O(1) (no `/proc` scan). Returns
+/// the process's PID-namespace inode when it does — the caller re-checks it
+/// after reading to close a recycle race.
+#[cfg(target_os = "linux")]
+fn pid_in_container(ctx: &Ctx<'_>, name: &str, pid: u32) -> io::Result<Option<u64>> {
+    let ns_inodes = container_ns_inodes(ctx, name)?;
+    Ok(pid_ns_inode(pid).filter(|ino| ns_inodes.contains(ino)))
+}
+
 /// The inode of a process's PID namespace (`/proc/<pid>/ns/pid`). Processes in
 /// the same PID namespace share this inode. `None` if unreadable (the process
 /// is gone, or it's another user's and we lack permission) — which the caller
@@ -115,31 +127,35 @@ fn pid_ns_inode(pid: u32) -> Option<u64> {
         .map(|m| m.ino())
 }
 
+#[cfg(target_os = "linux")]
+fn not_in_container(name: &str, pid: u32) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("no live process {pid} in container {name}"),
+    )
+}
+
 /// `ls /containers/<name>/proc[/<pid>]`.
 #[cfg(target_os = "linux")]
 pub fn ls(ctx: &Ctx<'_>, name: &str, subpath: &str) -> io::Result<ExitCode> {
     let _ = ctx.state.open_container(name)?; // validate the container exists
-    let pids = container_pids(ctx, name)?;
     let sub = subpath.trim_matches('/');
     if sub.is_empty() {
-        // The proc directory: one entry per live process.
-        for pid in pids {
+        // The proc directory: one entry per live process (full enumeration).
+        for pid in container_pids(ctx, name)? {
             println!("{}/", pid);
         }
         return Ok(ExitCode::SUCCESS);
     }
-    // A specific process directory: list its files.
+    // A specific process directory: list its files (O(1) membership check).
     let pid: u32 = sub
         .split('/')
         .next()
         .unwrap_or("")
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "not a process id"))?;
-    if !pids.contains(&pid) {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("no live process {pid} in container {name}"),
-        ));
+    if pid_in_container(ctx, name, pid)?.is_none() {
+        return Err(not_in_container(name, pid));
     }
     for f in PROC_FILES {
         println!("{}", f);
@@ -152,17 +168,24 @@ pub fn ls(ctx: &Ctx<'_>, name: &str, subpath: &str) -> io::Result<ExitCode> {
 pub fn cat(ctx: &Ctx<'_>, name: &str, subpath: &str) -> io::Result<ExitCode> {
     let _ = ctx.state.open_container(name)?; // validate the container exists
     let sub = subpath.trim_matches('/');
+    if sub.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "/containers/{name}/proc is a directory; specify a pid, e.g. \
+                 `hako cat /containers/{name}/proc/<pid>/status` (`hako ls` to list them)"
+            ),
+        ));
+    }
     let (pid_s, file) = sub.split_once('/').unwrap_or((sub, ""));
     let pid: u32 = pid_s
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "not a process id"))?;
-    // Security boundary: the pid must belong to this container.
-    if !container_pids(ctx, name)?.contains(&pid) {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("no live process {pid} in container {name}"),
-        ));
-    }
+    // Security boundary: the pid must belong to this container. Record its
+    // namespace inode so we can re-verify after the read (recycle race).
+    let Some(ns_before) = pid_in_container(ctx, name, pid)? else {
+        return Err(not_in_container(name, pid));
+    };
     let bytes = match file {
         "status" | "comm" => std::fs::read(format!("/proc/{pid}/{file}"))?,
         "cmdline" => {
@@ -197,6 +220,12 @@ pub fn cat(ctx: &Ctx<'_>, name: &str, subpath: &str) -> io::Result<ExitCode> {
             ))
         }
     };
+    // Recycle guard: if the pid left the container's namespace under us (it
+    // exited and the pid was reused by a process outside the container),
+    // discard the read rather than leak an unrelated process's data.
+    if pid_ns_inode(pid) != Some(ns_before) {
+        return Err(not_in_container(name, pid));
+    }
     io::stdout().write_all(&bytes)?;
     Ok(ExitCode::SUCCESS)
 }
