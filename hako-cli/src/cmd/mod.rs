@@ -10,9 +10,13 @@ use std::path::Path;
 pub mod apply;
 pub mod bundle;
 pub mod files;
+#[cfg(feature = "cluster")]
+pub mod identity;
 pub mod maintenance;
 pub mod nav;
 pub mod oci;
+#[cfg(feature = "cluster")]
+pub mod peers;
 pub mod proc_meta;
 pub mod runtime;
 pub mod sync;

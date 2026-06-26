@@ -7,6 +7,12 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches a release.
 ## [Unreleased]
 
 ### Added
+- **Cluster foundations (opt-in `--features cluster`):** each node has a stable
+  Ed25519 identity (`hako id`; secret seed at `.hako/identity`, 0600), and a
+  static peer registry — `hako peer add|list|remove` over `.hako/peers.toml`
+  (name → network address + public key). The first steps toward a private,
+  trusted-fleet distributed hako (`docs/distributed.md`); gated so the base
+  binary carries no crypto/transport weight.
 - **Container meta-fs:** from the host (`hako`) context, each container is
   addressable as a tree under `/containers/<name>/` — `root/` for its
   filesystem, plus meta nodes: `status` (read a snapshot of branch/HEAD/dirty),
