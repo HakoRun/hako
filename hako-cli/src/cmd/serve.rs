@@ -30,6 +30,8 @@ const SIG_LEN: usize = 64;
 
 /// Request tags (first byte of a post-handshake request frame).
 const TAG_META_READ: u8 = 1;
+/// `MetaWrite` request: payload is `[path_len: u32 BE][path][body]`.
+const TAG_META_WRITE: u8 = 2;
 /// Response status (first byte of a response frame).
 const RESP_OK: u8 = 0;
 const RESP_ERR: u8 = 1;
@@ -182,32 +184,27 @@ fn handle_peer(stream: &mut TcpStream, id: &identity::Identity, ctx: &Ctx<'_>) -
         let Some((&tag, payload)) = req.split_first() else {
             return Ok(());
         };
-        match tag {
-            TAG_META_READ => {
-                let result = std::str::from_utf8(payload)
-                    .map_err(|_| invalid("request path is not UTF-8"))
-                    .and_then(|path| meta_read(ctx, path));
-                let resp = match &result {
-                    Ok(bytes) => {
-                        let mut r = Vec::with_capacity(1 + bytes.len());
-                        r.push(RESP_OK);
-                        r.extend_from_slice(bytes);
-                        r
-                    }
-                    Err(e) => {
-                        let mut r = vec![RESP_ERR];
-                        r.extend_from_slice(e.to_string().as_bytes());
-                        r
-                    }
-                };
-                write_frame(stream, &resp)?;
+        let result: io::Result<Vec<u8>> = match tag {
+            TAG_META_READ => std::str::from_utf8(payload)
+                .map_err(|_| invalid("request path is not UTF-8"))
+                .and_then(|path| meta_read(ctx, path)),
+            TAG_META_WRITE => meta_write(ctx, payload),
+            _ => Err(invalid("unknown request")),
+        };
+        let resp = match &result {
+            Ok(bytes) => {
+                let mut r = Vec::with_capacity(1 + bytes.len());
+                r.push(RESP_OK);
+                r.extend_from_slice(bytes);
+                r
             }
-            _ => {
+            Err(e) => {
                 let mut r = vec![RESP_ERR];
-                r.extend_from_slice(b"unknown request");
-                write_frame(stream, &r)?;
+                r.extend_from_slice(e.to_string().as_bytes());
+                r
             }
-        }
+        };
+        write_frame(stream, &resp)?;
     }
 }
 
@@ -223,6 +220,35 @@ fn meta_read(ctx: &Ctx<'_>, path: &str) -> io::Result<Vec<u8>> {
         _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("cannot serve {path} remotely yet (only container status)"),
+        )),
+    }
+}
+
+/// Serve a meta-fs write. Payload is `[path_len: u32 BE][path][body]`. For now:
+/// a container `ctl` verb (run/commit/branch/tag), dispatched on this node with
+/// its output captured and returned.
+fn meta_write(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
+    use hako::RouteTarget;
+    if payload.len() < 4 {
+        return Err(invalid("malformed write request"));
+    }
+    let plen = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
+    let rest = &payload[4..];
+    if rest.len() < plen {
+        return Err(invalid("malformed write request"));
+    }
+    let path =
+        std::str::from_utf8(&rest[..plen]).map_err(|_| invalid("write path is not UTF-8"))?;
+    let body = &rest[plen..];
+    match RouteTarget::parse(path) {
+        RouteTarget::Container { name, path: sub } if sub == "ctl" => {
+            let mut buf = Vec::new();
+            crate::cmd::files::dispatch_ctl(ctx, &name, body, &mut buf)?;
+            Ok(buf)
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("cannot write {path} remotely yet (only container ctl)"),
         )),
     }
 }
@@ -254,7 +280,33 @@ pub fn remote_cat(ctx: &Ctx<'_>, peer_rest: &str) -> io::Result<ExitCode> {
     let mut req = vec![TAG_META_READ];
     req.extend_from_slice(format!("/{subpath}").as_bytes());
     write_frame(&mut stream, &req)?;
-    let resp = read_frame(&mut stream)?;
+    read_response(&mut stream, node)
+}
+
+/// `write /peers/<node>/<subpath>` — handshake, then `MetaWrite(subpath, body)`.
+/// Dispatches a `ctl` verb (e.g. `run …`) to a remote node and prints its reply.
+pub fn remote_write(ctx: &Ctx<'_>, peer_rest: &str, body: &[u8]) -> io::Result<ExitCode> {
+    let (node, subpath) = peer_rest.split_once('/').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "address a peer path as /peers/<node>/containers/<name>/ctl",
+        )
+    })?;
+    let peer = peers::lookup(ctx, node)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no peer named {node}")))?;
+    let mut stream = connect_and_handshake(ctx, &peer)?;
+    let path = format!("/{subpath}");
+    let mut req = vec![TAG_META_WRITE];
+    req.extend_from_slice(&(path.len() as u32).to_be_bytes());
+    req.extend_from_slice(path.as_bytes());
+    req.extend_from_slice(body);
+    write_frame(&mut stream, &req)?;
+    read_response(&mut stream, node)
+}
+
+/// Read a response frame; on success write its payload to stdout.
+fn read_response(stream: &mut TcpStream, node: &str) -> io::Result<ExitCode> {
+    let resp = read_frame(stream)?;
     let (&status, payload) = resp
         .split_first()
         .ok_or_else(|| invalid("empty response"))?;
