@@ -54,6 +54,10 @@ pub fn write(
             if sub == META_CTL {
                 return dispatch_ctl(ctx, &name, &bytes);
             }
+            // proc/<pid>/ctl — signal a process in the container (Plan 9 model).
+            if let Some(procsub) = crate::cmd::proc_meta::proc_subpath(&sub) {
+                return crate::cmd::proc_meta::write(ctx, &name, procsub, &bytes);
+            }
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(

@@ -467,7 +467,7 @@ fn proc_meta_exposes_the_container_tree_and_rejects_host_processes() {
     std::fs::create_dir_all(&rd).unwrap();
     std::fs::write(
         rd.join("config.json"),
-        r#"{"branch":"hako","command":["bash"],"started_unix":1}"#,
+        r#"{"container":"hako","branch":"main","command":["bash"],"started_unix":1}"#,
     )
     .unwrap();
     std::fs::write(rd.join("pid"), nspid.to_string()).unwrap();
@@ -532,6 +532,38 @@ fn proc_meta_exposes_the_container_tree_and_rejects_host_processes() {
     );
     assert!(!o.status.success(), "proc/<pid>/mem must not be exposed");
 
+    // proc/<pid>/ctl signals a process, scoped to the container. SECURITY: a
+    // host pid (different PID namespace) is rejected — never signaled.
+    let o = hako(
+        d.path(),
+        &[
+            "write",
+            &format!("/containers/hako/proc/{host_pid}/ctl"),
+            "stop",
+        ],
+    );
+    assert!(
+        !o.status.success() && err(&o).contains("no live process"),
+        "signalling a host process must be rejected: {}",
+        err(&o)
+    );
+    // A container process is accepted and the signal delivered (SIGTERM here —
+    // sent last, since it tears the unshared helper down). exit 0 ⇒ the pid was
+    // verified in-container and kill(2) succeeded.
+    let o = hako(
+        d.path(),
+        &[
+            "write",
+            &format!("/containers/hako/proc/{nspid}/ctl"),
+            "stop",
+        ],
+    );
+    assert!(
+        o.status.success(),
+        "signalling a container process should succeed: {}",
+        err(&o)
+    );
+
     // `host` and `unshared` are killed + reaped on drop (including on panic).
 }
 
@@ -553,6 +585,29 @@ fn ctl_run_is_a_recognized_verb() {
         !err(&o).contains("unsupported command") && !err(&o).contains("panicked"),
         "`run` should be a recognized ctl verb (got the runtime's platform error, \
          not the unknown-verb error): {}",
+        err(&o)
+    );
+}
+
+// Writing to `proc/<pid>/ctl` signals a process — a runtime op that must *route*
+// to the proc surface, not fall through to the generic "not writable" meta path.
+// Off Linux the proc surface reports the runtime-needed error; what we assert
+// cross-platform is that the write reached it (not the not-writable rejection).
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn proc_ctl_write_routes_to_the_proc_surface() {
+    let d = workspace();
+    let o = hako(
+        d.path(),
+        &["write", "/containers/hako/proc/123/ctl", "stop"],
+    );
+    assert!(
+        !o.status.success(),
+        "can't signal without the Linux runtime"
+    );
+    assert!(
+        !err(&o).contains("is not writable") && !err(&o).contains("panicked"),
+        "proc/<pid>/ctl should route to the proc surface, not the not-writable path: {}",
         err(&o)
     );
 }

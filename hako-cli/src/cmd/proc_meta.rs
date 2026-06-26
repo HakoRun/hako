@@ -29,9 +29,21 @@ use std::process::ExitCode;
 pub const META_PROC: &str = "proc";
 
 /// Per-pid files exposed under `/containers/<name>/proc/<pid>/`. `mem` is
-/// intentionally excluded.
+/// intentionally excluded. `ctl` (the per-process control node) is listed
+/// separately since it is write-driven.
 #[cfg(target_os = "linux")]
 const PROC_FILES: &[&str] = &["status", "cmdline", "comm"];
+
+/// The per-process control node (`proc/<pid>/ctl`). Plan 9's `/proc/n/ctl`:
+/// write a signal verb to it.
+#[cfg(target_os = "linux")]
+const PROC_CTL: &str = "ctl";
+
+#[cfg(target_os = "linux")]
+const PROC_CTL_USAGE: &str = "\
+ctl — write a signal to control this process:
+  stop  (SIGTERM)   kill  (SIGKILL)   int   hup   <number>
+";
 
 /// If `sub` (the path after `/containers/<name>`, no leading slash) addresses
 /// the proc surface, return the part after `proc`/`proc/` (empty = the proc
@@ -160,6 +172,7 @@ pub fn ls(ctx: &Ctx<'_>, name: &str, subpath: &str) -> io::Result<ExitCode> {
     for f in PROC_FILES {
         println!("{}", f);
     }
+    println!("{}", PROC_CTL);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -201,6 +214,7 @@ pub fn cat(ctx: &Ctx<'_>, name: &str, subpath: &str) -> io::Result<ExitCode> {
             out.push(b'\n');
             out
         }
+        "ctl" => PROC_CTL_USAGE.as_bytes().to_vec(),
         "mem" => {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -230,6 +244,67 @@ pub fn cat(ctx: &Ctx<'_>, name: &str, subpath: &str) -> io::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `write /containers/<name>/proc/<pid>/ctl "<signal>"` — signal a process in
+/// the container (Plan 9's `/proc/n/ctl`). Only `proc/<pid>/ctl` is writable.
+#[cfg(target_os = "linux")]
+pub fn write(ctx: &Ctx<'_>, name: &str, subpath: &str, body: &[u8]) -> io::Result<ExitCode> {
+    let _ = ctx.state.open_container(name)?; // validate the container exists
+    let sub = subpath.trim_matches('/');
+    let (pid_s, node) = sub.split_once('/').unwrap_or((sub, ""));
+    if node != PROC_CTL {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "/containers/{name}/proc/{sub} is not writable; signal a process via \
+                 /containers/{name}/proc/<pid>/ctl"
+            ),
+        ));
+    }
+    let pid: u32 = pid_s
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "not a process id"))?;
+    // Security boundary: the pid must belong to this container. Capture its
+    // namespace inode so we can re-verify immediately before signaling.
+    let Some(ns_before) = pid_in_container(ctx, name, pid)? else {
+        return Err(not_in_container(name, pid));
+    };
+    let verb = std::str::from_utf8(body)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "ctl signal must be UTF-8"))?
+        .trim();
+    let sig = signal_for(verb)?;
+    // Recycle guard: if the pid left the container's namespace under us (it
+    // exited and the pid was reused outside the container), refuse — never
+    // signal a process outside the container.
+    if pid_ns_inode(pid) != Some(ns_before) {
+        return Err(not_in_container(name, pid));
+    }
+    hako_runtime::proc::signal(pid, sig).map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Map a control verb to a signal number — a few common names, or a raw number.
+#[cfg(target_os = "linux")]
+fn signal_for(verb: &str) -> io::Result<i32> {
+    Ok(match verb {
+        "stop" | "term" | "sigterm" => 15,
+        "kill" | "sigkill" => 9,
+        "int" | "sigint" => 2,
+        "hup" | "sighup" => 1,
+        "" => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ctl: empty signal; try `stop`, `kill`, or a number",
+            ))
+        }
+        other => other.parse::<i32>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("ctl: unknown signal {other:?}; try stop, kill, int, hup, or a number"),
+            )
+        })?,
+    })
+}
+
 // ============================================================================
 // Non-Linux stubs — only reached if the bridge was skipped (HAKO_NO_BRIDGE) or
 // no Linux runtime is reachable. The normal Windows/macOS path forwards the
@@ -243,6 +318,11 @@ pub fn ls(_ctx: &Ctx<'_>, _name: &str, _subpath: &str) -> io::Result<ExitCode> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn cat(_ctx: &Ctx<'_>, _name: &str, _subpath: &str) -> io::Result<ExitCode> {
+    Err(proc_needs_runtime())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn write(_ctx: &Ctx<'_>, _name: &str, _subpath: &str, _body: &[u8]) -> io::Result<ExitCode> {
     Err(proc_needs_runtime())
 }
 
