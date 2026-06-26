@@ -164,7 +164,14 @@ pub fn run_container_detached(
     let workdir = hako_dir(repo)?;
     let id = instances::generate_id();
     let cmd_for_record = command.clone().unwrap_or_default();
-    instances::create(&workdir, &id, branch, &cmd_for_record)?;
+    // The container this instance belongs to is the basename of the repo's dir
+    // (`<ws>/.hako/containers/<name>`) — what the `proc/` surface groups by.
+    let container = repo
+        .root()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    instances::create(&workdir, &id, container, branch, &cmd_for_record)?;
     let volumes_owned = volumes.to_vec();
 
     // Outer fork: parent returns immediately; child supervises. If the fork

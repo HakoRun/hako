@@ -15,6 +15,12 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches a release.
   kernel's `/proc` scoped to the container's PID namespace (host processes are
   never exposed; `mem` is not exposed); on Windows/macOS it bridges into
   WSL2/Lima like `run`/`exec`.
+- **Container lifecycle through the control plane:** `ctl "run [command]"`
+  dispatches a detached workload (the container's current branch, like
+  `run -d`), and `proc/<pid>/ctl "stop|kill|int|hup|<number>"` signals a process
+  — both scoped to the container's PID namespace (a host or out-of-container pid
+  is never signaled, re-checked immediately before the kill). The first steps of
+  the distributed roadmap (`docs/distributed.md`); Linux-native for now.
 
 ### Changed
 - The `/containers`, `/workspace`, and `/peers` prefixes are recognized only

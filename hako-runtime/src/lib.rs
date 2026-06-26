@@ -23,6 +23,7 @@
 //! supported alternatives.
 
 pub mod instances;
+pub mod proc;
 
 #[cfg(target_os = "linux")]
 mod cgroup;
