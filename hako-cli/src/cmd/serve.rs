@@ -1,0 +1,358 @@
+//! The node daemon (`hako serve`) and the cluster wire protocol (Phase 2 of
+//! `docs/distributed.md`).
+//!
+//! A connection has two phases:
+//!
+//! 1. **Mutual handshake** — both ends prove they hold the Ed25519 key the other
+//!    has registered. The client verifies the server is the node it dialed; the
+//!    server verifies the client is a peer in *its* registry, before serving
+//!    anything. (Station-to-station style: exchange pubkey+nonce, sign the
+//!    other's nonce, verify.)
+//! 2. **Requests** — currently one: `MetaRead(path)`, which runs the node's own
+//!    meta-fs read (e.g. a container `status`) and returns the bytes. This is
+//!    what makes `cat /peers/<node>/containers/<name>/status` work remotely.
+//!
+//! `hako peer ping <name>` does the handshake and stops (a reachability +
+//! identity check); `cat /peers/...` does the handshake then a `MetaRead`.
+
+use super::Ctx;
+use crate::cmd::{identity, peers};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::process::ExitCode;
+
+/// Cap on a single frame's payload, guarding against a bogus length prefix.
+const MAX_FRAME: u32 = 1 << 20;
+const NONCE_LEN: usize = 32;
+const PUBKEY_LEN: usize = 32;
+const SIG_LEN: usize = 64;
+
+/// Request tags (first byte of a post-handshake request frame).
+const TAG_META_READ: u8 = 1;
+/// Response status (first byte of a response frame).
+const RESP_OK: u8 = 0;
+const RESP_ERR: u8 = 1;
+
+// ---------------------------------------------------------------------------
+// Framing
+// ---------------------------------------------------------------------------
+
+fn write_frame(w: &mut impl Write, payload: &[u8]) -> io::Result<()> {
+    w.write_all(&(payload.len() as u32).to_be_bytes())?;
+    w.write_all(payload)?;
+    w.flush()
+}
+
+fn read_frame(r: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut len = [0u8; 4];
+    r.read_exact(&mut len)?;
+    let len = u32::from_be_bytes(len);
+    if len > MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
+    }
+    let mut buf = vec![0u8; len as usize];
+    r.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn invalid(msg: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+fn denied(msg: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, msg)
+}
+fn random_nonce() -> io::Result<[u8; NONCE_LEN]> {
+    let mut n = [0u8; NONCE_LEN];
+    getrandom::getrandom(&mut n).map_err(|e| io::Error::other(format!("nonce: {e}")))?;
+    Ok(n)
+}
+
+// ---------------------------------------------------------------------------
+// Mutual handshake
+// ---------------------------------------------------------------------------
+
+/// Server side: verify the client (via `authorized`, which decides if a pubkey
+/// is a registered peer) and prove our own identity. The `authorized` closure
+/// keeps this decoupled from `Ctx` so it is unit-testable.
+fn handshake_as_server(
+    stream: &mut TcpStream,
+    id: &identity::Identity,
+    authorized: impl Fn(&[u8; PUBKEY_LEN]) -> bool,
+) -> io::Result<()> {
+    // H1: client_pubkey || client_nonce
+    let h1 = read_frame(stream)?;
+    if h1.len() != PUBKEY_LEN + NONCE_LEN {
+        return Err(invalid("handshake: bad hello"));
+    }
+    let client_pubkey: [u8; PUBKEY_LEN] = h1[..PUBKEY_LEN].try_into().unwrap();
+    let client_nonce = &h1[PUBKEY_LEN..];
+    let client_vk =
+        VerifyingKey::from_bytes(&client_pubkey).map_err(|_| invalid("client pubkey invalid"))?;
+    if !authorized(&client_pubkey) {
+        return Err(denied("client is not a registered peer"));
+    }
+    // H2: our signature over the client's nonce || our nonce
+    let server_nonce = random_nonce()?;
+    let mut h2 = Vec::with_capacity(SIG_LEN + NONCE_LEN);
+    h2.extend_from_slice(&id.sign(client_nonce));
+    h2.extend_from_slice(&server_nonce);
+    write_frame(stream, &h2)?;
+    // H3: client's signature over our nonce
+    let h3 = read_frame(stream)?;
+    let client_sig: [u8; SIG_LEN] = h3
+        .as_slice()
+        .try_into()
+        .map_err(|_| invalid("handshake: bad client signature"))?;
+    client_vk
+        .verify(&server_nonce, &Signature::from_bytes(&client_sig))
+        .map_err(|_| denied("client failed to prove its identity"))?;
+    Ok(())
+}
+
+/// Client side: prove our identity and verify the server is `expected`.
+fn handshake_as_client(
+    stream: &mut TcpStream,
+    id: &identity::Identity,
+    expected: &VerifyingKey,
+) -> io::Result<()> {
+    // H1: our pubkey || our nonce
+    let client_nonce = random_nonce()?;
+    let mut h1 = Vec::with_capacity(PUBKEY_LEN + NONCE_LEN);
+    h1.extend_from_slice(&id.verifying_key().to_bytes());
+    h1.extend_from_slice(&client_nonce);
+    write_frame(stream, &h1)?;
+    // H2: server_sig over our nonce || server nonce
+    let h2 = read_frame(stream)?;
+    if h2.len() != SIG_LEN + NONCE_LEN {
+        return Err(invalid("handshake: bad server reply"));
+    }
+    let server_sig: [u8; SIG_LEN] = h2[..SIG_LEN].try_into().unwrap();
+    let server_nonce = &h2[SIG_LEN..];
+    expected
+        .verify(&client_nonce, &Signature::from_bytes(&server_sig))
+        .map_err(|_| denied("peer failed the identity check"))?;
+    // H3: our signature over the server's nonce
+    write_frame(stream, &id.sign(server_nonce))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+/// `hako serve [--addr ...]` — listen, authenticate peers, serve requests.
+pub fn serve(ctx: &Ctx<'_>, addr: &str) -> io::Result<ExitCode> {
+    let id = identity::load_or_create(ctx)?;
+    let listener = TcpListener::bind(addr)?;
+    println!(
+        "hako serve: listening on {} as {}",
+        listener.local_addr()?,
+        id.node_id()
+    );
+    for conn in listener.incoming() {
+        match conn {
+            Ok(mut stream) => {
+                if let Err(e) = handle_peer(&mut stream, &id, ctx) {
+                    eprintln!("hako serve: connection error: {e}");
+                }
+            }
+            Err(e) => eprintln!("hako serve: accept error: {e}"),
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn handle_peer(stream: &mut TcpStream, id: &identity::Identity, ctx: &Ctx<'_>) -> io::Result<()> {
+    handshake_as_server(stream, id, |pk| {
+        peers::find_by_pubkey(ctx, &hex(pk))
+            .ok()
+            .flatten()
+            .is_some()
+    })?;
+    loop {
+        let req = match read_frame(stream) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let Some((&tag, payload)) = req.split_first() else {
+            return Ok(());
+        };
+        match tag {
+            TAG_META_READ => {
+                let result = std::str::from_utf8(payload)
+                    .map_err(|_| invalid("request path is not UTF-8"))
+                    .and_then(|path| meta_read(ctx, path));
+                let resp = match &result {
+                    Ok(bytes) => {
+                        let mut r = Vec::with_capacity(1 + bytes.len());
+                        r.push(RESP_OK);
+                        r.extend_from_slice(bytes);
+                        r
+                    }
+                    Err(e) => {
+                        let mut r = vec![RESP_ERR];
+                        r.extend_from_slice(e.to_string().as_bytes());
+                        r
+                    }
+                };
+                write_frame(stream, &resp)?;
+            }
+            _ => {
+                let mut r = vec![RESP_ERR];
+                r.extend_from_slice(b"unknown request");
+                write_frame(stream, &r)?;
+            }
+        }
+    }
+}
+
+/// Serve a meta-fs read. For now: a container's `status` readout (the bytes
+/// `cat /containers/<name>/status` would print locally).
+fn meta_read(ctx: &Ctx<'_>, path: &str) -> io::Result<Vec<u8>> {
+    use hako::RouteTarget;
+    match RouteTarget::parse(path) {
+        RouteTarget::Container { name, path: sub } if sub.is_empty() || sub == "status" => {
+            let repo = ctx.state.open_container(&name)?;
+            crate::helpers::render_container_status(&repo, &name)
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("cannot serve {path} remotely yet (only container status)"),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
+
+/// `hako peer ping <name>` — handshake with a peer and report success.
+pub fn ping(ctx: &Ctx<'_>, name: &str) -> io::Result<ExitCode> {
+    let peer = peers::lookup(ctx, name)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no peer named {name}")))?;
+    let _stream = connect_and_handshake(ctx, &peer)?;
+    println!("peer {name} ({}) verified", peer.address);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `cat /peers/<node>/<subpath>` — handshake, then `MetaRead(subpath)`.
+pub fn remote_cat(ctx: &Ctx<'_>, peer_rest: &str) -> io::Result<ExitCode> {
+    let (node, subpath) = peer_rest.split_once('/').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "address a peer path as /peers/<node>/containers/<name>/status",
+        )
+    })?;
+    let peer = peers::lookup(ctx, node)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no peer named {node}")))?;
+    let mut stream = connect_and_handshake(ctx, &peer)?;
+    let mut req = vec![TAG_META_READ];
+    req.extend_from_slice(format!("/{subpath}").as_bytes());
+    write_frame(&mut stream, &req)?;
+    let resp = read_frame(&mut stream)?;
+    let (&status, payload) = resp
+        .split_first()
+        .ok_or_else(|| invalid("empty response"))?;
+    if status == RESP_OK {
+        io::stdout().write_all(payload)?;
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Err(io::Error::other(format!(
+            "peer {node}: {}",
+            String::from_utf8_lossy(payload)
+        )))
+    }
+}
+
+fn connect_and_handshake(ctx: &Ctx<'_>, peer: &peers::Peer) -> io::Result<TcpStream> {
+    let expected = peer.verifying_key()?;
+    let id = identity::load_or_create(ctx)?;
+    let mut stream = TcpStream::connect(&peer.address)?;
+    handshake_as_client(&mut stream, &id, &expected)?;
+    Ok(stream)
+}
+
+/// Lowercase hex encoding.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_roundtrips() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, b"hello hako").unwrap();
+        let mut cur = std::io::Cursor::new(buf);
+        assert_eq!(read_frame(&mut cur).unwrap(), b"hello hako");
+    }
+
+    #[test]
+    fn oversized_frame_is_rejected() {
+        let mut bytes = (MAX_FRAME + 1).to_be_bytes().to_vec();
+        bytes.extend_from_slice(&[0u8; 8]);
+        let mut cur = std::io::Cursor::new(bytes);
+        assert!(read_frame(&mut cur).is_err());
+    }
+
+    fn id_at(dir: &std::path::Path) -> identity::Identity {
+        identity::load_or_create_at(&dir.join("identity")).unwrap()
+    }
+
+    #[test]
+    fn mutual_handshake_succeeds_when_both_are_registered() {
+        let ds = tempfile::tempdir().unwrap();
+        let dc = tempfile::tempdir().unwrap();
+        let server_id = id_at(ds.path());
+        let client_id = id_at(dc.path());
+        let server_vk = server_id.verifying_key();
+        let client_pk = client_id.verifying_key().to_bytes();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            handshake_as_server(&mut s, &server_id, |pk| *pk == client_pk)
+        });
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let client_result = handshake_as_client(&mut stream, &client_id, &server_vk);
+        assert!(client_result.is_ok(), "client: {client_result:?}");
+        assert!(server.join().unwrap().is_ok(), "server");
+    }
+
+    #[test]
+    fn handshake_rejects_an_unregistered_client() {
+        let ds = tempfile::tempdir().unwrap();
+        let dc = tempfile::tempdir().unwrap();
+        let server_id = id_at(ds.path());
+        let client_id = id_at(dc.path());
+        let server_vk = server_id.verifying_key();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The server authorizes nobody.
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            handshake_as_server(&mut s, &server_id, |_| false)
+        });
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let client_result = handshake_as_client(&mut stream, &client_id, &server_vk);
+        assert!(
+            client_result.is_err(),
+            "client handshake must fail when the server rejects it"
+        );
+        assert!(server.join().unwrap().is_err(), "server rejects");
+    }
+}

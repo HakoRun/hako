@@ -13,6 +13,13 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches a release.
   (name → network address + public key). The first steps toward a private,
   trusted-fleet distributed hako (`docs/distributed.md`); gated so the base
   binary carries no crypto/transport weight.
+- **Node daemon + remote meta-fs reads (`--features cluster`):** `hako serve`
+  runs a node daemon that authenticates peers with a **mutual** Ed25519 handshake
+  (each end proves it holds the key the other registered, and the server serves
+  only registered peers), then handles requests. `hako peer ping <name>` checks a
+  peer's reachability + identity; `cat /peers/<node>/containers/<name>/status`
+  reads a container's status from a remote node over that authenticated channel —
+  the first control RPC of the distributed roadmap.
 - **Container meta-fs:** from the host (`hako`) context, each container is
   addressable as a tree under `/containers/<name>/` — `root/` for its
   filesystem, plus meta nodes: `status` (read a snapshot of branch/HEAD/dirty),

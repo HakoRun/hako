@@ -183,7 +183,14 @@ pub fn cat(ctx: &Ctx<'_>, path: String) -> io::Result<ExitCode> {
     // both read the synthetic status readout. A ref (`<ref>:<path>`) always means
     // the filesystem tree, so meta interception only applies without a ref.
     if refspec.is_none() {
-        if let RouteTarget::Container { name, path } = route(&rest, ctx.default_container) {
+        let target = route(&rest, ctx.default_container);
+        // `/peers/<node>/...` reads a meta node from a remote node over the
+        // authenticated cluster channel (cluster builds only).
+        #[cfg(feature = "cluster")]
+        if let RouteTarget::Peers(peer_rest) = &target {
+            return crate::cmd::serve::remote_cat(ctx, peer_rest);
+        }
+        if let RouteTarget::Container { name, path } = target {
             if container_fs_path(&path).is_none() {
                 // Not a filesystem path → the meta surface.
                 // `proc/` is runtime-backed: reading it bridges to the Linux

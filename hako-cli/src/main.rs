@@ -58,6 +58,8 @@ enum PeerCmd {
     List,
     /// Remove a peer
     Remove { name: String },
+    /// Connect to a peer and verify it proves its registered identity
+    Ping { name: String },
 }
 
 #[derive(Subcommand)]
@@ -199,6 +201,13 @@ enum Cmd {
     Peer {
         #[command(subcommand)]
         cmd: PeerCmd,
+    },
+    /// Run the node daemon: serve this node's cluster surface to peers
+    #[cfg(feature = "cluster")]
+    Serve {
+        /// Address to listen on
+        #[arg(long, default_value = "127.0.0.1:7777")]
+        addr: String,
     },
 
     // ------------------------------------------------------------ Mount
@@ -487,6 +496,13 @@ impl Cmd {
             Cmd::Gc { dry_run: true } => false,
             // Init was already handled before locking.
             Cmd::Init { .. } => false,
+            // Cluster: identity/peers act on their own files (.hako/identity,
+            // .hako/peers.toml), not the workspace refs this lock protects — and
+            // `serve` is a long-running daemon, so holding the lock for its
+            // lifetime would deadlock every other command (including `peer ping`
+            // against it).
+            #[cfg(feature = "cluster")]
+            Cmd::Id | Cmd::Serve { .. } | Cmd::Peer { .. } => false,
             // Everything else is RMW on workspace state.
             _ => true,
         }
@@ -732,7 +748,10 @@ fn run() -> io::Result<ExitCode> {
             } => cmd::peers::add(&ctx, name, address, pubkey),
             PeerCmd::List => cmd::peers::list(&ctx),
             PeerCmd::Remove { name } => cmd::peers::remove(&ctx, name),
+            PeerCmd::Ping { name } => cmd::serve::ping(&ctx, &name),
         },
+        #[cfg(feature = "cluster")]
+        Cmd::Serve { addr } => cmd::serve::serve(&ctx, &addr),
         Cmd::NewContainer { name } => {
             state.create_container(&name)?;
             println!("created container {}", name);

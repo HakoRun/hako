@@ -28,6 +28,12 @@ impl Identity {
     pub fn node_id(&self) -> String {
         hex(self.verifying_key().to_bytes().as_slice())
     }
+
+    /// Sign a message with this node's key (e.g. a peer's connection challenge).
+    pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer;
+        self.signing.sign(msg).to_bytes()
+    }
 }
 
 /// Load the workspace's identity, generating and persisting one on first use.
