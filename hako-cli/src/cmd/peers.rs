@@ -20,6 +20,21 @@ pub struct Peer {
     pub pubkey: String,
 }
 
+impl Peer {
+    /// Decode the stored hex pubkey into an Ed25519 verifying key.
+    pub fn verifying_key(&self) -> io::Result<ed25519_dalek::VerifyingKey> {
+        let bytes = decode_hex32(&self.pubkey).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "stored pubkey is not 64 hex")
+        })?;
+        ed25519_dalek::VerifyingKey::from_bytes(&bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stored pubkey is not a valid key",
+            )
+        })
+    }
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct Registry {
     #[serde(default)]
@@ -136,6 +151,11 @@ pub fn remove(ctx: &Ctx<'_>, name: String) -> io::Result<ExitCode> {
     remove_at(&registry_path(ctx), &name)?;
     println!("removed peer {}", name);
     Ok(ExitCode::SUCCESS)
+}
+
+/// Look up a registered peer by name.
+pub fn lookup(ctx: &Ctx<'_>, name: &str) -> io::Result<Option<Peer>> {
+    Ok(load(&registry_path(ctx))?.peers.get(name).cloned())
 }
 
 #[cfg(test)]

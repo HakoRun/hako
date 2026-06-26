@@ -19,6 +19,8 @@ pub mod oci;
 pub mod peers;
 pub mod proc_meta;
 pub mod runtime;
+#[cfg(feature = "cluster")]
+pub mod serve;
 pub mod sync;
 pub mod vc;
 
