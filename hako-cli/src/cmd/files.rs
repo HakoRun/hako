@@ -49,10 +49,17 @@ pub fn write(
     // Meta surface: writing under /containers/<name> that is NOT a filesystem
     // path (i.e. not under root/) targets a control/meta node. `ctl` dispatches
     // a control verb; other meta nodes are read-only.
-    if let RouteTarget::Container { name, path: sub } = route(&path, ctx.default_container) {
+    let target = route(&path, ctx.default_container);
+    // `/peers/<node>/.../ctl` dispatches a control verb to a remote node over the
+    // authenticated cluster channel (cluster builds only).
+    #[cfg(feature = "cluster")]
+    if let RouteTarget::Peers(peer_rest) = &target {
+        return crate::cmd::serve::remote_write(ctx, peer_rest, &bytes);
+    }
+    if let RouteTarget::Container { name, path: sub } = target {
         if container_fs_path(&sub).is_none() {
             if sub == META_CTL {
-                return dispatch_ctl(ctx, &name, &bytes);
+                return dispatch_ctl(ctx, &name, &bytes, &mut io::stdout());
             }
             // proc/<pid>/ctl — signal a process in the container (Plan 9 model).
             if let Some(procsub) = crate::cmd::proc_meta::proc_subpath(&sub) {
@@ -85,7 +92,12 @@ pub fn write(
 /// [message]`, `branch <name>`, `tag <name>`. Instance verbs (start/stop/exec)
 /// are intentionally not here yet: they are instance-addressed and
 /// platform-specific, so they land in a later pass.
-fn dispatch_ctl(ctx: &Ctx<'_>, name: &str, body: &[u8]) -> io::Result<ExitCode> {
+pub(crate) fn dispatch_ctl(
+    ctx: &Ctx<'_>,
+    name: &str,
+    body: &[u8],
+    out: &mut dyn io::Write,
+) -> io::Result<ExitCode> {
     let text = std::str::from_utf8(body)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "ctl command must be UTF-8"))?
         .trim();
@@ -104,7 +116,7 @@ fn dispatch_ctl(ctx: &Ctx<'_>, name: &str, body: &[u8]) -> io::Result<ExitCode> 
             } else {
                 arg
             };
-            super::vc::commit_repo(&repo, message, "ctl")
+            super::vc::commit_repo(&repo, message, "ctl", out)
         }
         "branch" => {
             let new_branch = require_ctl_arg(verb, arg, "<name>")?;
@@ -113,11 +125,12 @@ fn dispatch_ctl(ctx: &Ctx<'_>, name: &str, body: &[u8]) -> io::Result<ExitCode> 
                 .head_commit()?
                 .ok_or_else(|| io::Error::other("no HEAD commit to branch from"))?;
             repo.write_ref(new_branch, target)?;
-            println!(
+            writeln!(
+                out,
                 "created branch {} at {}",
                 new_branch,
                 &target.to_hex()[..12]
-            );
+            )?;
             Ok(ExitCode::SUCCESS)
         }
         "tag" => {
@@ -127,7 +140,7 @@ fn dispatch_ctl(ctx: &Ctx<'_>, name: &str, body: &[u8]) -> io::Result<ExitCode> 
                 .head_commit()?
                 .ok_or_else(|| io::Error::other("no HEAD commit to tag"))?;
             repo.write_tag(tag_name, target)?;
-            println!("tagged {} at {}", tag_name, &target.to_hex()[..12]);
+            writeln!(out, "tagged {} at {}", tag_name, &target.to_hex()[..12])?;
             Ok(ExitCode::SUCCESS)
         }
         "run" => {
@@ -150,7 +163,7 @@ fn dispatch_ctl(ctx: &Ctx<'_>, name: &str, body: &[u8]) -> io::Result<ExitCode> 
             };
             let id = hako_runtime::transform::run_container_detached(&repo, &branch, command, &[])
                 .map_err(super::runtime::runtime_to_io)?;
-            println!("{}", id);
+            writeln!(out, "{}", id)?;
             Ok(ExitCode::SUCCESS)
         }
         other => Err(io::Error::new(

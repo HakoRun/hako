@@ -11,14 +11,20 @@ use std::process::ExitCode;
 
 pub fn commit(ctx: &Ctx<'_>, message: String, author: String) -> io::Result<ExitCode> {
     let repo = ctx.state.open_container(ctx.default_container)?;
-    commit_repo(&repo, &message, &author)
+    commit_repo(&repo, &message, &author, &mut io::stdout())
 }
 
 /// Commit a repo's working tree onto its current branch. Shared by the `commit`
 /// command and the container `ctl` control node (`write …/ctl "commit <msg>"`),
-/// so both go through identical snapshot semantics. Returns exit code 1 (and a
-/// stderr note) when there is nothing to commit, mirroring the CLI behavior.
-pub fn commit_repo(repo: &hako::Repo<'_>, message: &str, author: &str) -> io::Result<ExitCode> {
+/// so both go through identical snapshot semantics. The result line is written to
+/// `out` (stdout locally, a capture buffer when served to a peer). Returns exit
+/// code 1 (and a stderr note) when there is nothing to commit.
+pub fn commit_repo(
+    repo: &hako::Repo<'_>,
+    message: &str,
+    author: &str,
+    out: &mut dyn io::Write,
+) -> io::Result<ExitCode> {
     let work = repo.working_tree()?;
     let head = repo.head_commit()?;
     // Propagate (don't swallow) a failure to load HEAD: a corrupt/missing HEAD
@@ -39,7 +45,7 @@ pub fn commit_repo(repo: &hako::Repo<'_>, message: &str, author: &str) -> io::Re
         .current_branch()?
         .ok_or_else(|| io::Error::other("detached HEAD"))?;
     repo.write_ref(&branch, commit)?;
-    println!("{} {}", &commit.to_hex()[..12], message);
+    writeln!(out, "{} {}", &commit.to_hex()[..12], message)?;
     Ok(ExitCode::SUCCESS)
 }
 
