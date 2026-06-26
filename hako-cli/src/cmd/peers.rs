@@ -158,6 +158,17 @@ pub fn lookup(ctx: &Ctx<'_>, name: &str) -> io::Result<Option<Peer>> {
     Ok(load(&registry_path(ctx))?.peers.get(name).cloned())
 }
 
+/// Find a registered peer's name by its public key (hex), if any. Used by the
+/// daemon to decide whether a connecting client is an authorized peer.
+pub fn find_by_pubkey(ctx: &Ctx<'_>, pubkey_hex: &str) -> io::Result<Option<String>> {
+    let reg = load(&registry_path(ctx))?;
+    Ok(reg
+        .peers
+        .iter()
+        .find(|(_, p)| p.pubkey == pubkey_hex)
+        .map(|(name, _)| name.clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
