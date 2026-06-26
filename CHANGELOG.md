@@ -23,6 +23,12 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches a release.
   verb (run/commit/branch/tag) to it — its output (e.g. the new instance id) and
   errors come back over the wire. `hako peer ping <name>` checks reachability +
   identity.
+- **Container replication over the cluster (`--features cluster`):** `hako peer
+  push <node> [branch]` replicates a container branch to a peer over the
+  authenticated channel — a content-addressed have/want sync that sends only the
+  objects the peer is missing (a second push transfers nothing), then points the
+  peer's ref at the commit (creating the container there if needed). With remote
+  `ctl`, this closes the loop: ship a container to a node, then dispatch `run`.
 - **Container meta-fs:** from the host (`hako`) context, each container is
   addressable as a tree under `/containers/<name>/` — `root/` for its
   filesystem, plus meta nodes: `status` (read a snapshot of branch/HEAD/dirty),
