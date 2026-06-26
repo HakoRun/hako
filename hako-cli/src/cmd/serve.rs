@@ -18,6 +18,7 @@
 use super::Ctx;
 use crate::cmd::{identity, peers};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use hako::{ChunkStore, Hash};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
@@ -32,9 +33,20 @@ const SIG_LEN: usize = 64;
 const TAG_META_READ: u8 = 1;
 /// `MetaWrite` request: payload is `[path_len: u32 BE][path][body]`.
 const TAG_META_WRITE: u8 = 2;
+/// Data plane (push). `SyncHave` payload is a list of 32-byte object hashes; the
+/// reply is the subset the server is missing. `SyncPut` payload is
+/// `[obj_len: u32][obj]...`. `SyncRef` payload is
+/// `[container_len: u32][container][branch_len: u32][branch][commit: 32]`.
+const TAG_SYNC_HAVE: u8 = 3;
+const TAG_SYNC_PUT: u8 = 4;
+const TAG_SYNC_REF: u8 = 5;
 /// Response status (first byte of a response frame).
 const RESP_OK: u8 = 0;
 const RESP_ERR: u8 = 1;
+
+const HASH_LEN: usize = 32;
+/// Flush a `SyncPut` batch before it would approach `MAX_FRAME`.
+const PUT_BATCH_LIMIT: usize = 512 * 1024;
 
 // ---------------------------------------------------------------------------
 // Framing
@@ -189,6 +201,9 @@ fn handle_peer(stream: &mut TcpStream, id: &identity::Identity, ctx: &Ctx<'_>) -
                 .map_err(|_| invalid("request path is not UTF-8"))
                 .and_then(|path| meta_read(ctx, path)),
             TAG_META_WRITE => meta_write(ctx, payload),
+            TAG_SYNC_HAVE => sync_have(ctx, payload),
+            TAG_SYNC_PUT => sync_put(ctx, payload),
+            TAG_SYNC_REF => sync_ref(ctx, payload),
             _ => Err(invalid("unknown request")),
         };
         let resp = match &result {
@@ -253,6 +268,79 @@ fn meta_write(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
     }
 }
 
+/// Data plane: report which of the offered object hashes we are missing.
+fn sync_have(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
+    let store = ctx.state.store();
+    let mut missing = Vec::new();
+    for h in decode_hashes(payload)? {
+        if !store.has(&h)? {
+            missing.extend_from_slice(&h.0);
+        }
+    }
+    Ok(missing)
+}
+
+/// Data plane: store a batch of objects (`[obj_len: u32][obj]...`).
+fn sync_put(ctx: &Ctx<'_>, mut payload: &[u8]) -> io::Result<Vec<u8>> {
+    let store = ctx.state.store();
+    while !payload.is_empty() {
+        if payload.len() < 4 {
+            return Err(invalid("malformed put batch"));
+        }
+        let len = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
+        payload = &payload[4..];
+        if payload.len() < len {
+            return Err(invalid("malformed put batch"));
+        }
+        let (obj, rest) = payload.split_at(len);
+        store.put(obj)?;
+        payload = rest;
+    }
+    Ok(Vec::new())
+}
+
+/// Data plane: point a container's branch at a (now-present) commit, creating
+/// the container if the node doesn't have it yet.
+fn sync_ref(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
+    let (container, rest) = take_lenprefixed_str(payload)?;
+    let (branch, rest) = take_lenprefixed_str(rest)?;
+    if rest.len() != HASH_LEN {
+        return Err(invalid("malformed ref request"));
+    }
+    let commit = Hash(rest.try_into().unwrap());
+    if !ctx.state.list_containers()?.iter().any(|c| c == container) {
+        ctx.state.create_container(container)?;
+    }
+    let repo = ctx.state.open_container(container)?;
+    repo.write_ref(branch, commit)?;
+    Ok(format!("updated {container}:{branch} -> {}", &hex(&commit.0)[..12]).into_bytes())
+}
+
+/// Decode a concatenation of 32-byte object hashes.
+fn decode_hashes(bytes: &[u8]) -> io::Result<Vec<Hash>> {
+    if !bytes.len().is_multiple_of(HASH_LEN) {
+        return Err(invalid("malformed hash list"));
+    }
+    Ok(bytes
+        .chunks_exact(HASH_LEN)
+        .map(|c| Hash(c.try_into().unwrap()))
+        .collect())
+}
+
+/// Split a `[len: u32][bytes]` UTF-8 field off the front of `buf`.
+fn take_lenprefixed_str(buf: &[u8]) -> io::Result<(&str, &[u8])> {
+    if buf.len() < 4 {
+        return Err(invalid("truncated request"));
+    }
+    let len = u32::from_be_bytes(buf[..4].try_into().unwrap()) as usize;
+    let rest = &buf[4..];
+    if rest.len() < len {
+        return Err(invalid("truncated request"));
+    }
+    let s = std::str::from_utf8(&rest[..len]).map_err(|_| invalid("field is not UTF-8"))?;
+    Ok((s, &rest[len..]))
+}
+
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
@@ -304,21 +392,94 @@ pub fn remote_write(ctx: &Ctx<'_>, peer_rest: &str, body: &[u8]) -> io::Result<E
     read_response(&mut stream, node)
 }
 
-/// Read a response frame; on success write its payload to stdout.
-fn read_response(stream: &mut TcpStream, node: &str) -> io::Result<ExitCode> {
+/// `hako peer push <node> [branch]` — replicate the local container's branch to
+/// a peer over the authenticated channel: offer the reachable object hashes,
+/// send only the ones it lacks, then point its ref at the commit.
+pub fn remote_push(ctx: &Ctx<'_>, node: &str, branch: &str) -> io::Result<ExitCode> {
+    let repo = ctx.state.open_container(ctx.default_container)?;
+    let commit = repo.read_ref(branch)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "local branch {branch} not found in {}",
+                ctx.default_container
+            ),
+        )
+    })?;
+    let reachable: Vec<Hash> = repo.reachable_objects(commit)?.into_iter().collect();
+    let peer = peers::lookup(ctx, node)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no peer named {node}")))?;
+    let mut stream = connect_and_handshake(ctx, &peer)?;
+
+    // Offer every reachable hash; the peer replies with the subset it lacks.
+    let mut have = Vec::with_capacity(1 + reachable.len() * HASH_LEN);
+    have.push(TAG_SYNC_HAVE);
+    for h in &reachable {
+        have.extend_from_slice(&h.0);
+    }
+    write_frame(&mut stream, &have)?;
+    let missing = decode_hashes(&read_ok_payload(&mut stream, node)?)?;
+
+    // Send the missing objects, batched to stay well under MAX_FRAME.
+    let store = ctx.state.store();
+    let mut batch = vec![TAG_SYNC_PUT];
+    let mut sent = 0usize;
+    for h in &missing {
+        let bytes = store
+            .get(h)?
+            .ok_or_else(|| invalid("a reachable object is missing locally"))?;
+        if batch.len() > 1 && batch.len() + 4 + bytes.len() > PUT_BATCH_LIMIT {
+            write_frame(&mut stream, &batch)?;
+            read_ok_payload(&mut stream, node)?;
+            batch = vec![TAG_SYNC_PUT];
+        }
+        batch.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        batch.extend_from_slice(&bytes);
+        sent += 1;
+    }
+    if batch.len() > 1 {
+        write_frame(&mut stream, &batch)?;
+        read_ok_payload(&mut stream, node)?;
+    }
+
+    // Point the peer's ref at the commit (creating the container if needed).
+    let mut req = vec![TAG_SYNC_REF];
+    let container = ctx.default_container;
+    req.extend_from_slice(&(container.len() as u32).to_be_bytes());
+    req.extend_from_slice(container.as_bytes());
+    req.extend_from_slice(&(branch.len() as u32).to_be_bytes());
+    req.extend_from_slice(branch.as_bytes());
+    req.extend_from_slice(&commit.0);
+    write_frame(&mut stream, &req)?;
+    let confirm = read_ok_payload(&mut stream, node)?;
+    println!(
+        "pushed {sent} objects to {node}; {}",
+        String::from_utf8_lossy(&confirm)
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Read a response frame; return its payload on success, an error otherwise.
+fn read_ok_payload(stream: &mut TcpStream, node: &str) -> io::Result<Vec<u8>> {
     let resp = read_frame(stream)?;
     let (&status, payload) = resp
         .split_first()
         .ok_or_else(|| invalid("empty response"))?;
     if status == RESP_OK {
-        io::stdout().write_all(payload)?;
-        Ok(ExitCode::SUCCESS)
+        Ok(payload.to_vec())
     } else {
         Err(io::Error::other(format!(
             "peer {node}: {}",
             String::from_utf8_lossy(payload)
         )))
     }
+}
+
+/// Read a response and write its payload to stdout.
+fn read_response(stream: &mut TcpStream, node: &str) -> io::Result<ExitCode> {
+    let payload = read_ok_payload(stream, node)?;
+    io::stdout().write_all(&payload)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn connect_and_handshake(ctx: &Ctx<'_>, peer: &peers::Peer) -> io::Result<TcpStream> {
@@ -406,5 +567,33 @@ mod tests {
             "client handshake must fail when the server rejects it"
         );
         assert!(server.join().unwrap().is_err(), "server rejects");
+    }
+
+    #[test]
+    fn decode_hashes_roundtrips_and_rejects_garbage() {
+        let a = Hash([1u8; 32]);
+        let b = Hash([2u8; 32]);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&a.0);
+        buf.extend_from_slice(&b.0);
+        assert_eq!(decode_hashes(&buf).unwrap(), vec![a, b]);
+        assert!(
+            decode_hashes(&[0u8; 5]).is_err(),
+            "non-multiple of 32 rejected"
+        );
+    }
+
+    #[test]
+    fn take_lenprefixed_str_parses_and_rejects_truncation() {
+        let mut buf = (3u32).to_be_bytes().to_vec();
+        buf.extend_from_slice(b"abc");
+        buf.extend_from_slice(b"tail");
+        let (s, rest) = take_lenprefixed_str(&buf).unwrap();
+        assert_eq!(s, "abc");
+        assert_eq!(rest, b"tail");
+        assert!(
+            take_lenprefixed_str(&[0, 0, 0, 9, 1, 2]).is_err(),
+            "a length past the end is rejected"
+        );
     }
 }

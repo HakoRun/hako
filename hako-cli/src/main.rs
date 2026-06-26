@@ -60,6 +60,12 @@ enum PeerCmd {
     Remove { name: String },
     /// Connect to a peer and verify it proves its registered identity
     Ping { name: String },
+    /// Push a container branch to a peer (replicate it over the network)
+    Push {
+        node: String,
+        #[arg(default_value = "main")]
+        branch: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -749,6 +755,7 @@ fn run() -> io::Result<ExitCode> {
             PeerCmd::List => cmd::peers::list(&ctx),
             PeerCmd::Remove { name } => cmd::peers::remove(&ctx, name),
             PeerCmd::Ping { name } => cmd::serve::ping(&ctx, &name),
+            PeerCmd::Push { node, branch } => cmd::serve::remote_push(&ctx, &node, &branch),
         },
         #[cfg(feature = "cluster")]
         Cmd::Serve { addr } => cmd::serve::serve(&ctx, &addr),
