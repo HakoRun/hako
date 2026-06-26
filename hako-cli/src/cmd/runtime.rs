@@ -479,7 +479,7 @@ pub fn reap(ctx: &Ctx<'_>, id: String, force: bool) -> io::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn runtime_to_io(e: hako_runtime::RuntimeError) -> io::Error {
+pub fn runtime_to_io(e: hako_runtime::RuntimeError) -> io::Error {
     let kind = match &e {
         hako_runtime::RuntimeError::UnsupportedPlatform { .. } => io::ErrorKind::Unsupported,
         hako_runtime::RuntimeError::BranchNotFound(_)

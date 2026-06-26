@@ -19,6 +19,7 @@ ctl — write a command to control this container:
   hako write /containers/<name>/ctl \"commit [message]\"   snapshot the working tree
   hako write /containers/<name>/ctl \"branch <name>\"      create a branch at HEAD
   hako write /containers/<name>/ctl \"tag <name>\"         tag HEAD
+  hako write /containers/<name>/ctl \"run [command]\"      spawn a detached instance (Linux)
 ";
 
 pub fn write(
@@ -125,11 +126,34 @@ fn dispatch_ctl(ctx: &Ctx<'_>, name: &str, body: &[u8]) -> io::Result<ExitCode> 
             println!("tagged {} at {}", tag_name, &target.to_hex()[..12]);
             Ok(ExitCode::SUCCESS)
         }
+        "run" => {
+            // The runtime counterpart of the version-control verbs: dispatch a
+            // detached workload (the container's current branch). Returns the
+            // instance id, like `hako run -d`. Linux-only — on Windows/macOS this
+            // surfaces the runtime's UnsupportedPlatform until the write-borne
+            // runtime-verb bridge is wired (see docs/distributed.md).
+            let repo = ctx.state.open_container(name)?;
+            let branch = repo.current_branch()?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "container has a detached HEAD; check out a branch before `run`",
+                )
+            })?;
+            let command = if arg.is_empty() {
+                None
+            } else {
+                Some(arg.split_whitespace().map(str::to_string).collect())
+            };
+            let id = hako_runtime::transform::run_container_detached(&repo, &branch, command, &[])
+                .map_err(super::runtime::runtime_to_io)?;
+            println!("{}", id);
+            Ok(ExitCode::SUCCESS)
+        }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
                 "ctl: unsupported command {other:?}; \
-                 supported: commit [message], branch <name>, tag <name>"
+                 supported: commit [message], branch <name>, tag <name>, run [command]"
             ),
         )),
     }

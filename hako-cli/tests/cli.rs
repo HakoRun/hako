@@ -534,3 +534,25 @@ fn proc_meta_exposes_the_container_tree_and_rejects_host_processes() {
 
     // `host` and `unshared` are killed + reaped on drop (including on panic).
 }
+
+// `ctl "run"` dispatches a detached workload — a runtime op. Off Linux the
+// runtime can't spawn, so it surfaces the platform error immediately (no real
+// container is started), which lets us assert *cross-platform* that the verb is
+// wired: a recognized verb, not the unknown-command parse error. The actual
+// spawn is exercised on Linux by the runtime path.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn ctl_run_is_a_recognized_verb() {
+    let d = workspace();
+    let o = hako(d.path(), &["write", "/containers/hako/ctl", "run echo hi"]);
+    assert!(
+        !o.status.success(),
+        "run can't succeed without the Linux runtime"
+    );
+    assert!(
+        !err(&o).contains("unsupported command") && !err(&o).contains("panicked"),
+        "`run` should be a recognized ctl verb (got the runtime's platform error, \
+         not the unknown-verb error): {}",
+        err(&o)
+    );
+}

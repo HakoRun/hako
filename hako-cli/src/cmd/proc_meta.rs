@@ -62,7 +62,7 @@ fn container_ns_inodes(ctx: &Ctx<'_>, name: &str) -> io::Result<std::collections
     let own_ns = pid_ns_inode(std::process::id());
     let mut set = std::collections::HashSet::new();
     for inst in instances {
-        if inst.config.branch == name && inst.is_running() {
+        if inst.config.container == name && inst.is_running() {
             if let Some((nspid, _)) =
                 hako_runtime::instances::read_nspid_with_starttime(&runtime_root, &inst.id)
             {

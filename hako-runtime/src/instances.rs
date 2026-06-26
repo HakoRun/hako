@@ -33,6 +33,13 @@ pub const RUNTIME_DIR: &str = "runtime";
 /// Configuration of a spawned instance, written once at spawn time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceConfig {
+    /// The workspace container this instance belongs to. Distinct from `branch`
+    /// (the ref that was run): an instance of container `app` running branch
+    /// `main` has `container = "app"`, `branch = "main"`. The `proc/` meta
+    /// surface groups instances by this. `#[serde(default)]` keeps pre-field
+    /// instance dirs readable (they decode to an empty container).
+    #[serde(default)]
+    pub container: String,
     pub branch: String,
     pub command: Vec<String>,
     pub started_unix: u64,
@@ -130,12 +137,14 @@ pub fn generate_id() -> String {
 pub fn create(
     workdir: &Path,
     id: &str,
+    container: &str,
     branch: &str,
     command: &[String],
 ) -> Result<PathBuf, RuntimeError> {
     let dir = instance_dir(workdir, id);
     fs::create_dir_all(&dir)?;
     let config = InstanceConfig {
+        container: container.to_string(),
         branch: branch.to_string(),
         command: command.to_vec(),
         started_unix: SystemTime::now()
@@ -422,9 +431,10 @@ mod tests {
     fn create_and_get_roundtrip() {
         let wd = workdir();
         let id = "abc123";
-        create(wd.path(), id, "alpine", &["sh".into()]).unwrap();
+        create(wd.path(), id, "app", "alpine", &["sh".into()]).unwrap();
         let inst = get(wd.path(), id).unwrap();
         assert_eq!(inst.id, id);
+        assert_eq!(inst.config.container, "app");
         assert_eq!(inst.config.branch, "alpine");
         assert_eq!(inst.config.command, vec!["sh".to_string()]);
         assert!(inst.config.started_unix > 0);
@@ -434,7 +444,7 @@ mod tests {
     fn pid_and_exit_code_persist() {
         let wd = workdir();
         let id = "p1";
-        create(wd.path(), id, "main", &[]).unwrap();
+        create(wd.path(), id, "c", "main", &[]).unwrap();
         write_pid(wd.path(), id, 12345).unwrap();
         write_exit_code(wd.path(), id, 42).unwrap();
         let inst = get(wd.path(), id).unwrap();
@@ -449,7 +459,7 @@ mod tests {
         // platforms start_time is None — both the writer and reader agree.
         let wd = workdir();
         let id = "st1";
-        create(wd.path(), id, "main", &[]).unwrap();
+        create(wd.path(), id, "c", "main", &[]).unwrap();
         let pid = std::process::id();
         write_pid(wd.path(), id, pid).unwrap();
         let (read_pid, read_st) = read_pid_with_starttime(wd.path(), id).unwrap();
@@ -467,7 +477,7 @@ mod tests {
         // Make sure we can still read those.
         let wd = workdir();
         let id = "legacy";
-        create(wd.path(), id, "main", &[]).unwrap();
+        create(wd.path(), id, "c", "main", &[]).unwrap();
         write_atomic(&instance_dir(wd.path(), id).join("pid"), b"99999").unwrap();
         let (pid, st) = read_pid_with_starttime(wd.path(), id).unwrap();
         assert_eq!(pid, 99999);
@@ -479,9 +489,10 @@ mod tests {
         let wd = workdir();
         // Three instances with different timestamps via the on-disk config.
         for (id, ts) in [("a", 1000u64), ("b", 2000), ("c", 1500)] {
-            create(wd.path(), id, "branch", &[]).unwrap();
+            create(wd.path(), id, "c", "branch", &[]).unwrap();
             // Overwrite started_unix manually to control sort order.
             let cfg = InstanceConfig {
+                container: "c".into(),
                 branch: "branch".into(),
                 command: vec![],
                 started_unix: ts,
@@ -502,7 +513,7 @@ mod tests {
     fn remove_refuses_running_unless_forced() {
         let wd = workdir();
         let id = "r1";
-        create(wd.path(), id, "main", &[]).unwrap();
+        create(wd.path(), id, "c", "main", &[]).unwrap();
         // Use our own pid — definitely alive.
         write_pid(wd.path(), id, std::process::id()).unwrap();
 
@@ -518,7 +529,7 @@ mod tests {
     fn remove_succeeds_when_no_pid_recorded() {
         let wd = workdir();
         let id = "r2";
-        create(wd.path(), id, "main", &[]).unwrap();
+        create(wd.path(), id, "c", "main", &[]).unwrap();
         // No pid written → considered not running everywhere.
         remove(wd.path(), id, false).unwrap();
         assert!(!instance_dir(wd.path(), id).exists());
