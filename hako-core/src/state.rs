@@ -18,7 +18,10 @@ pub struct Session {
 impl Default for Session {
     fn default() -> Self {
         Self {
-            container: "main".into(),
+            // The seeded host container (see `State::init`). Matches the CLI's
+            // `default_container` fallback, so a fresh workspace's session agrees
+            // with the resolved active container instead of saying "main".
+            container: "hako".into(),
             cwd: "/".into(),
         }
     }
@@ -234,7 +237,7 @@ fn parse_session(text: &str) -> io::Result<Session> {
         }
     }
     if s.container.is_empty() {
-        s.container = "main".into();
+        s.container = "hako".into();
     }
     if s.cwd.is_empty() {
         s.cwd = "/".into();
@@ -405,7 +408,7 @@ mod tests {
         let (_d, s) = fresh();
         let sess = s.read_session().unwrap();
         assert_eq!(sess, Session::default());
-        assert_eq!(sess.container, "main");
+        assert_eq!(sess.container, "hako");
         assert_eq!(sess.cwd, "/");
     }
 

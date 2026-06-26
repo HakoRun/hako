@@ -186,3 +186,351 @@ fn runs_outside_a_workspace_fail_cleanly() {
         err(&o)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Container meta surface + the `root/` boundary (Option B layout): the rootfs
+// lives at /containers/<name>/root/..., and meta nodes (status, …) sit beside
+// it at /containers/<name>/. The seeded default container is named `hako`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cat_container_dir_shows_status_readout() {
+    // `cat /containers/<name>` (the container directory) reads a synthetic
+    // status readout instead of erroring.
+    let d = workspace();
+    let readout = ok(d.path(), &["cat", "/containers/hako"]);
+    assert!(
+        readout.contains("container: hako"),
+        "status readout should name the container: {readout}"
+    );
+    assert!(
+        readout.contains("branch:") && readout.contains("working:"),
+        "status readout should report branch and working state: {readout}"
+    );
+    // The status node is also addressable by its listed name.
+    assert_eq!(
+        ok(d.path(), &["cat", "/containers/hako/status"]),
+        readout,
+        "cat .../status should match cat of the container dir"
+    );
+}
+
+#[test]
+fn ls_container_dir_lists_root_and_meta() {
+    // Listing the container directory surfaces the `root/` filesystem boundary
+    // and the synthetic `status` meta entry — not the rootfs contents directly.
+    let d = workspace();
+    let listing = ok(d.path(), &["ls", "/containers/hako"]);
+    assert!(
+        listing.contains("root/"),
+        "container dir ls should show the root/ filesystem boundary: {listing}"
+    );
+    assert!(
+        listing.contains("status"),
+        "container dir ls should surface the synthetic status entry: {listing}"
+    );
+    // The whole META_NODES registry is listed: the ctl control node and the
+    // runtime-backed proc/ directory, alongside status.
+    assert!(
+        listing.contains("ctl"),
+        "container dir ls should surface the ctl control node: {listing}"
+    );
+    assert!(
+        listing.contains("proc/"),
+        "container dir ls should surface the proc/ meta directory: {listing}"
+    );
+    assert!(
+        !listing.contains("bin"),
+        "container dir ls should NOT list rootfs entries directly: {listing}"
+    );
+}
+
+#[test]
+fn ls_container_root_shows_rootfs() {
+    // The rootfs itself is listed under the `root/` boundary.
+    let d = workspace();
+    let listing = ok(d.path(), &["ls", "/containers/hako/root"]);
+    assert!(
+        listing.contains("bin"),
+        "ls of /containers/<name>/root should show the seeded rootfs: {listing}"
+    );
+}
+
+#[test]
+fn container_status_reflects_uncommitted_changes() {
+    // Writing into a container without committing flips the readout to
+    // "modified"; this exercises the working-tree-vs-HEAD comparison.
+    let d = workspace();
+    ok(d.path(), &["write", "/etc/motd", "hi"]);
+    let readout = ok(d.path(), &["cat", "/containers/hako"]);
+    assert!(
+        readout.contains("working:   modified"),
+        "status should report a dirty working tree after an uncommitted write: {readout}"
+    );
+}
+
+#[test]
+fn cat_container_fs_requires_root_boundary() {
+    // Under Option B, reading the filesystem cross-container goes through
+    // `root/`; the pre-migration form is rejected, and the file is readable via
+    // the `root/` path.
+    let d = workspace();
+    ok(d.path(), &["write", "/greeting.txt", "hello"]);
+    assert_eq!(
+        ok(d.path(), &["cat", "/containers/hako/root/greeting.txt"]),
+        "hello"
+    );
+    let o = hako(d.path(), &["cat", "/containers/hako/greeting.txt"]);
+    assert!(
+        !o.status.success(),
+        "addressing the fs without root/ should fail under Option B"
+    );
+    assert!(
+        !err(&o).contains("panicked"),
+        "rejection should be a clean error: {}",
+        err(&o)
+    );
+}
+
+#[test]
+fn ctl_node_is_listed_and_readable() {
+    // The control node appears in the container directory listing and reads
+    // back its usage.
+    let d = workspace();
+    let listing = ok(d.path(), &["ls", "/containers/hako"]);
+    assert!(
+        listing.contains("ctl"),
+        "container dir ls should surface the ctl node: {listing}"
+    );
+    let usage = ok(d.path(), &["cat", "/containers/hako/ctl"]);
+    assert!(
+        usage.contains("commit"),
+        "ctl usage should mention the commit verb: {usage}"
+    );
+}
+
+#[test]
+fn ctl_commit_snapshots_the_working_tree() {
+    // Writing `commit <msg>` to the ctl node snapshots the container, exactly
+    // like `hako commit` — the Plan 9 control-via-a-file model.
+    let d = workspace();
+    ok(d.path(), &["write", "/etc/motd", "hi"]);
+    // Before: dirty.
+    assert!(ok(d.path(), &["cat", "/containers/hako"]).contains("working:   modified"));
+    // Control it by writing to ctl.
+    ok(
+        d.path(),
+        &["write", "/containers/hako/ctl", "commit set motd via ctl"],
+    );
+    // After: clean, and the message shows up in the log.
+    assert!(ok(d.path(), &["cat", "/containers/hako"]).contains("working:   clean"));
+    assert!(ok(d.path(), &["log"]).contains("set motd via ctl"));
+}
+
+#[test]
+fn ctl_rejects_unknown_verb_cleanly() {
+    let d = workspace();
+    let o = hako(
+        d.path(),
+        &["write", "/containers/hako/ctl", "frobnicate now"],
+    );
+    assert!(!o.status.success(), "unknown ctl verb should fail");
+    assert!(
+        err(&o).contains("unsupported") && !err(&o).contains("panicked"),
+        "unknown verb should be a clean, descriptive error: {}",
+        err(&o)
+    );
+}
+
+#[test]
+fn writing_a_readonly_meta_node_is_rejected() {
+    // `status` is read-only; only `ctl` accepts writes among the meta nodes.
+    let d = workspace();
+    let o = hako(d.path(), &["write", "/containers/hako/status", "x"]);
+    assert!(!o.status.success(), "writing status should fail");
+    assert!(
+        !err(&o).contains("panicked"),
+        "rejection should be clean: {}",
+        err(&o)
+    );
+}
+
+#[test]
+fn ctl_branch_and_tag_create_refs() {
+    // The control plane also covers the cross-platform VC verbs: `branch` and
+    // `tag` each create a ref at HEAD, driven entirely by writing to ctl.
+    let d = workspace();
+    ok(d.path(), &["write", "/a.txt", "one"]);
+    ok(d.path(), &["write", "/containers/hako/ctl", "commit first"]);
+
+    ok(
+        d.path(),
+        &["write", "/containers/hako/ctl", "branch feature-x"],
+    );
+    assert!(
+        ok(d.path(), &["branch"]).contains("feature-x"),
+        "ctl `branch` should create a listed branch"
+    );
+
+    ok(d.path(), &["write", "/containers/hako/ctl", "tag v1"]);
+    // The tag resolves as a ref, so `<tag>:<path>` reads its tree.
+    assert_eq!(ok(d.path(), &["cat", "v1:/a.txt"]).trim(), "one");
+}
+
+#[test]
+fn ctl_verb_missing_argument_errors_cleanly() {
+    // `branch`/`tag` require a name; omitting it is a clean, descriptive error
+    // (the arg check fires before any repo work).
+    let d = workspace();
+    let o = hako(d.path(), &["write", "/containers/hako/ctl", "branch"]);
+    assert!(!o.status.success(), "branch with no name should fail");
+    assert!(
+        err(&o).contains("needs an argument") && !err(&o).contains("panicked"),
+        "missing-arg error should be clean and descriptive: {}",
+        err(&o)
+    );
+}
+
+// The proc/ reader runs against the host kernel's /proc, so it needs a real PID
+// namespace — the cross-platform suite can't reach it. This Linux-only test
+// codifies the security boundary: a container's process *tree* is exposed, while
+// a host process (a different PID namespace) is rejected. Skips cleanly where
+// unprivileged user namespaces aren't available (e.g. a hardened CI runner).
+#[cfg(target_os = "linux")]
+#[test]
+fn proc_meta_exposes_the_container_tree_and_rejects_host_processes() {
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    // Kill (and reap) spawned helpers even if an assertion panics mid-test.
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn spawn_quiet(cmd: &mut Command) -> std::io::Result<Child> {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    }
+
+    let d = workspace();
+
+    // A control process in the HOST namespace — must never be exposed.
+    let host = KillOnDrop(spawn_quiet(Command::new("sleep").arg("60")).expect("spawn host sleep"));
+    let host_pid = host.0.id();
+
+    // A real container PID namespace: an unshared PID-1 (bash) with two children.
+    let unshared = match spawn_quiet(Command::new("unshare").args([
+        "-Upf",
+        "--mount-proc",
+        "--kill-child",
+        "bash",
+        "-c",
+        "sleep 60 & sleep 61 & wait",
+    ])) {
+        Ok(c) => KillOnDrop(c),
+        Err(_) => {
+            eprintln!("SKIP: `unshare` unavailable");
+            return;
+        }
+    };
+
+    // Poll for the namespaced PID-1 (unshare's forked child) rather than racing a
+    // fixed sleep; skip cleanly if no namespace appears (userns disabled).
+    let read_nspid = || -> Option<u32> {
+        std::fs::read_to_string(format!("/proc/{u}/task/{u}/children", u = unshared.0.id()))
+            .ok()?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let nspid = loop {
+        if let Some(p) = read_nspid() {
+            break p;
+        }
+        if Instant::now() >= deadline {
+            eprintln!("SKIP: could not create a PID namespace (unprivileged userns disabled?)");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // Fabricate a running instance of the default `hako` container whose PID-1
+    // is the unshared process.
+    let rd = d.path().join(".hako/runtime/test-proc");
+    std::fs::create_dir_all(&rd).unwrap();
+    std::fs::write(
+        rd.join("config.json"),
+        r#"{"branch":"hako","command":["bash"],"started_unix":1}"#,
+    )
+    .unwrap();
+    std::fs::write(rd.join("pid"), nspid.to_string()).unwrap();
+    std::fs::write(rd.join("nspid"), nspid.to_string()).unwrap();
+
+    // Poll `ls` until the children settle into the full tree (PID-1 + 2 sleeps)
+    // rather than asserting against a fixed delay.
+    let count = |s: &str| s.lines().filter(|l| !l.trim().is_empty()).count();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let listing = loop {
+        let l = ok(d.path(), &["ls", "/containers/hako/proc"]);
+        if count(&l) >= 3 || Instant::now() >= deadline {
+            break l;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    // ls enumerates the container's *tree* (PID-1 + children), not the host.
+    let listed: Vec<&str> = listing.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(
+        listed
+            .iter()
+            .any(|l| l.trim_end_matches('/') == nspid.to_string()),
+        "the container PID-1 should be listed: {listing}"
+    );
+    assert!(
+        listed.len() >= 2,
+        "the process *tree* (PID-1 + children) should be listed, got: {listing}"
+    );
+    assert!(
+        !listed
+            .iter()
+            .any(|l| l.trim_end_matches('/') == host_pid.to_string()),
+        "a host-namespace process must never appear: {listing}"
+    );
+
+    // cat reads a container process.
+    assert!(
+        !ok(
+            d.path(),
+            &["cat", &format!("/containers/hako/proc/{nspid}/comm")]
+        )
+        .is_empty(),
+        "comm of a container process should read"
+    );
+
+    // SECURITY: the host process must be rejected (different PID namespace).
+    let o = hako(
+        d.path(),
+        &["cat", &format!("/containers/hako/proc/{host_pid}/comm")],
+    );
+    assert!(
+        !o.status.success() && !err(&o).contains("panicked"),
+        "host process must not be readable through proc/: {}",
+        err(&o)
+    );
+
+    // mem is never exposed.
+    let o = hako(
+        d.path(),
+        &["cat", &format!("/containers/hako/proc/{nspid}/mem")],
+    );
+    assert!(!o.status.success(), "proc/<pid>/mem must not be exposed");
+
+    // `host` and `unshared` are killed + reaped on drop (including on panic).
+}

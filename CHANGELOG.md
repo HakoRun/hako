@@ -4,6 +4,28 @@ All notable changes to hako are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims
 to follow [Semantic Versioning](https://semver.org/) once it reaches a release.
 
+## [Unreleased]
+
+### Added
+- **Container meta-fs:** from the host (`hako`) context, each container is
+  addressable as a tree under `/containers/<name>/` — `root/` for its
+  filesystem, plus meta nodes: `status` (read a snapshot of branch/HEAD/dirty),
+  `ctl` (write a verb — `commit`/`branch`/`tag` — the Plan 9 control-file model),
+  and `proc/` for the container's live process tree. `proc/` reads the host
+  kernel's `/proc` scoped to the container's PID namespace (host processes are
+  never exposed; `mem` is not exposed); on Windows/macOS it bridges into
+  WSL2/Lima like `run`/`exec`.
+
+### Changed
+- The `/containers`, `/workspace`, and `/peers` prefixes are recognized only
+  from the **host** (`hako`) container; from a guest image they are ordinary
+  paths in the guest's own filesystem, so a guest is never shadowed by hako's
+  namespace.
+- A fresh workspace's session now defaults to the **`hako`** container instead of
+  `"main"`, matching the seeded default container. This only changes behavior for
+  a workspace with no `SESSION` file that had a container explicitly named `main`
+  (it would now default to `hako`).
+
 ## [0.1.1] — 2026-06-10
 
 ### Added

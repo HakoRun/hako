@@ -391,6 +391,19 @@ enum Cmd {
     External(Vec<String>),
 }
 
+/// Whether a `cat`/`ls`/`tree` path targets a container's `proc/` meta surface
+/// (`/containers/<name>/proc[/...]`), which reads live process state and so must
+/// run on the Linux runtime. Only the absolute form is detected here — the
+/// bridge decision runs before the session cwd is loaded, so a relative
+/// `proc/...` while cd'd into a container isn't auto-bridged (a v1 limitation).
+fn is_container_proc_path(path: &str) -> bool {
+    matches!(
+        hako::RouteTarget::parse(path),
+        hako::RouteTarget::Container { path: sub, .. }
+            if crate::cmd::proc_meta::proc_subpath(&sub).is_some()
+    )
+}
+
 impl Cmd {
     /// Whether this command requires the Linux runtime (namespaces, FUSE,
     /// pivot_root). On non-Linux hosts these are auto-forwarded into the
@@ -402,6 +415,14 @@ impl Cmd {
             // without touching the runtime — no reason to pay the WSL/Lima
             // round-trip just to print 4 lines.
             Cmd::Apply { dry_run, .. } => !dry_run,
+            // Reading a container's live processes (`/containers/<name>/proc/...`)
+            // reads /proc on the kernel the container runs on, so it must bridge
+            // like run/exec to work from Windows/macOS via WSL2/Lima.
+            Cmd::Cat { path } => is_container_proc_path(path),
+            Cmd::Ls { path: Some(path) } => is_container_proc_path(path),
+            Cmd::Tree {
+                path: Some(path), ..
+            } => is_container_proc_path(path),
             _ => false,
         }
     }
@@ -939,4 +960,47 @@ fn init(workdir: &std::path::Path, path: Option<PathBuf>) -> io::Result<ExitCode
         println!("run `hako apply` to pull the image and execute setup steps");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proc_paths_need_the_linux_runtime() {
+        // A container `proc/` read is runtime-backed → must bridge to Linux.
+        assert!(is_container_proc_path("/containers/alpine/proc"));
+        assert!(is_container_proc_path("/containers/alpine/proc/1"));
+        assert!(is_container_proc_path("/containers/alpine/proc/1/status"));
+    }
+
+    #[test]
+    fn non_proc_paths_stay_native() {
+        // The filesystem and the store-backed meta nodes are not bridged.
+        assert!(!is_container_proc_path("/containers/alpine/root/etc/hosts"));
+        assert!(!is_container_proc_path("/containers/alpine/status"));
+        assert!(!is_container_proc_path("/containers/alpine/ctl"));
+        assert!(!is_container_proc_path("/containers/alpine")); // the container dir
+        assert!(!is_container_proc_path("/containers/alpine/procfs")); // not the proc node
+        assert!(!is_container_proc_path("/etc/hosts")); // active-container fs path
+        assert!(!is_container_proc_path("/containers")); // the container list
+    }
+
+    #[test]
+    fn cmd_classification_routes_proc_reads() {
+        // Cat/Ls/Tree pick up the proc-path classification; nothing else does.
+        assert!(Cmd::Cat {
+            path: "/containers/alpine/proc/1/status".into()
+        }
+        .needs_linux_runtime());
+        assert!(!Cmd::Cat {
+            path: "/containers/alpine/status".into()
+        }
+        .needs_linux_runtime());
+        assert!(Cmd::Ls {
+            path: Some("/containers/alpine/proc".into())
+        }
+        .needs_linux_runtime());
+        assert!(!Cmd::Ls { path: None }.needs_linux_runtime());
+    }
 }

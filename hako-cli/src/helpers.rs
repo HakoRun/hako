@@ -62,18 +62,38 @@ pub fn collapse_dotdot(path: &str) -> String {
 /// Returns (new_container, new_cwd). Handles `/containers/<name>/...` for
 /// switching containers and resolves `..` / `.` segments.
 pub fn resolve_cd(session: &Session, raw: &str) -> io::Result<(String, String)> {
-    if raw == "/containers" || raw == "/containers/" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "/containers is virtual; cd into a specific container",
-        ));
-    }
-    if let Some(rest) = raw.strip_prefix("/containers/") {
-        let (name, sub) = match rest.split_once('/') {
-            Some((n, p)) => (n.to_string(), format!("/{}", p)),
-            None => (rest.to_string(), "/".to_string()),
-        };
-        return Ok((name, collapse_dotdot(&sub)));
+    // The /containers namespace is only navigable from the host context; from a
+    // guest, `/containers/...` is just a path in the guest's own filesystem.
+    if is_host_context(&session.container) {
+        if raw == "/containers" || raw == "/containers/" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "/containers is virtual; cd into a specific container",
+            ));
+        }
+        if let Some(rest) = raw.strip_prefix("/containers/") {
+            let (name, sub) = match rest.split_once('/') {
+                Some((n, p)) => (n.to_string(), p.to_string()),
+                None => (rest.to_string(), String::new()),
+            };
+            // The session cwd is a filesystem path. Entering a container lands at
+            // its filesystem root; deeper fs paths must go through `root/`. A meta
+            // node (e.g. `status`) isn't a directory you can cd into.
+            let cwd = if sub.is_empty() || sub == ROOT_BOUNDARY {
+                "/".to_string()
+            } else if let Some(fs) = sub.strip_prefix("root/") {
+                format!("/{}", fs)
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "cannot cd into /containers/{name}/{sub}; \
+                         the container filesystem is under /containers/{name}/root/"
+                    ),
+                ));
+            };
+            return Ok((name, collapse_dotdot(&cwd)));
+        }
     }
     let absolute = apply_cwd(session, raw);
     Ok((session.container.clone(), collapse_dotdot(&absolute)))
@@ -161,11 +181,40 @@ pub fn is_hex_prefix(s: &str) -> bool {
 // Multi-target dispatch (RouteTarget-aware)
 // ============================================================================
 
+/// The host container. The workspace-level prefixes (`/containers`,
+/// `/workspace`, `/peers`) are recognized *only* when this is the active
+/// container. From any other (guest) container they are ordinary paths in the
+/// guest's own filesystem — so a guest image is never shadowed by hako's
+/// namespace, and the workspace is reachable only from the host.
+///
+/// Must match the default container seeded by `hako-core`'s `State::init`.
+pub const HOST_CONTAINER: &str = "hako";
+
+/// True when the active container is the host, so workspace prefixes resolve.
+pub fn is_host_context(active_container: &str) -> bool {
+    active_container == HOST_CONTAINER
+}
+
+/// Parse a path into a route, honoring host-vs-guest context. The workspace
+/// prefixes resolve only from the host container; from a guest every path is
+/// guest-local (`Local`), so `/containers/...` reads the guest's own filesystem
+/// rather than the workspace.
+pub fn route(path: &str, active_container: &str) -> RouteTarget {
+    let target = RouteTarget::parse(path);
+    if is_host_context(active_container) {
+        return target;
+    }
+    match target {
+        RouteTarget::Local(_) => target,
+        _ => RouteTarget::Local(path.trim_start_matches('/').to_string()),
+    }
+}
+
 pub fn with_target<F>(state: &State, default_container: &str, path: &str, f: F) -> io::Result<()>
 where
     F: FnOnce(&Repo<'_>, &str) -> io::Result<()>,
 {
-    let target = RouteTarget::parse(path);
+    let target = route(path, default_container);
     with_target_resolved(state, default_container, target, f)
 }
 
@@ -196,12 +245,25 @@ where
             f(&repo, &p)
         }
         RouteTarget::Container { name, path } => {
+            // The container filesystem lives under `root/`. A bare container
+            // path or a meta name (e.g. `status`) is not a filesystem path and
+            // must be handled by the meta surface, not raw fs ops.
+            let fs = container_fs_path(&path).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "/containers/{name}/{path} is not a filesystem path; \
+                         the container filesystem is under /containers/{name}/root/"
+                    ),
+                )
+            })?;
             let repo = state.open_container(&name)?;
-            f(&repo, &path)
+            f(&repo, fs)
         }
         RouteTarget::ContainersList => Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "/containers is a virtual list, not writable",
+            io::ErrorKind::InvalidInput,
+            "/containers is the virtual container list — address a container as \
+             /containers/<name>/root/<path> (or `hako ls /containers`)",
         )),
         RouteTarget::Workspace(_) => Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -220,12 +282,109 @@ pub fn container_and_path<'a>(
 ) -> io::Result<(&'a str, &'a str)> {
     match target {
         RouteTarget::Local(p) => Ok((default_container, p.as_str())),
-        RouteTarget::Container { name, path } => Ok((name.as_str(), path.as_str())),
+        RouteTarget::Container { name, path } => {
+            // Filesystem only — require the `root/` boundary (see container_fs_path).
+            let fs = container_fs_path(path).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "/containers/{name}/{path} is not a filesystem path; \
+                         the container filesystem is under /containers/{name}/root/"
+                    ),
+                )
+            })?;
+            Ok((name.as_str(), fs))
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "this path is not a container path",
         )),
     }
+}
+
+// ============================================================================
+// Container meta surface (the /containers/<name> everything-is-a-file view)
+// ============================================================================
+
+/// The boundary segment under which a container's filesystem (rootfs) lives.
+/// Everything at `/containers/<name>/root/...` is the container's filesystem;
+/// everything else under `/containers/<name>/` is the synthetic meta surface.
+/// Sandboxing the rootfs under `root/` makes meta nodes collision-proof: a
+/// container that ships its own `/proc` lives at `…/root/proc`, never clashing
+/// with a future meta `…/proc`.
+pub const ROOT_BOUNDARY: &str = "root";
+
+/// The reserved leaf name exposed by the container meta surface alongside a
+/// container's filesystem. Sits beside `root/` at `/containers/<name>/status`.
+pub const META_STATUS: &str = "status";
+
+/// The control node: writing a verb to `/containers/<name>/ctl` runs a control
+/// action (e.g. `commit <msg>`) on the container — the Plan 9 ctl-file model.
+/// Reading it returns a usage summary.
+pub const META_CTL: &str = "ctl";
+
+/// How `ls` renders a meta node beside `root/`.
+pub enum MetaNodeKind {
+    /// A readable file (`status`, `ctl`).
+    Leaf,
+    /// A directory (`proc/`).
+    Dir,
+}
+
+/// The reserved meta nodes that sit beside `root/` in a container directory, and
+/// how `ls` lists each: store-backed leaves (`status`, `ctl`) plus the
+/// runtime-backed `proc/` directory. Keeping the whole set in one place is what
+/// stops `ls` from drifting out of sync with the `cat`/`write` interceptors as
+/// nodes are added.
+pub const META_NODES: &[(&str, MetaNodeKind)] = &[
+    (META_STATUS, MetaNodeKind::Leaf),
+    (META_CTL, MetaNodeKind::Leaf),
+    (crate::cmd::proc_meta::META_PROC, MetaNodeKind::Dir),
+];
+
+/// Interpret the sub-path after `/containers/<name>` (the raw `path` from
+/// `RouteTarget::Container`, with no leading slash) under the `root/` layout.
+///
+/// Returns `Some(fs_path)` when it addresses the container **filesystem** (the
+/// sub-path is `root` or `root/...`), with the `root` boundary stripped off.
+/// Returns `None` when it addresses the container directory itself (empty) or a
+/// meta node (e.g. `status`) — i.e. anything that is *not* a filesystem path.
+pub fn container_fs_path(sub: &str) -> Option<&str> {
+    if sub == ROOT_BOUNDARY {
+        return Some("");
+    }
+    sub.strip_prefix("root/")
+}
+
+/// Render a one-container status summary as bytes, for `cat /containers/<name>`.
+/// Pure `Repo` — no runtime/instance data — so it stays in hako-core's
+/// read-only, dependency-light world and needs no workspace lock.
+///
+/// Reports the active branch, the short HEAD commit (or "(no commits yet)"),
+/// and whether the working tree differs from HEAD.
+pub fn render_container_status(repo: &Repo<'_>, name: &str) -> io::Result<Vec<u8>> {
+    use std::fmt::Write as _;
+    let branch = repo
+        .current_branch()?
+        .unwrap_or_else(|| "(detached)".into());
+    let head = repo.head_commit()?;
+    let head_tree = repo.head_tree()?;
+    let work_tree = repo.working_tree()?;
+    let dirty = head_tree != work_tree;
+
+    let mut s = String::new();
+    let _ = writeln!(s, "container: {}", name);
+    let _ = writeln!(s, "branch:    {}", branch);
+    match head {
+        Some(h) => {
+            let _ = writeln!(s, "head:      {}", &h.to_hex()[..12]);
+        }
+        None => {
+            let _ = writeln!(s, "head:      (no commits yet)");
+        }
+    }
+    let _ = writeln!(s, "working:   {}", if dirty { "modified" } else { "clean" });
+    Ok(s.into_bytes())
 }
 
 // ============================================================================
@@ -583,10 +742,16 @@ mod tests {
 
     #[test]
     fn resolve_cd_switches_container() {
-        let s = sess("main", "/x");
+        let s = sess("hako", "/x"); // host context — workspace prefixes resolve
+                                    // Filesystem paths are addressed under the `root/` boundary.
         assert_eq!(
-            resolve_cd(&s, "/containers/alpha/sub").unwrap(),
+            resolve_cd(&s, "/containers/alpha/root/sub").unwrap(),
             ("alpha".into(), "/sub".into())
+        );
+        // `root` itself, and a bare container, both land at the filesystem root.
+        assert_eq!(
+            resolve_cd(&s, "/containers/alpha/root").unwrap(),
+            ("alpha".into(), "/".into())
         );
         assert_eq!(
             resolve_cd(&s, "/containers/beta").unwrap(),
@@ -599,9 +764,84 @@ mod tests {
     }
 
     #[test]
+    fn resolve_cd_rejects_non_root_container_path() {
+        // Under the `root/` layout, addressing the filesystem without `root/`
+        // (the pre-migration form) is no longer a valid cd target.
+        let s = sess("hako", "/x");
+        assert!(resolve_cd(&s, "/containers/alpha/etc").is_err());
+        // A meta node is not a directory you can cd into.
+        assert!(resolve_cd(&s, "/containers/alpha/status").is_err());
+    }
+
+    #[test]
     fn resolve_cd_rejects_containers_root() {
-        let s = sess("main", "/");
+        let s = sess("hako", "/");
         assert!(resolve_cd(&s, "/containers").is_err());
         assert!(resolve_cd(&s, "/containers/").is_err());
+    }
+
+    #[test]
+    fn resolve_cd_from_a_guest_treats_containers_as_local() {
+        // From a guest container, /containers is not the workspace namespace —
+        // it's an ordinary path in the guest's own filesystem, so cd neither
+        // switches containers nor errors.
+        let s = sess("ubuntu", "/");
+        assert_eq!(
+            resolve_cd(&s, "/containers/alpha/root").unwrap(),
+            ("ubuntu".into(), "/containers/alpha/root".into())
+        );
+        assert_eq!(
+            resolve_cd(&s, "/containers").unwrap(),
+            ("ubuntu".into(), "/containers".into())
+        );
+    }
+
+    #[test]
+    fn container_fs_path_boundary() {
+        assert_eq!(container_fs_path("root"), Some(""));
+        assert_eq!(container_fs_path("root/etc/hosts"), Some("etc/hosts"));
+        assert_eq!(container_fs_path(""), None); // container dir itself
+        assert_eq!(container_fs_path("status"), None); // meta node
+        assert_eq!(container_fs_path("rootfs"), None); // not the `root` segment
+    }
+
+    #[test]
+    fn route_resolves_workspace_prefixes_only_from_the_host() {
+        // From the host (hako), the workspace prefixes resolve.
+        assert_eq!(
+            route("/containers", HOST_CONTAINER),
+            RouteTarget::ContainersList
+        );
+        assert_eq!(
+            route("/containers/ubuntu/root/etc", HOST_CONTAINER),
+            RouteTarget::Container {
+                name: "ubuntu".into(),
+                path: "root/etc".into()
+            }
+        );
+
+        // From a guest, the same paths are guest-local — never the workspace.
+        assert_eq!(
+            route("/containers", "ubuntu"),
+            RouteTarget::Local("containers".into())
+        );
+        assert_eq!(
+            route("/containers/debian/root/etc", "ubuntu"),
+            RouteTarget::Local("containers/debian/root/etc".into())
+        );
+        assert_eq!(
+            route("/peers/x", "ubuntu"),
+            RouteTarget::Local("peers/x".into())
+        );
+
+        // Ordinary paths are guest-local in both contexts.
+        assert_eq!(
+            route("/etc/hosts", HOST_CONTAINER),
+            RouteTarget::Local("etc/hosts".into())
+        );
+        assert_eq!(
+            route("/etc/hosts", "ubuntu"),
+            RouteTarget::Local("etc/hosts".into())
+        );
     }
 }
