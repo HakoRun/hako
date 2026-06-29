@@ -96,6 +96,15 @@ Concurrency split: a **node serving** requests is fine blocking; an
 **orchestrator fanning out** to N nodes wants async/threads — so the orchestrator
 is a separate binary that can afford a heavier stack without bloating the agent.
 
+**Current posture (Noise not yet wired).** The shipped channel does the framed
+TCP + the mutual Ed25519 handshake, but **not** the `snow` session yet — so the
+channel is *authenticated* (you know which registered peer you're talking to) but
+**not encrypted or per-message-authenticated**. On a network where an attacker can
+inject into the TCP session that is exploitable (e.g. a forged `ctl` write). Until
+the Noise layer lands, `hako serve` therefore **defaults to loopback** and refuses
+a routable bind unless you pass `--allow-remote` (intended for a trusted LAN/VPN,
+and it warns). Treat `--allow-remote` over the open internet as unsafe.
+
 ## Known wrinkles (found while reviewing the code)
 
 - **`ctl` runtime verbs ride inside `write`.** `run`/`stop` via `ctl` are runtime

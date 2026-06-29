@@ -158,15 +158,42 @@ fn handshake_as_client(
 // Server
 // ---------------------------------------------------------------------------
 
+/// Reject binding a routable (non-loopback) address unless the operator opts in.
+/// The post-handshake channel is authenticated but not yet encrypted, so a
+/// remote-reachable bind should be a deliberate choice (trusted LAN/VPN), not a
+/// surprise. Returns whether the chosen address exposes the node off-host.
+fn check_bind_safety(addr: &str, allow_remote: bool) -> io::Result<bool> {
+    use std::net::ToSocketAddrs;
+    let exposes_remote = addr.to_socket_addrs()?.any(|sa| !sa.ip().is_loopback());
+    if exposes_remote && !allow_remote {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to bind {addr}: the cluster channel is authenticated but not \
+                 encrypted. Re-run with --allow-remote to bind a routable address (use only \
+                 on a trusted LAN/VPN)."
+            ),
+        ));
+    }
+    Ok(exposes_remote)
+}
+
 /// `hako serve [--addr ...]` — listen, authenticate peers, serve requests.
-pub fn serve(ctx: &Ctx<'_>, addr: &str) -> io::Result<ExitCode> {
+pub fn serve(ctx: &Ctx<'_>, addr: &str, allow_remote: bool) -> io::Result<ExitCode> {
     let id = identity::load_or_create(ctx)?;
+    let exposes_remote = check_bind_safety(addr, allow_remote)?;
     let listener = TcpListener::bind(addr)?;
     println!(
         "hako serve: listening on {} as {}",
         listener.local_addr()?,
         id.node_id()
     );
+    if exposes_remote {
+        eprintln!(
+            "hako serve: WARNING — bound a routable address; the channel is authenticated \
+             but NOT encrypted. Use only on a trusted LAN/VPN."
+        );
+    }
     for conn in listener.incoming() {
         match conn {
             Ok(mut stream) => {
@@ -510,6 +537,22 @@ mod tests {
         write_frame(&mut buf, b"hello hako").unwrap();
         let mut cur = std::io::Cursor::new(buf);
         assert_eq!(read_frame(&mut cur).unwrap(), b"hello hako");
+    }
+
+    #[test]
+    fn loopback_bind_needs_no_optin() {
+        // literal IPs only — no DNS resolution in the test
+        assert_eq!(check_bind_safety("127.0.0.1:7777", false).unwrap(), false);
+        assert_eq!(check_bind_safety("[::1]:7777", false).unwrap(), false);
+    }
+
+    #[test]
+    fn routable_bind_requires_optin() {
+        // all-interfaces / specific routable address is refused without the flag
+        assert!(check_bind_safety("0.0.0.0:7777", false).is_err());
+        assert!(check_bind_safety("192.168.1.5:7777", false).is_err());
+        // ...and allowed (reported as remote-exposing) with it
+        assert_eq!(check_bind_safety("0.0.0.0:7777", true).unwrap(), true);
     }
 
     #[test]
