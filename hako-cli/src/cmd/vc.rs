@@ -9,9 +9,18 @@ use hako::{Hash, ScopedFs};
 use std::io;
 use std::process::ExitCode;
 
-pub fn commit(ctx: &Ctx<'_>, message: String, author: String) -> io::Result<ExitCode> {
+pub fn commit(ctx: &Ctx<'_>, message: String, author: Option<String>) -> io::Result<ExitCode> {
     let repo = ctx.state.open_container(ctx.default_container)?;
-    commit_repo(&repo, &message, &author, &mut io::stdout())
+    commit_repo(&repo, &message, &resolve_author(author), &mut io::stdout())
+}
+
+/// Resolve the commit author: the explicit `--author` flag, else `$HAKO_AUTHOR`,
+/// else the literal `"user"`. (Previously every commit was hardcoded to "user".)
+pub fn resolve_author(author: Option<String>) -> String {
+    author
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HAKO_AUTHOR").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "user".to_string())
 }
 
 /// Commit a repo's working tree onto its current branch. Shared by the `commit`
@@ -155,7 +164,7 @@ pub fn checkout(ctx: &Ctx<'_>, branch: String, force: bool) -> io::Result<ExitCo
 pub fn merge(
     ctx: &Ctx<'_>,
     branch: Option<String>,
-    author: String,
+    author: Option<String>,
     abort: bool,
 ) -> io::Result<ExitCode> {
     let repo = ctx.state.open_container(ctx.default_container)?;
@@ -165,6 +174,7 @@ pub fn merge(
         println!("merge aborted; working tree reset to HEAD");
         return Ok(ExitCode::SUCCESS);
     }
+    let author = resolve_author(author);
     let branch = branch.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -315,4 +325,21 @@ pub fn diff(ctx: &Ctx<'_>, from: Option<String>, to: Option<String>) -> io::Resu
         print_diff(&d);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_author_flag_then_default() {
+        // an explicit, non-empty flag always wins
+        assert_eq!(resolve_author(Some("alice".into())), "alice");
+        // an empty flag is ignored; with HAKO_AUTHOR unset it falls back to "user"
+        // (only assert the env-free path so we don't mutate process-global env)
+        if std::env::var_os("HAKO_AUTHOR").is_none() {
+            assert_eq!(resolve_author(None), "user");
+            assert_eq!(resolve_author(Some(String::new())), "user");
+        }
+    }
 }

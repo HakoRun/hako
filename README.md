@@ -76,7 +76,7 @@ binary, see [BUILD.md](BUILD.md).
 |------|----------|
 | **Workspace** | `init` |
 | **Files** | `write`, `cat`, `mkdir`, `del`, `cp`, `mv`, `import`, `export` |
-| **Navigation** | `ls`, `pwd`, `cd`, `tree`, `status` |
+| **Navigation** | `ls`, `pwd`, `cd`, `tree`, `status`, `mount` (FUSE browse) |
 | **Version control** | `commit`, `log`, `branch`, `checkout`, `merge`, `diff`, `tag` |
 | **Containers** | `containers`, `new-container`, `del-container`, `is` |
 | **OCI** | `pull` |
@@ -84,7 +84,7 @@ binary, see [BUILD.md](BUILD.md).
 | **Packaging** | `bundle` (container → single self-contained executable) |
 | **Sync** | `fetch`, `push` |
 | **Config** | `apply` (reads `hako.toml`) |
-| **Maintenance** | `gc`, `fsck`, `mount`, `bootstrap` |
+| **Maintenance** | `gc`, `fsck`, `bootstrap` |
 
 `run-host <path>` runs a Linux executable straight from the host filesystem
 through hako's sandbox (add `--display` for a GUI app); `bundle <container>`

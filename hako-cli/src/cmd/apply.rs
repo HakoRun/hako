@@ -64,7 +64,14 @@ pub fn apply(
                     format!("hako.toml image: {}", e),
                 )
             })?;
-            super::oci::pull_into(ctx.state, &image_ref, &app.name, "linux", "amd64", false)?;
+            super::oci::pull_into(
+                ctx.state,
+                &image_ref,
+                &app.name,
+                "linux",
+                super::oci::host_oci_arch(),
+                false,
+            )?;
         }
     }
 

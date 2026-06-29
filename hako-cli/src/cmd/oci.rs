@@ -35,6 +35,18 @@ pub fn pull(
     Ok(ExitCode::SUCCESS)
 }
 
+/// The OCI architecture matching the host the Linux runtime runs on. hako always
+/// runs a Linux runtime — native, or bridged into WSL2/Lima — so a pulled image's
+/// arch must match the host CPU, not a hardcoded `amd64`. (`x86_64`→`amd64`,
+/// `aarch64`→`arm64`; other arches fall through as their Rust name, best-effort.)
+pub fn host_oci_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
 /// Pull `image_ref` into a container named `container`, creating the
 /// container if it doesn't exist. Returns the new root tree hash. Used by
 /// the `pull` CLI handler AND by `nav::switch_identity`'s auto-bootstrap
@@ -129,4 +141,19 @@ fn derive_container_name(image_ref: &ImageRef) -> String {
         .next()
         .unwrap_or(&image_ref.repo)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_oci_arch_matches_current() {
+        let a = host_oci_arch();
+        assert!(!a.is_empty());
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(a, "amd64");
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(a, "arm64");
+    }
 }
