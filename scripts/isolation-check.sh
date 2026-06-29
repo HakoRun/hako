@@ -81,6 +81,20 @@ check "seccomp blocks the mount syscall" 'echo "$mnt" | grep -q "rc=0" && false 
 sysrc="$(run 'touch /sys/.hako_iso_w 2>&1; echo rc=$?')"
 check "/sys is read-only" 'echo "$sysrc" | grep -q "rc=0" && false || echo "$sysrc" | grep -qiE "read-only|not permitted"' "$sysrc"
 
+# 7. /sys is read-only in the shared-netns `apply` path too. Unlike `run` (which
+#    gets a fresh RO sysfs), `apply` keeps host networking and binds the host
+#    /sys, so it must remount it read-only — and fail rather than fall back to a
+#    writable bind. The setup step exits 0 iff /sys is read-only, so `apply`
+#    succeeds iff the remount held (and did not fail-closed). Reuses the seeded
+#    `hako` container as the base so no image pull/network is needed.
+cat > hako.toml <<'TOML'
+image = "unused"
+name = "hako"
+setup = ["if : > /sys/.hako_apply_w 2>/dev/null; then exit 1; else exit 0; fi"]
+TOML
+applyout="$("$HAKO" apply 2>&1)"; applyrc=$?
+check "/sys is read-only in apply (shared netns)" '[ "$applyrc" -eq 0 ]' "rc=$applyrc | $applyout"
+
 echo "---"
 if [ "$fail" -eq 0 ]; then
   echo -e "\033[32mALL ISOLATION CHECKS PASSED\033[0m"

@@ -1109,19 +1109,26 @@ fn setup_sysfs(root: &str, net_isolated: bool) -> Result<(), RuntimeError> {
     {
         return Ok(());
     }
-    // Fallback (shared netns, e.g. `apply`): bind the host /sys, then a
-    // best-effort read-only remount of the TOP mount. A recursive RO remount is
-    // refused (EPERM) for submounts we don't own, and we must not fail the run
-    // over it — so this is non-recursive and best-effort; if even that is denied
-    // the bind stays read-write (the prior behavior).
+    // Fallback (shared netns, e.g. `apply`): bind the host /sys, then remount the
+    // TOP mount read-only — and *require* it. Previously this remount was
+    // best-effort, so if it was denied the bind stayed read-write and a
+    // host-networked `apply` step from a malicious `hako.toml` ran with a writable
+    // host /sys. Fail closed instead. (A recursive RO remount of submounts we
+    // don't own is refused by the kernel, so the top RO mount plus
+    // NOSUID/NODEV/NOEXEC is the strongest confinement we can enforce here.)
     bind_mount("/sys", &sys_path, MsFlags::MS_BIND | MsFlags::MS_REC)?;
-    let _ = mount(
+    mount(
         None::<&str>,
         sys_path.as_str(),
         None::<&str>,
-        MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+        MsFlags::MS_BIND | MsFlags::MS_REMOUNT | ro,
         None::<&str>,
-    );
+    )
+    .map_err(|e| {
+        io_other(format!(
+            "failed to remount /sys read-only (shared netns): {e}"
+        ))
+    })?;
     Ok(())
 }
 
