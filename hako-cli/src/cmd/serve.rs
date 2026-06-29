@@ -18,7 +18,7 @@
 use super::Ctx;
 use crate::cmd::{identity, peers};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use hako::{ChunkStore, Hash};
+use hako::{ChunkStore, Hash, WorkspaceLock};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
@@ -281,6 +281,14 @@ fn meta_read(ctx: &Ctx<'_>, path: &str) -> io::Result<Vec<u8>> {
     }
 }
 
+/// Acquire the workspace lock for the duration of a daemon-side mutation, so a
+/// remote write serializes against concurrent *local* commands (which hold the
+/// same lock). `serve` never holds it globally, so this can't self-deadlock; the
+/// guard is dropped as soon as the mutation returns (short-lived).
+fn lock_workspace(ctx: &Ctx<'_>) -> io::Result<WorkspaceLock> {
+    WorkspaceLock::acquire(&ctx.workdir.join(crate::DOT_HAKO))
+}
+
 /// Serve a meta-fs write. Payload is `[path_len: u32 BE][path][body]`. For now:
 /// a container `ctl` verb (run/commit/branch/tag), dispatched on this node with
 /// its output captured and returned.
@@ -296,6 +304,9 @@ fn meta_write(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
     let body = &rest[plen..];
     match RouteTarget::parse(path) {
         RouteTarget::Container { name, path: sub } if sub == "ctl" => {
+            // A `ctl` verb (commit/branch/tag/run) mutates refs/state — serialize
+            // it against local commands for the duration of the dispatch.
+            let _lock = lock_workspace(ctx)?;
             let mut buf = Vec::new();
             crate::cmd::files::dispatch_ctl(ctx, &name, body, &mut buf)?;
             Ok(buf)
@@ -340,7 +351,11 @@ fn sync_put(ctx: &Ctx<'_>, mut payload: &[u8]) -> io::Result<Vec<u8>> {
 fn sync_ref(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
     let (container, rest) = take_lenprefixed_str(payload)?;
     let (branch, rest) = take_lenprefixed_str(rest)?;
-    let commit = Hash(<[u8; HASH_LEN]>::try_from(rest).map_err(|_| invalid("malformed ref request"))?);
+    let commit =
+        Hash(<[u8; HASH_LEN]>::try_from(rest).map_err(|_| invalid("malformed ref request"))?);
+    // Serialize the create-container + ref update against concurrent local
+    // commands (which hold the workspace lock); released as this fn returns.
+    let _lock = lock_workspace(ctx)?;
     if !ctx.state.list_containers()?.iter().any(|c| c == container) {
         ctx.state.create_container(container)?;
     }
@@ -576,7 +591,10 @@ mod tests {
     fn first_array_is_panic_free_on_short_input() {
         assert!(first_array::<4>(&[1, 2, 3], "x").is_err()); // too short
         assert!(first_array::<4>(&[], "x").is_err()); // empty
-        assert_eq!(first_array::<4>(&[1, 2, 3, 4, 5], "x").unwrap(), [1u8, 2, 3, 4]);
+        assert_eq!(
+            first_array::<4>(&[1, 2, 3, 4, 5], "x").unwrap(),
+            [1u8, 2, 3, 4]
+        );
     }
 
     #[test]
@@ -597,7 +615,10 @@ mod tests {
             "read should have timed out promptly, not blocked"
         );
         assert!(
-            matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
+            matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
             "expected a timeout error kind, got {:?}",
             err.kind()
         );
