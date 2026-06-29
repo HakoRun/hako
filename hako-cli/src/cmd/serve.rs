@@ -573,9 +573,9 @@ mod tests {
 
     #[test]
     fn loopback_bind_needs_no_optin() {
-        // literal IPs only — no DNS resolution in the test
-        assert_eq!(check_bind_safety("127.0.0.1:7777", false).unwrap(), false);
-        assert_eq!(check_bind_safety("[::1]:7777", false).unwrap(), false);
+        // literal IPs only — no DNS resolution in the test; loopback never exposes
+        assert!(!check_bind_safety("127.0.0.1:7777", false).unwrap());
+        assert!(!check_bind_safety("[::1]:7777", false).unwrap());
     }
 
     #[test]
@@ -584,7 +584,7 @@ mod tests {
         assert!(check_bind_safety("0.0.0.0:7777", false).is_err());
         assert!(check_bind_safety("192.168.1.5:7777", false).is_err());
         // ...and allowed (reported as remote-exposing) with it
-        assert_eq!(check_bind_safety("0.0.0.0:7777", true).unwrap(), true);
+        assert!(check_bind_safety("0.0.0.0:7777", true).unwrap());
     }
 
     #[test]
