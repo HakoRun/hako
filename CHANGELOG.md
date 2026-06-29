@@ -22,7 +22,9 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches a release.
   and `write /peers/<node>/containers/<name>/ctl "run …"` dispatches a control
   verb (run/commit/branch/tag) to it — its output (e.g. the new instance id) and
   errors come back over the wire. `hako peer ping <name>` checks reachability +
-  identity.
+  identity. `serve` defaults to **loopback**; binding a routable address requires
+  `--allow-remote` (the channel is authenticated but not yet encrypted, so a
+  remote bind must be a deliberate, trusted-network choice).
 - **Container replication over the cluster (`--features cluster`):** `hako peer
   push <node> [branch]` replicates a container branch to a peer over the
   authenticated channel — a content-addressed have/want sync that sends only the

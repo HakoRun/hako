@@ -214,6 +214,11 @@ enum Cmd {
         /// Address to listen on
         #[arg(long, default_value = "127.0.0.1:7777")]
         addr: String,
+        /// Allow binding a routable (non-loopback) address. The cluster channel
+        /// is authenticated but not yet encrypted, so a remote bind must be a
+        /// deliberate choice — use only on a trusted LAN/VPN.
+        #[arg(long)]
+        allow_remote: bool,
     },
 
     // ------------------------------------------------------------ Mount
@@ -758,7 +763,7 @@ fn run() -> io::Result<ExitCode> {
             PeerCmd::Push { node, branch } => cmd::serve::remote_push(&ctx, &node, &branch),
         },
         #[cfg(feature = "cluster")]
-        Cmd::Serve { addr } => cmd::serve::serve(&ctx, &addr),
+        Cmd::Serve { addr, allow_remote } => cmd::serve::serve(&ctx, &addr, allow_remote),
         Cmd::NewContainer { name } => {
             state.create_container(&name)?;
             println!("created container {}", name);
