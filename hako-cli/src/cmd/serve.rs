@@ -116,7 +116,7 @@ fn handshake_as_server(
     if h1.len() != PUBKEY_LEN + NONCE_LEN {
         return Err(invalid("handshake: bad hello"));
     }
-    let client_pubkey: [u8; PUBKEY_LEN] = h1[..PUBKEY_LEN].try_into().unwrap();
+    let client_pubkey = first_array::<PUBKEY_LEN>(&h1, "handshake: bad hello")?;
     let client_nonce = &h1[PUBKEY_LEN..];
     let client_vk =
         VerifyingKey::from_bytes(&client_pubkey).map_err(|_| invalid("client pubkey invalid"))?;
@@ -158,7 +158,7 @@ fn handshake_as_client(
     if h2.len() != SIG_LEN + NONCE_LEN {
         return Err(invalid("handshake: bad server reply"));
     }
-    let server_sig: [u8; SIG_LEN] = h2[..SIG_LEN].try_into().unwrap();
+    let server_sig = first_array::<SIG_LEN>(&h2, "handshake: bad server reply")?;
     let server_nonce = &h2[SIG_LEN..];
     expected
         .verify(&client_nonce, &Signature::from_bytes(&server_sig))
@@ -286,10 +286,7 @@ fn meta_read(ctx: &Ctx<'_>, path: &str) -> io::Result<Vec<u8>> {
 /// its output captured and returned.
 fn meta_write(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
     use hako::RouteTarget;
-    if payload.len() < 4 {
-        return Err(invalid("malformed write request"));
-    }
-    let plen = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
+    let plen = u32::from_be_bytes(first_array::<4>(payload, "malformed write request")?) as usize;
     let rest = &payload[4..];
     if rest.len() < plen {
         return Err(invalid("malformed write request"));
@@ -326,10 +323,7 @@ fn sync_have(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
 fn sync_put(ctx: &Ctx<'_>, mut payload: &[u8]) -> io::Result<Vec<u8>> {
     let store = ctx.state.store();
     while !payload.is_empty() {
-        if payload.len() < 4 {
-            return Err(invalid("malformed put batch"));
-        }
-        let len = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
+        let len = u32::from_be_bytes(first_array::<4>(payload, "malformed put batch")?) as usize;
         payload = &payload[4..];
         if payload.len() < len {
             return Err(invalid("malformed put batch"));
@@ -346,10 +340,7 @@ fn sync_put(ctx: &Ctx<'_>, mut payload: &[u8]) -> io::Result<Vec<u8>> {
 fn sync_ref(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
     let (container, rest) = take_lenprefixed_str(payload)?;
     let (branch, rest) = take_lenprefixed_str(rest)?;
-    if rest.len() != HASH_LEN {
-        return Err(invalid("malformed ref request"));
-    }
-    let commit = Hash(rest.try_into().unwrap());
+    let commit = Hash(<[u8; HASH_LEN]>::try_from(rest).map_err(|_| invalid("malformed ref request"))?);
     if !ctx.state.list_containers()?.iter().any(|c| c == container) {
         ctx.state.create_container(container)?;
     }
@@ -358,23 +349,33 @@ fn sync_ref(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
     Ok(format!("updated {container}:{branch} -> {}", &hex(&commit.0)[..12]).into_bytes())
 }
 
+/// Read the first `N` bytes of `b` as a fixed array, erroring (never panicking)
+/// if `b` is too short — so the network parse path can't be turned into a remote
+/// panic by a future refactor that drops a length guard.
+fn first_array<const N: usize>(b: &[u8], what: &'static str) -> io::Result<[u8; N]> {
+    b.get(..N)
+        .and_then(|s| <[u8; N]>::try_from(s).ok())
+        .ok_or_else(|| invalid(what))
+}
+
 /// Decode a concatenation of 32-byte object hashes.
 fn decode_hashes(bytes: &[u8]) -> io::Result<Vec<Hash>> {
     if !bytes.len().is_multiple_of(HASH_LEN) {
         return Err(invalid("malformed hash list"));
     }
-    Ok(bytes
+    bytes
         .chunks_exact(HASH_LEN)
-        .map(|c| Hash(c.try_into().unwrap()))
-        .collect())
+        .map(|c| {
+            <[u8; HASH_LEN]>::try_from(c)
+                .map(Hash)
+                .map_err(|_| invalid("malformed hash list"))
+        })
+        .collect()
 }
 
 /// Split a `[len: u32][bytes]` UTF-8 field off the front of `buf`.
 fn take_lenprefixed_str(buf: &[u8]) -> io::Result<(&str, &[u8])> {
-    if buf.len() < 4 {
-        return Err(invalid("truncated request"));
-    }
-    let len = u32::from_be_bytes(buf[..4].try_into().unwrap()) as usize;
+    let len = u32::from_be_bytes(first_array::<4>(buf, "truncated request")?) as usize;
     let rest = &buf[4..];
     if rest.len() < len {
         return Err(invalid("truncated request"));
@@ -569,6 +570,13 @@ mod tests {
         assert!(check_bind_safety("192.168.1.5:7777", false).is_err());
         // ...and allowed (reported as remote-exposing) with it
         assert_eq!(check_bind_safety("0.0.0.0:7777", true).unwrap(), true);
+    }
+
+    #[test]
+    fn first_array_is_panic_free_on_short_input() {
+        assert!(first_array::<4>(&[1, 2, 3], "x").is_err()); // too short
+        assert!(first_array::<4>(&[], "x").is_err()); // empty
+        assert_eq!(first_array::<4>(&[1, 2, 3, 4, 5], "x").unwrap(), [1u8, 2, 3, 4]);
     }
 
     #[test]
