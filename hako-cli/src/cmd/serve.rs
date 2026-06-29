@@ -48,6 +48,20 @@ const HASH_LEN: usize = 32;
 /// Flush a `SyncPut` batch before it would approach `MAX_FRAME`.
 const PUT_BATCH_LIMIT: usize = 512 * 1024;
 
+/// Read/write timeout applied to every peer connection (server *and* client).
+/// The daemon is blocking and single-threaded, so without this a peer that
+/// connects and stalls (or stops reading) would wedge it indefinitely. Generous
+/// enough for a burst of sync rounds; bounded so a hung connection is dropped and
+/// the daemon recovers to serve the next peer.
+const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Apply [`IO_TIMEOUT`] to a freshly accepted or connected stream.
+fn set_io_timeouts(stream: &TcpStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Framing
 // ---------------------------------------------------------------------------
@@ -208,6 +222,7 @@ pub fn serve(ctx: &Ctx<'_>, addr: &str, allow_remote: bool) -> io::Result<ExitCo
 }
 
 fn handle_peer(stream: &mut TcpStream, id: &identity::Identity, ctx: &Ctx<'_>) -> io::Result<()> {
+    set_io_timeouts(stream)?;
     handshake_as_server(stream, id, |pk| {
         peers::find_by_pubkey(ctx, &hex(pk))
             .ok()
@@ -513,6 +528,7 @@ fn connect_and_handshake(ctx: &Ctx<'_>, peer: &peers::Peer) -> io::Result<TcpStr
     let expected = peer.verifying_key()?;
     let id = identity::load_or_create(ctx)?;
     let mut stream = TcpStream::connect(&peer.address)?;
+    set_io_timeouts(&stream)?;
     handshake_as_client(&mut stream, &id, &expected)?;
     Ok(stream)
 }
@@ -553,6 +569,30 @@ mod tests {
         assert!(check_bind_safety("192.168.1.5:7777", false).is_err());
         // ...and allowed (reported as remote-exposing) with it
         assert_eq!(check_bind_safety("0.0.0.0:7777", true).unwrap(), true);
+    }
+
+    #[test]
+    fn read_frame_honors_read_timeout_on_silent_peer() {
+        // A peer that connects but never sends must not hang the reader forever:
+        // with a read timeout set, read_frame returns promptly with a timeout error.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).unwrap(); // connects, sends nothing
+        let (mut server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(std::time::Duration::from_millis(150)))
+            .unwrap();
+        let start = std::time::Instant::now();
+        let err = read_frame(&mut server).unwrap_err();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "read should have timed out promptly, not blocked"
+        );
+        assert!(
+            matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
+            "expected a timeout error kind, got {:?}",
+            err.kind()
+        );
     }
 
     #[test]
