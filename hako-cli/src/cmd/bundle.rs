@@ -66,6 +66,97 @@ fn read_appended_payload(exe: &Path) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(payload))
 }
 
+/// True if `p` is a plain relative path with no component that could escape the
+/// extraction root (no absolute/root/prefix component, no `..`).
+fn is_safe_relative(p: &Path) -> bool {
+    use std::path::Component;
+    p.components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
+/// True if a sym/hard-link `target` declared at archive path `entry_path` would
+/// resolve *outside* the extraction root. Absolute targets always escape;
+/// relative targets are walked while tracking depth below the root.
+fn link_target_escapes(entry_path: &Path, target: &Path) -> bool {
+    use std::path::Component;
+    if target.is_absolute() {
+        return true;
+    }
+    // Depth of the directory containing the link, relative to the root.
+    let mut depth: isize = entry_path
+        .parent()
+        .map(|p| {
+            p.components()
+                .filter(|c| matches!(c, Component::Normal(_)))
+                .count() as isize
+        })
+        .unwrap_or(0);
+    for c in target.components() {
+        match c {
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return true;
+                }
+            }
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => return true,
+        }
+    }
+    false
+}
+
+/// Extract the gzip-tar `payload` into `dst` with hardened defaults: never
+/// overwrite an existing path, reject any entry whose path escapes `dst`, and
+/// reject sym/hard links whose target would resolve outside `dst`. This is the
+/// only place an untrusted archive touches the real filesystem, so safety is
+/// enforced here rather than delegated to the `tar` crate's defaults.
+fn unpack_hardened(payload: &[u8], dst: &Path) -> io::Result<()> {
+    let gz = flate2::read::GzDecoder::new(payload);
+    let mut archive = tar::Archive::new(gz);
+    archive.set_overwrite(false);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        if !is_safe_relative(&path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bundle: unsafe archive entry path: {}", path.display()),
+            ));
+        }
+        if matches!(
+            entry.header().entry_type(),
+            tar::EntryType::Symlink | tar::EntryType::Link
+        ) {
+            let target = entry.link_name()?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bundle: link entry with no target",
+                )
+            })?;
+            if link_target_escapes(&path, &target) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "bundle: unsafe link target: {} -> {}",
+                        path.display(),
+                        target.display()
+                    ),
+                ));
+            }
+        }
+        // `unpack_in` adds the tar crate's own dst-containment check as a backstop.
+        if !entry.unpack_in(dst)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bundle: refused unsafe archive entry: {}", path.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Extract (once) and run the bundled container's command.
 fn launch(payload: &[u8]) -> io::Result<ExitCode> {
     let id = hako::Hash::of(payload).to_hex()[..12].to_string();
@@ -80,8 +171,7 @@ fn launch(payload: &[u8]) -> io::Result<ExitCode> {
         let tmp = base.join(format!(".{id}.tmp.{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp)?;
-        let gz = flate2::read::GzDecoder::new(payload);
-        tar::Archive::new(gz).unpack(&tmp)?;
+        unpack_hardened(payload, &tmp)?;
         std::fs::write(tmp.join(".ready"), b"")?;
         // Atomically publish by renaming our temp dir into place.
         if std::fs::rename(&tmp, &cache).is_err() {
@@ -316,4 +406,92 @@ pub fn create(
         output.display()
     );
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_safe_relative_cases() {
+        assert!(is_safe_relative(Path::new("a/b/c")));
+        assert!(is_safe_relative(Path::new("./a")));
+        assert!(!is_safe_relative(Path::new("../escape")));
+        assert!(!is_safe_relative(Path::new("a/../../b")));
+        assert!(!is_safe_relative(Path::new("/abs")));
+    }
+
+    #[test]
+    fn link_target_escape_cases() {
+        // relative target that stays inside the tree is fine
+        assert!(!link_target_escapes(
+            Path::new("a/b/link"),
+            Path::new("../c")
+        ));
+        assert!(!link_target_escapes(
+            Path::new("a/b/link"),
+            Path::new("c/d")
+        ));
+        // climbs out of the root
+        assert!(link_target_escapes(Path::new("link"), Path::new("../x")));
+        assert!(link_target_escapes(
+            Path::new("a/link"),
+            Path::new("../../x")
+        ));
+        // absolute always escapes (would resolve to a host path)
+        assert!(link_target_escapes(
+            Path::new("a/link"),
+            Path::new("/etc/passwd")
+        ));
+    }
+
+    /// gzip a tar built from `(path, entry_type, data, linkname)` entries.
+    fn gz_tar(entries: &[(&str, tar::EntryType, &[u8], Option<&str>)]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        for (path, kind, data, linkname) in entries {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(*kind);
+            h.set_mode(0o644);
+            h.set_size(data.len() as u64);
+            if let Some(ln) = linkname {
+                h.set_link_name(ln).unwrap();
+            }
+            b.append_data(&mut h, path, &data[..]).unwrap();
+        }
+        let tar_bytes = b.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tar_bytes).unwrap();
+        gz.finish().unwrap()
+    }
+
+    #[test]
+    fn safe_tar_extracts() {
+        let payload = gz_tar(&[
+            ("hello.txt", tar::EntryType::Regular, b"hi", None),
+            ("sub/world.txt", tar::EntryType::Regular, b"earth", None),
+        ]);
+        let dst = tempfile::tempdir().unwrap();
+        unpack_hardened(&payload, dst.path()).unwrap();
+        assert_eq!(std::fs::read(dst.path().join("hello.txt")).unwrap(), b"hi");
+        assert_eq!(
+            std::fs::read(dst.path().join("sub/world.txt")).unwrap(),
+            b"earth"
+        );
+    }
+
+    #[test]
+    fn rejects_escaping_symlink_target() {
+        // A symlink whose target climbs out of the extraction root is refused
+        // *before* the link is created (so this is safe to run on Windows too).
+        let payload = gz_tar(&[(
+            "link",
+            tar::EntryType::Symlink,
+            b"",
+            Some("../../etc/passwd"),
+        )]);
+        let dst = tempfile::tempdir().unwrap();
+        let err = unpack_hardened(&payload, dst.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(!dst.path().join("link").exists());
+    }
 }
