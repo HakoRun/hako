@@ -193,7 +193,15 @@ fn check_bind_safety(addr: &str, allow_remote: bool) -> io::Result<bool> {
 }
 
 /// `hako serve [--addr ...]` — listen, authenticate peers, serve requests.
-pub fn serve(ctx: &Ctx<'_>, addr: &str, allow_remote: bool) -> io::Result<ExitCode> {
+///
+/// `allow_remote_run` gates the one request that grants command execution on
+/// this node (the `ctl run` verb); it is off unless the operator opts in.
+pub fn serve(
+    ctx: &Ctx<'_>,
+    addr: &str,
+    allow_remote: bool,
+    allow_remote_run: bool,
+) -> io::Result<ExitCode> {
     let id = identity::load_or_create(ctx)?;
     let exposes_remote = check_bind_safety(addr, allow_remote)?;
     let listener = TcpListener::bind(addr)?;
@@ -208,10 +216,16 @@ pub fn serve(ctx: &Ctx<'_>, addr: &str, allow_remote: bool) -> io::Result<ExitCo
              but NOT encrypted. Use only on a trusted LAN/VPN."
         );
     }
+    if allow_remote_run {
+        eprintln!(
+            "hako serve: WARNING — remote `ctl run` is ENABLED; any registered peer can \
+             execute commands in a container on this node."
+        );
+    }
     for conn in listener.incoming() {
         match conn {
             Ok(mut stream) => {
-                if let Err(e) = handle_peer(&mut stream, &id, ctx) {
+                if let Err(e) = handle_peer(&mut stream, &id, ctx, allow_remote_run) {
                     eprintln!("hako serve: connection error: {e}");
                 }
             }
@@ -221,7 +235,12 @@ pub fn serve(ctx: &Ctx<'_>, addr: &str, allow_remote: bool) -> io::Result<ExitCo
     Ok(ExitCode::SUCCESS)
 }
 
-fn handle_peer(stream: &mut TcpStream, id: &identity::Identity, ctx: &Ctx<'_>) -> io::Result<()> {
+fn handle_peer(
+    stream: &mut TcpStream,
+    id: &identity::Identity,
+    ctx: &Ctx<'_>,
+    allow_remote_run: bool,
+) -> io::Result<()> {
     set_io_timeouts(stream)?;
     handshake_as_server(stream, id, |pk| {
         peers::find_by_pubkey(ctx, &hex(pk))
@@ -242,7 +261,7 @@ fn handle_peer(stream: &mut TcpStream, id: &identity::Identity, ctx: &Ctx<'_>) -
             TAG_META_READ => std::str::from_utf8(payload)
                 .map_err(|_| invalid("request path is not UTF-8"))
                 .and_then(|path| meta_read(ctx, path)),
-            TAG_META_WRITE => meta_write(ctx, payload),
+            TAG_META_WRITE => meta_write(ctx, payload, allow_remote_run),
             TAG_SYNC_HAVE => sync_have(ctx, payload),
             TAG_SYNC_PUT => sync_put(ctx, payload),
             TAG_SYNC_REF => sync_ref(ctx, payload),
@@ -292,7 +311,7 @@ fn lock_workspace(ctx: &Ctx<'_>) -> io::Result<WorkspaceLock> {
 /// Serve a meta-fs write. Payload is `[path_len: u32 BE][path][body]`. For now:
 /// a container `ctl` verb (run/commit/branch/tag), dispatched on this node with
 /// its output captured and returned.
-fn meta_write(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
+fn meta_write(ctx: &Ctx<'_>, payload: &[u8], allow_remote_run: bool) -> io::Result<Vec<u8>> {
     use hako::RouteTarget;
     let plen = u32::from_be_bytes(first_array::<4>(payload, "malformed write request")?) as usize;
     let rest = &payload[4..];
@@ -304,6 +323,22 @@ fn meta_write(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
     let body = &rest[plen..];
     match RouteTarget::parse(path) {
         RouteTarget::Container { name, path: sub } if sub == "ctl" => {
+            // Gate remote command execution. The `run` verb spawns an arbitrary
+            // command in a container on THIS node, so it is refused unless the
+            // operator opted in with `hako serve --allow-remote-run` — otherwise a
+            // registered peer would get code execution here by default (issue #40).
+            // The other ctl verbs (commit/branch/tag) only touch this node's own
+            // version-control state and stay available.
+            let verb = std::str::from_utf8(body)
+                .ok()
+                .and_then(|s| s.split_whitespace().next())
+                .unwrap_or("");
+            if verb == "run" && !allow_remote_run {
+                return Err(denied(
+                    "remote `ctl run` is disabled on this node; \
+                     start it with `hako serve --allow-remote-run` to permit it",
+                ));
+            }
             // A `ctl` verb (commit/branch/tag/run) mutates refs/state — serialize
             // it against local commands for the duration of the dispatch.
             let _lock = lock_workspace(ctx)?;
@@ -762,6 +797,40 @@ mod tests {
         // A genuine fast-forward is accepted and advances the ref.
         sync_ref(&ctx, &enc(ff)).unwrap();
         assert_eq!(tip(), Some(ff));
+    }
+
+    #[test]
+    fn meta_write_gates_remote_run() {
+        use hako::{Config, Session, State};
+
+        let d = tempfile::tempdir().unwrap();
+        let state = State::init(&d.path().join(crate::DOT_HAKO)).unwrap();
+        let session = Session::default();
+        let cfg = Config::default();
+        let ctx = Ctx {
+            state: &state,
+            session: &session,
+            default_container: "hako",
+            workdir: d.path(),
+            cfg: &cfg,
+        };
+        let enc = |path: &str, body: &str| {
+            let mut p = Vec::new();
+            p.extend_from_slice(&(path.len() as u32).to_be_bytes());
+            p.extend_from_slice(path.as_bytes());
+            p.extend_from_slice(body.as_bytes());
+            p
+        };
+
+        // `run` is refused when remote-run is disabled (the default), before any
+        // spawn is attempted.
+        let err = meta_write(&ctx, &enc("/containers/hako/ctl", "run echo hi"), false).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        // A non-`run` verb is not gated — it only touches this node's local VC
+        // state (a clean tree yields "nothing to commit", still a non-error
+        // dispatch, so the request itself is served).
+        assert!(meta_write(&ctx, &enc("/containers/hako/ctl", "commit msg"), false).is_ok());
     }
 
     #[test]

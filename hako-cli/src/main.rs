@@ -225,6 +225,13 @@ enum Cmd {
         /// deliberate choice — use only on a trusted LAN/VPN.
         #[arg(long)]
         allow_remote: bool,
+        /// Allow peers to trigger command execution on this node via
+        /// `write /peers/<node>/containers/<name>/ctl "run …"`. Off by default:
+        /// it grants any registered peer arbitrary command execution inside a
+        /// container on this host. The version-control ctl verbs
+        /// (commit/branch/tag) and replication stay available without it.
+        #[arg(long)]
+        allow_remote_run: bool,
     },
 
     // ------------------------------------------------------------ Mount
@@ -777,7 +784,11 @@ fn run() -> io::Result<ExitCode> {
             PeerCmd::Push { node, branch } => cmd::serve::remote_push(&ctx, &node, &branch),
         },
         #[cfg(feature = "cluster")]
-        Cmd::Serve { addr, allow_remote } => cmd::serve::serve(&ctx, &addr, allow_remote),
+        Cmd::Serve {
+            addr,
+            allow_remote,
+            allow_remote_run,
+        } => cmd::serve::serve(&ctx, &addr, allow_remote, allow_remote_run),
         Cmd::NewContainer { name } => {
             state.create_container(&name)?;
             println!("created container {}", name);
