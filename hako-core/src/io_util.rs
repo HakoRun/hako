@@ -21,15 +21,22 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
 
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // A per-process sequence disambiguates two threads writing the same target
+    // within the same sub-second nanosecond, which would otherwise pick the same
+    // temp name and let one clobber the other's in-flight write.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = parent.join(format!(
-        ".{}.tmp.{}.{}",
+        ".{}.tmp.{}.{}.{}",
         path.file_name().and_then(|s| s.to_str()).unwrap_or("file"),
         std::process::id(),
-        nanos
+        nanos,
+        seq
     ));
 
     {

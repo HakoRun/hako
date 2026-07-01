@@ -151,10 +151,12 @@ pub fn checkout(ctx: &Ctx<'_>, branch: String, force: bool) -> io::Result<ExitCo
         )
     })?;
     let tree = repo.load_commit(&target)?.tree;
-    // Update working tree FIRST, then HEAD. If a crash interleaves, a
-    // re-opened workspace will see a coherent (working == old_branch's tree,
-    // HEAD == old_branch) state — the failed checkout is a no-op rather
-    // than leaving HEAD pointing at the new branch with stale working.
+    // Update the working tree FIRST, then move HEAD. If a crash interleaves,
+    // the refs stay intact (HEAD still on the old branch) and the workspace
+    // simply shows the target branch's tree as uncommitted changes on the old
+    // branch — recoverable by re-running checkout, with no ref lost. The reverse
+    // order could leave HEAD on the new branch while WORKING still holds the old
+    // branch's tree, silently mislabeling that content as edits on the new branch.
     repo.set_working(tree)?;
     repo.set_branch(&branch)?;
     println!("switched to branch {}", branch);
