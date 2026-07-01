@@ -1174,6 +1174,28 @@ fn setup_user_volumes(root: &str, volumes: &[VolumeMount]) -> Result<(), Runtime
             )
             .map_err(|e| io_other(format!("remount {} ro: {}", target, e)))?;
         }
+        // Shadow any masked sub-paths with an empty read-only tmpfs. This is how
+        // the implicit `/workspace` mount hides the workspace's own `.hako/`
+        // (the content-addressed store, refs, and — in cluster builds — the
+        // Ed25519 identity key) from the workload: without it a `run` workload
+        // could read the store or the private key and, because `/workspace` is a
+        // real host mount (not the ephemeral FUSE rootfs), delete or rewrite the
+        // host repo. Overmounts sit on top of the bind, so the ro flag above does
+        // not prevent creating them.
+        for sub in &v.mask {
+            let masked = format!("{}/{}", target, sub.trim_matches('/'));
+            // Only shadow a path that actually exists under the mount; a mask
+            // for an absent sub-path is a harmless no-op.
+            if Path::new(&masked).exists() {
+                mount_kind(
+                    "tmpfs",
+                    &masked,
+                    "tmpfs",
+                    MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+                    Some("mode=0000,size=0"),
+                )?;
+            }
+        }
     }
     Ok(())
 }

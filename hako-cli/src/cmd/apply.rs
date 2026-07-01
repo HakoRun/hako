@@ -167,6 +167,9 @@ fn build_volumes(ctx: &Ctx<'_>, app: &AppConfig) -> Vec<VolumeMount> {
             host: ctx.workdir.to_path_buf(),
             container: "/workspace".into(),
             readonly: matches!(app.workspace, WorkspaceMode::Ro),
+            // Keep a setup step from seeing/altering the workspace's own .hako/
+            // (store + refs + identity key) through the workspace mount. See #39.
+            mask: vec![DOT_HAKO.to_string()],
         }],
     }
 }

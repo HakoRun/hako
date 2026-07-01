@@ -117,6 +117,7 @@ fn run_host_on_host(ctx: &Ctx<'_>, path: &str, command: Vec<String>) -> io::Resu
             host: PathBuf::from(d),
             container: (*d).to_string(),
             readonly: true,
+            mask: Vec::new(),
         })
         .collect();
     push_bin_dir(&mut volumes, path);
@@ -184,6 +185,7 @@ fn push_bin_dir(volumes: &mut Vec<VolumeMount>, path: &str) {
             host,
             container,
             readonly: true,
+            mask: Vec::new(),
         });
     }
 }
@@ -382,6 +384,11 @@ fn build_volumes(
             host: ctx.workdir.to_path_buf(),
             container: "/workspace".into(),
             readonly: false,
+            // Hide the workspace's own .hako/ (store + refs + identity key) from
+            // the workload — the implicit mount is the workspace root, so without
+            // this the container could read the store/key and, since this is a
+            // real host mount, delete or rewrite the host repo. See issue #39.
+            mask: vec![DOT_HAKO.to_string()],
         });
         all.append(&mut user_volumes);
         return Ok(all);

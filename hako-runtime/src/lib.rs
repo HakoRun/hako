@@ -38,11 +38,18 @@ use std::path::PathBuf;
 /// containerized rootfs after the standard mounts but before `pivot_root`,
 /// honoring `readonly`. On non-Linux, the field is accepted but ignored
 /// (the stub returns `UnsupportedPlatform` anyway).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct VolumeMount {
     pub host: PathBuf,
     pub container: String,
     pub readonly: bool,
+    /// Sub-paths (relative to `container`) to shadow with an empty read-only
+    /// tmpfs immediately after the bind mount, hiding host content the workload
+    /// must not see or modify through this mount. Used to keep the implicit
+    /// `/workspace` mount from exposing the workspace's own `.hako/` store,
+    /// refs, and (cluster builds) identity key. Empty for user `-v` mounts —
+    /// an explicit bind is the caller's choice.
+    pub mask: Vec<String>,
 }
 
 impl VolumeMount {
@@ -73,6 +80,7 @@ impl VolumeMount {
             host: PathBuf::from(parts[0]),
             container: parts[1].into(),
             readonly,
+            mask: Vec::new(),
         })
     }
 }
