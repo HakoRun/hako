@@ -142,7 +142,14 @@ pub fn switch_identity(ctx: &Ctx<'_>, branch: String) -> io::Result<ExitCode> {
                 format!("no container {} and not a valid image ref: {}", branch, e),
             )
         })?;
-        super::oci::pull_into(ctx.state, &image_ref, &branch, "linux", "amd64", false)?;
+        super::oci::pull_into(
+            ctx.state,
+            &image_ref,
+            &branch,
+            "linux",
+            super::oci::host_oci_arch(),
+            false,
+        )?;
     }
     let new_session = Session {
         container: branch.clone(),

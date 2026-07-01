@@ -205,7 +205,14 @@ fn resolve_auto_container(ctx: &Ctx<'_>, path: &str) -> io::Result<String> {
         let image_ref = hako::ImageRef::parse(image).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidInput, format!("bad image ref: {}", e))
         })?;
-        crate::cmd::oci::pull_into(ctx.state, &image_ref, distro, "linux", "amd64", false)?;
+        crate::cmd::oci::pull_into(
+            ctx.state,
+            &image_ref,
+            distro,
+            "linux",
+            crate::cmd::oci::host_oci_arch(),
+            false,
+        )?;
     }
     Ok(distro.to_string())
 }

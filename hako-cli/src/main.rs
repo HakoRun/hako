@@ -130,8 +130,9 @@ enum Cmd {
     Commit {
         #[arg(short = 'm', long)]
         message: String,
-        #[arg(short = 'a', long, default_value = "user")]
-        author: String,
+        /// Commit author (default: $HAKO_AUTHOR, else "user")
+        #[arg(short = 'a', long)]
+        author: Option<String>,
     },
     /// Show commit history
     Log,
@@ -151,8 +152,9 @@ enum Cmd {
     /// Merge another branch into the current one (or --abort to reset working to HEAD)
     Merge {
         branch: Option<String>,
-        #[arg(short = 'a', long, default_value = "user")]
-        author: String,
+        /// Commit author (default: $HAKO_AUTHOR, else "user")
+        #[arg(short = 'a', long)]
+        author: Option<String>,
         #[arg(long)]
         abort: bool,
     },
@@ -175,8 +177,10 @@ enum Cmd {
     Fetch {
         remote: PathBuf,
         branch: String,
+        /// Name for the local ref to create/update (default: the branch name)
         #[arg(long)]
         as_ref: Option<String>,
+        /// Remote container to fetch the branch from (default: the local default container)
         #[arg(long)]
         from_container: Option<String>,
     },
@@ -184,8 +188,10 @@ enum Cmd {
     Push {
         remote: PathBuf,
         branch: String,
+        /// Name of the ref to update on the remote (default: the branch name)
         #[arg(long)]
         as_ref: Option<String>,
+        /// Remote container to push into (default: the local default container)
         #[arg(long)]
         to_container: Option<String>,
     },
@@ -245,7 +251,8 @@ enum Cmd {
         per_layer: bool,
         #[arg(long, default_value = "linux")]
         os: String,
-        #[arg(long, default_value = "amd64")]
+        /// OCI architecture (default: the host's — amd64 on x86_64, arm64 on aarch64)
+        #[arg(long, default_value_t = cmd::oci::host_oci_arch().to_string())]
         arch: String,
     },
 
@@ -713,7 +720,14 @@ fn run() -> io::Result<ExitCode> {
                         format!("no container {} and not a valid image ref: {}", explicit, e),
                     )
                 })?;
-                cmd::oci::pull_into(&state, &image_ref, explicit, "linux", "amd64", false)?;
+                cmd::oci::pull_into(
+                    &state,
+                    &image_ref,
+                    explicit,
+                    "linux",
+                    cmd::oci::host_oci_arch(),
+                    false,
+                )?;
             }
         }
     }
