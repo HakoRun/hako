@@ -412,6 +412,49 @@ pub fn create(
 mod tests {
     use super::*;
 
+    /// `[prefix][payload][magic(8)][payload_len: u64 LE]` — the on-disk bundle layout.
+    fn write_bundle(path: &Path, prefix: &[u8], payload: &[u8]) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(prefix);
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(TRAILER_MAGIC);
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    #[test]
+    fn appended_payload_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fakehako");
+        let payload = b"my bundle payload bytes";
+        write_bundle(&path, b"ELF...pretend binary...", payload);
+        assert_eq!(
+            read_appended_payload(&path).unwrap().as_deref(),
+            Some(&payload[..])
+        );
+    }
+
+    #[test]
+    fn no_trailer_reads_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain");
+        std::fs::write(&path, b"a normal binary, no trailer").unwrap();
+        assert!(read_appended_payload(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn bogus_payload_len_reads_as_none() {
+        // Magic present but the declared payload length overruns the file: reject
+        // (guards the byte-offset arithmetic against a corrupt/forged trailer).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad");
+        let mut bytes = b"short".to_vec();
+        bytes.extend_from_slice(TRAILER_MAGIC);
+        bytes.extend_from_slice(&9_999_999u64.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(read_appended_payload(&path).unwrap().is_none());
+    }
+
     #[test]
     fn is_safe_relative_cases() {
         assert!(is_safe_relative(Path::new("a/b/c")));

@@ -83,6 +83,18 @@ use std::sync::Arc;
 /// so it doesn't leak into other processes.
 const MOUNTPOINT: &str = "/tmp/hako-transform";
 
+/// Map a finished child's `WaitStatus` to a conventional process exit code: its
+/// own code if it exited, `128 + signal` if a signal killed it, else 0.
+/// Extracted from seven byte-identical inline matches across the fork ladders so
+/// the two (RO/RW) paths can't drift on how they report exit status.
+fn wait_to_exit_code(status: WaitStatus) -> i32 {
+    match status {
+        WaitStatus::Exited(_, code) => code,
+        WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
+        _ => 0,
+    }
+}
+
 // ============================================================================
 // Public API (Linux)
 // ============================================================================
@@ -284,11 +296,7 @@ pub fn exec_in_instance(
     ];
 
     match unsafe { fork() }.map_err(|e| io_other(format!("fork: {}", e)))? {
-        ForkResult::Parent { child } => wait_for_child(child).map(|s| match s {
-            WaitStatus::Exited(_, code) => code,
-            WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
-            _ => 0,
-        }),
+        ForkResult::Parent { child } => wait_for_child(child).map(wait_to_exit_code),
         ForkResult::Child => {
             let code = enter_and_exec(&ns_order, command).unwrap_or_else(|e| {
                 eprintln!("hako exec: {}", e);
@@ -310,11 +318,7 @@ fn enter_and_exec(
         setns(file.as_fd(), *flag).map_err(|e| io_other(format!("setns {:?}: {}", flag, e)))?;
     }
     match unsafe { fork() }.map_err(|e| io_other(format!("exec fork: {}", e)))? {
-        ForkResult::Parent { child } => wait_for_child(child).map(|s| match s {
-            WaitStatus::Exited(_, code) => code,
-            WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
-            _ => 0,
-        }),
+        ForkResult::Parent { child } => wait_for_child(child).map(wait_to_exit_code),
         ForkResult::Child => {
             // cwd from the host may not exist in the container's mount ns.
             env::set_current_dir("/")?;
@@ -377,11 +381,7 @@ fn run_outer(
     // Fork to escape the parent process; this also keeps the parent's
     // resources untouched if the child crashes during namespace setup.
     match unsafe { fork() }.map_err(|e| io_other(format!("fork: {}", e)))? {
-        ForkResult::Parent { child } => wait_for_child(child).map(|s| match s {
-            WaitStatus::Exited(_, code) => code,
-            WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
-            _ => 0,
-        }),
+        ForkResult::Parent { child } => wait_for_child(child).map(wait_to_exit_code),
         ForkResult::Child => {
             let code = run_inner(store, root, command, detached, detached_state, volumes)
                 .unwrap_or_else(|e| {
@@ -478,11 +478,7 @@ fn run_fuse_server(
     // Wait for the command process to exit.
     let status = wait_for_child(child)?;
 
-    let exit_code = match status {
-        WaitStatus::Exited(_, code) => code,
-        WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
-        _ => 0,
-    };
+    let exit_code = wait_to_exit_code(status);
 
     // Record the exit code for detached instances, even if the inner process
     // wrote one — this is the authoritative source.
@@ -520,11 +516,7 @@ fn run_outer_rw(
             // Close the write end in the parent so EOF arrives if the child dies.
             drop(write_fd);
             let status = wait_for_child(child)?;
-            let exit_code = match status {
-                WaitStatus::Exited(_, code) => code,
-                WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
-                _ => 0,
-            };
+            let exit_code = wait_to_exit_code(status);
             // Read the final root the inner supervisor wrote before exiting.
             // 32 bytes of hash, then we trust the exit code we already have.
             let mut buf = [0u8; 32];
@@ -619,11 +611,7 @@ fn run_fuse_server_rw(
     drop(sock);
 
     let status = wait_for_child(child)?;
-    let exit_code = match status {
-        WaitStatus::Exited(_, code) => code,
-        WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
-        _ => 0,
-    };
+    let exit_code = wait_to_exit_code(status);
 
     // Write the post-exec root to the outer parent over the pipe BEFORE
     // dropping the session (so the chunk store still has everything).
@@ -690,11 +678,7 @@ fn run_command_setup(
             // exits, then dropped to remove the now-empty cgroup.
             let _cgroup = crate::cgroup::apply(child.as_raw(), &crate::cgroup::Limits::from_env());
             let status = wait_for_child(child)?;
-            Ok(match status {
-                WaitStatus::Exited(_, code) => code,
-                WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
-                _ => 0,
-            })
+            Ok(wait_to_exit_code(status))
         }
         ForkResult::Child => {
             // PID 1 of the container's PID namespace. Never returns on success.
