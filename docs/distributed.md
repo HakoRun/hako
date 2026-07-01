@@ -105,6 +105,13 @@ the Noise layer lands, `hako serve` therefore **defaults to loopback** and refus
 a routable bind unless you pass `--allow-remote` (intended for a trusted LAN/VPN,
 and it warns). Treat `--allow-remote` over the open internet as unsafe.
 
+Two further interim gates shrink the per-peer blast radius until Noise lands:
+peer-triggered command execution (`ctl "run …"`) is refused unless the node is
+started with `--allow-remote-run` (off by default), and remote ref updates
+(`sync_ref`) are **fast-forward-only**, so a registered peer cannot force-rewrite
+a branch's history. Replication and the version-control `ctl` verbs
+(commit/branch/tag) stay available without the flag.
+
 ## Known wrinkles (found while reviewing the code)
 
 - **`ctl` runtime verbs ride inside `write`.** `run`/`stop` via `ctl` are runtime

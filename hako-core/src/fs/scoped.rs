@@ -372,6 +372,12 @@ impl<'s> ScopedFs<'s> {
     /// is a file or symlink. This stops the user from writing `/a/b` while
     /// `/a` is a file, which would otherwise leave `/a` and `/a/b` coexisting
     /// invisibly.
+    ///
+    /// Intentional OCI consequence (issue #43): if one image layer makes `/a` a
+    /// symlink and a later layer writes `/a/b`, the write is rejected rather than
+    /// resolved *through* the symlink. Following writes through a symlinked
+    /// ancestor is the classic tar-symlink escape, so refusing it is the safe
+    /// choice; well-formed images write to real paths, so this is rarely hit.
     fn reject_file_ancestor(&self, root: &Hash, key: &str) -> io::Result<()> {
         let mut start = 0;
         while let Some(off) = key[start..].find('/') {
