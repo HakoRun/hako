@@ -360,6 +360,24 @@ fn sync_ref(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
         ctx.state.create_container(container)?;
     }
     let repo = ctx.state.open_container(container)?;
+    // Fast-forward-only: a peer may only advance an existing branch to a commit
+    // that descends from its current tip. Without this, any registered peer could
+    // force-overwrite `main` (or any ref) to an arbitrary commit and rewrite the
+    // node's history. A brand-new branch (no current tip) is always allowed, as is
+    // a no-op re-push of the same commit. See issue #40.
+    if let Some(existing) = repo.read_ref(branch)? {
+        if existing != commit && repo.common_ancestor(existing, commit)? != Some(existing) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing non-fast-forward update to {container}:{branch} \
+                     (current tip {} is not an ancestor of {})",
+                    &hex(&existing.0)[..12],
+                    &hex(&commit.0)[..12]
+                ),
+            ));
+        }
+    }
     repo.write_ref(branch, commit)?;
     Ok(format!("updated {container}:{branch} -> {}", &hex(&commit.0)[..12]).into_bytes())
 }
@@ -693,6 +711,51 @@ mod tests {
             decode_hashes(&[0u8; 5]).is_err(),
             "non-multiple of 32 rejected"
         );
+    }
+
+    #[test]
+    fn sync_ref_is_fast_forward_only() {
+        use hako::{Config, Hash, Session, State};
+
+        let d = tempfile::tempdir().unwrap();
+        let state = State::init(&d.path().join(crate::DOT_HAKO)).unwrap();
+        // Build a base commit, a fast-forward descendant, and an unrelated commit.
+        let repo = state.open_container("hako").unwrap();
+        let t = repo.working_tree().unwrap();
+        let base = repo.commit(t, vec![], "u", "base", 1).unwrap();
+        let ff = repo.commit(t, vec![base], "u", "ff", 2).unwrap();
+        let diverged = repo.commit(t, vec![], "u", "x", 3).unwrap();
+        repo.write_ref("main", base).unwrap();
+        drop(repo);
+
+        let session = Session::default();
+        let cfg = Config::default();
+        let ctx = Ctx {
+            state: &state,
+            session: &session,
+            default_container: "hako",
+            workdir: d.path(),
+            cfg: &cfg,
+        };
+        let enc = |commit: Hash| {
+            let mut p = Vec::new();
+            p.extend_from_slice(&4u32.to_be_bytes());
+            p.extend_from_slice(b"hako");
+            p.extend_from_slice(&4u32.to_be_bytes());
+            p.extend_from_slice(b"main");
+            p.extend_from_slice(&commit.0);
+            p
+        };
+        let tip = || state.open_container("hako").unwrap().read_ref("main").unwrap();
+
+        // A non-fast-forward (unrelated) update is refused and leaves the ref put.
+        let err = sync_ref(&ctx, &enc(diverged)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(tip(), Some(base), "ref must not move on a rejected update");
+
+        // A genuine fast-forward is accepted and advances the ref.
+        sync_ref(&ctx, &enc(ff)).unwrap();
+        assert_eq!(tip(), Some(ff));
     }
 
     #[test]
