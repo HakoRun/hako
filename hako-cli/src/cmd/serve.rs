@@ -746,7 +746,13 @@ mod tests {
             p.extend_from_slice(&commit.0);
             p
         };
-        let tip = || state.open_container("hako").unwrap().read_ref("main").unwrap();
+        let tip = || {
+            state
+                .open_container("hako")
+                .unwrap()
+                .read_ref("main")
+                .unwrap()
+        };
 
         // A non-fast-forward (unrelated) update is refused and leaves the ref put.
         let err = sync_ref(&ctx, &enc(diverged)).unwrap_err();
