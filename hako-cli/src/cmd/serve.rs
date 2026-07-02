@@ -846,4 +846,156 @@ mod tests {
             "a length past the end is rejected"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // Two-node integration: real loopback TCP through the full handshake +
+    // wire protocol (docs/distributed.md flagged this as the missing coverage
+    // for phases 2–3). Each test wires a server node and a client node, mutually
+    // registered, and drives one connection. `handle_peer` returns when the
+    // client disconnects, so a single `accept()` serves a whole exchange.
+    // ---------------------------------------------------------------------
+
+    /// A test node: an initialized workspace plus its persisted identity.
+    fn setup_node() -> (tempfile::TempDir, hako::State, identity::Identity) {
+        let d = tempfile::tempdir().unwrap();
+        let state = hako::State::init(&d.path().join(crate::DOT_HAKO)).unwrap();
+        let id =
+            identity::load_or_create_at(&d.path().join(crate::DOT_HAKO).join("identity")).unwrap();
+        (d, state, id)
+    }
+
+    fn ctx<'a>(
+        state: &'a hako::State,
+        session: &'a hako::Session,
+        cfg: &'a hako::Config,
+        container: &'a str,
+        workdir: &'a std::path::Path,
+    ) -> Ctx<'a> {
+        Ctx {
+            state,
+            session,
+            default_container: container,
+            workdir,
+            cfg,
+        }
+    }
+
+    #[test]
+    fn two_node_push_replicates_a_branch() {
+        use hako::{Config, ScopedFs, Session};
+
+        let (a_dir, a_state, a_id) = setup_node(); // server
+        let (b_dir, b_state, b_id) = setup_node(); // client
+
+        // Client builds a fresh container with a commit to replicate. A new
+        // container name the server lacks avoids any ref divergence — the push
+        // creates it fresh on the server.
+        let repo = b_state.create_container("app").unwrap();
+        let base = repo.working_tree().unwrap();
+        let tree = ScopedFs::new(repo.store())
+            .write_file(&base, "hello.txt", b"from client")
+            .unwrap();
+        let commit = repo.commit(tree, vec![], "b", "add hello", 1).unwrap();
+        repo.write_ref("main", commit).unwrap();
+        drop(repo);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let (a_sess, a_cfg) = (Session::default(), Config::default());
+        let a_ctx = ctx(&a_state, &a_sess, &a_cfg, "hako", a_dir.path());
+        let (b_sess, b_cfg) = (Session::default(), Config::default());
+        let b_ctx = ctx(&b_state, &b_sess, &b_cfg, "app", b_dir.path());
+
+        // Mutual registration: server authorizes the client's key; client knows
+        // the server's address + key.
+        peers::add(&a_ctx, "client".into(), "unused".into(), b_id.node_id()).unwrap();
+        peers::add(&b_ctx, "server".into(), addr, a_id.node_id()).unwrap();
+
+        std::thread::scope(|s| {
+            let server = s.spawn(|| {
+                let (mut stream, _) = listener.accept().unwrap();
+                handle_peer(&mut stream, &a_id, &a_ctx, false)
+            });
+            let rc = remote_push(&b_ctx, "server", "main");
+            assert!(rc.is_ok(), "push failed: {rc:?}");
+            server.join().unwrap().expect("server handled the peer");
+        });
+
+        // The server now has the replicated container, ref, and objects.
+        let a_repo = a_state.open_container("app").expect("server created 'app'");
+        assert_eq!(a_repo.read_ref("main").unwrap(), Some(commit));
+        let t = a_repo.load_commit(&commit).unwrap().tree;
+        assert_eq!(
+            ScopedFs::new(a_repo.store())
+                .read_file(&t, "hello.txt")
+                .unwrap(),
+            b"from client"
+        );
+    }
+
+    #[test]
+    fn two_node_remote_cat_reads_status() {
+        use hako::{Config, Session};
+
+        let (a_dir, a_state, a_id) = setup_node(); // server (has the seeded "hako")
+        let (b_dir, b_state, b_id) = setup_node(); // client
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let (a_sess, a_cfg) = (Session::default(), Config::default());
+        let a_ctx = ctx(&a_state, &a_sess, &a_cfg, "hako", a_dir.path());
+        let (b_sess, b_cfg) = (Session::default(), Config::default());
+        let b_ctx = ctx(&b_state, &b_sess, &b_cfg, "hako", b_dir.path());
+
+        peers::add(&a_ctx, "client".into(), "unused".into(), b_id.node_id()).unwrap();
+        peers::add(&b_ctx, "server".into(), addr, a_id.node_id()).unwrap();
+
+        std::thread::scope(|s| {
+            let server = s.spawn(|| {
+                let (mut stream, _) = listener.accept().unwrap();
+                handle_peer(&mut stream, &a_id, &a_ctx, false)
+            });
+            // Reads the server's own container status over the authenticated wire.
+            let rc = remote_cat(&b_ctx, "server/containers/hako/status");
+            assert!(rc.is_ok(), "remote_cat failed: {rc:?}");
+            server.join().unwrap().expect("server handled the peer");
+        });
+    }
+
+    #[test]
+    fn two_node_remote_run_refused_when_gate_off() {
+        use hako::{Config, Session};
+
+        let (a_dir, a_state, a_id) = setup_node(); // server
+        let (b_dir, b_state, b_id) = setup_node(); // client
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let (a_sess, a_cfg) = (Session::default(), Config::default());
+        let a_ctx = ctx(&a_state, &a_sess, &a_cfg, "hako", a_dir.path());
+        let (b_sess, b_cfg) = (Session::default(), Config::default());
+        let b_ctx = ctx(&b_state, &b_sess, &b_cfg, "hako", b_dir.path());
+
+        peers::add(&a_ctx, "client".into(), "unused".into(), b_id.node_id()).unwrap();
+        peers::add(&b_ctx, "server".into(), addr, a_id.node_id()).unwrap();
+
+        std::thread::scope(|s| {
+            // Server started WITHOUT --allow-remote-run (the false arg).
+            let server = s.spawn(|| {
+                let (mut stream, _) = listener.accept().unwrap();
+                handle_peer(&mut stream, &a_id, &a_ctx, false)
+            });
+            let rc = remote_write(&b_ctx, "server/containers/hako/ctl", b"run echo hi");
+            let err = rc.expect_err("remote `ctl run` must be refused when the gate is off");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("disabled") || msg.contains("allow-remote-run"),
+                "unexpected refusal message: {msg}"
+            );
+            server.join().unwrap().expect("server handled the peer");
+        });
+    }
 }
