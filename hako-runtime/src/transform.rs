@@ -73,7 +73,7 @@ use nix::unistd::{fork, getgid, getuid, pivot_root, setsid, ForkResult, Gid, Pid
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -109,7 +109,17 @@ pub fn become_container(
     volumes: &[VolumeMount],
 ) -> Result<i32, RuntimeError> {
     let (store, root) = resolve_branch(repo, branch)?;
-    run_outer(store, root, None, false, None, volumes.to_vec())
+    run_outer(
+        store,
+        root,
+        None,
+        false,
+        None,
+        volumes.to_vec(),
+        true,
+        false,
+    )
+    .map(|(code, _)| code)
 }
 
 /// Run `command` inside the container at `branch`. Blocks until the command
@@ -124,7 +134,17 @@ pub fn run_container(
         return Err(RuntimeError::Other("command is empty".into()));
     }
     let (store, root) = resolve_branch(repo, branch)?;
-    run_outer(store, root, Some(command), false, None, volumes.to_vec())
+    run_outer(
+        store,
+        root,
+        Some(command),
+        false,
+        None,
+        volumes.to_vec(),
+        true,
+        false,
+    )
+    .map(|(code, _)| code)
 }
 
 /// Run `command` inside the container at `branch` with a **writable** FUSE
@@ -156,7 +176,16 @@ pub fn run_container_rw(
         return Err(RuntimeError::Other("command is empty".into()));
     }
     let (store, root) = resolve_branch(repo, branch)?;
-    run_outer_rw(store, root, command, volumes.to_vec())
+    run_outer(
+        store,
+        root,
+        Some(command),
+        false,
+        None,
+        volumes.to_vec(),
+        false,
+        true,
+    )
 }
 
 /// Spawn `command` (or the user's shell) inside the container at `branch`,
@@ -227,6 +256,8 @@ pub fn run_container_detached(
                 true,
                 Some((workdir.clone(), id.clone())),
                 volumes_owned,
+                true,
+                None,
             ) {
                 Ok(code) => code,
                 Err(e) => {
@@ -370,47 +401,14 @@ fn resolve_branch(
     Ok((store, tree_root))
 }
 
-fn run_outer(
-    store: Arc<dyn ChunkStore + Send + Sync + 'static>,
-    root: Hash,
-    command: Option<Vec<String>>,
-    detached: bool,
-    detached_state: Option<(PathBuf, String)>,
-    volumes: Vec<VolumeMount>,
-) -> Result<i32, RuntimeError> {
-    // Fork to escape the parent process; this also keeps the parent's
-    // resources untouched if the child crashes during namespace setup.
-    match unsafe { fork() }.map_err(|e| io_other(format!("fork: {}", e)))? {
-        ForkResult::Parent { child } => wait_for_child(child).map(wait_to_exit_code),
-        ForkResult::Child => {
-            let code = run_inner(store, root, command, detached, detached_state, volumes)
-                .unwrap_or_else(|e| {
-                    eprintln!("hako runtime: {}", e);
-                    1
-                });
-            std::process::exit(code);
-        }
-    }
-}
-
-/// Inner: unshare, set up uid/gid maps, fork into FUSE server + command setup.
-/// Returns the command's exit code, or an error on setup failure.
-fn run_inner(
-    store: Arc<dyn ChunkStore + Send + Sync + 'static>,
-    root: Hash,
-    command: Option<Vec<String>>,
-    detached: bool,
-    detached_state: Option<(PathBuf, String)>,
-    volumes: Vec<VolumeMount>,
-) -> Result<i32, RuntimeError> {
+/// Isolation setup shared by every runtime entry point: enter the user + mount +
+/// IPC + UTS namespaces and install the single-uid mapping (container uid 0 → the
+/// calling user). Network is isolated later, per-command, in `run_command_setup`.
+/// Extracted so the `run` (RO) and `apply` (RW) paths can never drift on this
+/// security-critical mapping.
+fn setup_userns() -> Result<(), RuntimeError> {
     let uid = getuid();
     let gid = getgid();
-
-    // `run` is the running-container boundary: isolate IPC + UTS alongside
-    // user + mount. Network is isolated later, per-command, in
-    // run_command_setup (doing it here breaks fusermount3's FUSE mount).
-    // PID-namespace isolation (a fresh procfs) is Increment 2 — it needs a
-    // fork-to-PID-1 restructure (CLONE_NEWPID here breaks the FUSE thread spawn).
     unshare(
         CloneFlags::CLONE_NEWUSER
             | CloneFlags::CLONE_NEWNS
@@ -418,56 +416,162 @@ fn run_inner(
             | CloneFlags::CLONE_NEWUTS,
     )
     .map_err(|e| io_other(format!("unshare: {}", e)))?;
-
     fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid))?;
     fs::write("/proc/self/setgroups", "deny\n")?;
     fs::write("/proc/self/gid_map", format!("0 {} 1\n", gid))?;
+    Ok(())
+}
+
+/// Outer process: fork so the caller returns after the container exits, then run
+/// the inner supervisor. `net_isolated` picks `run`'s empty netns vs `apply`'s
+/// host network. When `capture` is set (the `apply`/RW path), a pipe carries the
+/// container's final tree root back from the FUSE server so the caller can commit
+/// it; otherwise the returned root is just the initial one (ignored by `run`).
+#[allow(clippy::too_many_arguments)]
+fn run_outer(
+    store: Arc<dyn ChunkStore + Send + Sync + 'static>,
+    root: Hash,
+    command: Option<Vec<String>>,
+    detached: bool,
+    detached_state: Option<(PathBuf, String)>,
+    volumes: Vec<VolumeMount>,
+    net_isolated: bool,
+    capture: bool,
+) -> Result<(i32, Hash), RuntimeError> {
+    use nix::unistd::pipe;
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+
+    // Only the RW path needs the post-exec root; skip the pipe otherwise.
+    let pipe_pair: Option<(OwnedFd, OwnedFd)> = if capture {
+        Some(pipe().map_err(|e| io_other(format!("pipe: {}", e)))?)
+    } else {
+        None
+    };
+
+    // Fork to escape the parent process; this also keeps the parent's resources
+    // untouched if the child crashes during namespace setup.
+    match unsafe { fork() }.map_err(|e| io_other(format!("fork: {}", e)))? {
+        ForkResult::Parent { child } => {
+            // Keep the read end; close the write end so `read` sees EOF if the
+            // child dies before writing.
+            let read_fd = pipe_pair.map(|(r, w)| {
+                drop(w);
+                r
+            });
+            let status = wait_for_child(child)?;
+            let exit_code = wait_to_exit_code(status);
+            let final_root = match read_fd {
+                Some(r) => {
+                    let mut buf = [0u8; 32];
+                    let mut f = unsafe { fs::File::from_raw_fd(r.into_raw_fd()) };
+                    match f.read_exact(&mut buf) {
+                        Ok(()) => Hash(buf),
+                        // Child died before writing — nothing was committed.
+                        Err(_) => root,
+                    }
+                }
+                None => root,
+            };
+            Ok((exit_code, final_root))
+        }
+        ForkResult::Child => {
+            // Keep the write end (handed to the FUSE server via run_inner); close
+            // the read end.
+            let capture_pipe = pipe_pair.map(|(r, w)| {
+                drop(r);
+                w.into_raw_fd()
+            });
+            let code = run_inner(
+                store,
+                root,
+                command,
+                detached,
+                detached_state,
+                volumes,
+                net_isolated,
+                capture_pipe,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("hako runtime: {}", e);
+                1
+            });
+            std::process::exit(code);
+        }
+    }
+}
+
+/// Inner supervisor: enter the namespaces (`setup_userns`), then fork into the
+/// FUSE server and the command-setup process. Returns the command's exit code, or
+/// an error on setup failure. `net_isolated` picks the netns policy and
+/// `capture_pipe` (Some for `apply`/RW) is where the FUSE server sends the final
+/// tree root — both are just threaded through to their consumers.
+///
+/// (PID-namespace isolation happens later, in `run_command_setup`: `CLONE_NEWPID`
+/// here would break the FUSE server thread spawn.)
+#[allow(clippy::too_many_arguments)]
+fn run_inner(
+    store: Arc<dyn ChunkStore + Send + Sync + 'static>,
+    root: Hash,
+    command: Option<Vec<String>>,
+    detached: bool,
+    detached_state: Option<(PathBuf, String)>,
+    volumes: Vec<VolumeMount>,
+    net_isolated: bool,
+    capture_pipe: Option<RawFd>,
+) -> Result<i32, RuntimeError> {
+    setup_userns()?;
 
     let (fuse_sock, shell_sock) =
         UnixStream::pair().map_err(|e| io_other(format!("socketpair: {}", e)))?;
-
     fs::create_dir_all(MOUNTPOINT)?;
 
     match unsafe { fork() }.map_err(|e| io_other(format!("inner fork: {}", e)))? {
         ForkResult::Child => {
             drop(fuse_sock);
+            // The capture pipe belongs to the FUSE server; the workload must never
+            // inherit it.
+            if let Some(fd) = capture_pipe {
+                let _ = nix::unistd::close(fd);
+            }
             run_command_setup(
                 shell_sock,
                 command,
                 detached,
                 detached_state.as_ref(),
                 &volumes,
-                true, // net_isolated: `run` has no network by default
+                net_isolated,
             )
         }
         ForkResult::Parent { child } => {
             drop(shell_sock);
-            run_fuse_server(store, root, fuse_sock, child, detached_state)
+            run_fuse_server(store, root, fuse_sock, child, detached_state, capture_pipe)
         }
     }
 }
 
-/// FUSE-server side: mount FUSE in a background thread, signal command setup,
-/// wait for command setup to exit, exit with its status.
+/// FUSE-server side: mount the tree read-write in a background thread, signal
+/// command-setup that it's ready, wait for the container to exit, and return its
+/// status. Two optional tails: for a detached instance it records the
+/// authoritative exit code; for the `apply`/RW path (`capture_pipe` is Some) it
+/// sends the post-exec tree root back to the outer process.
 fn run_fuse_server(
     store: Arc<dyn ChunkStore + Send + Sync + 'static>,
     root: Hash,
     sync_sock: UnixStream,
     child: Pid,
     detached_state: Option<(PathBuf, String)>,
+    capture_pipe: Option<RawFd>,
 ) -> Result<i32, RuntimeError> {
-    // Mount FUSE in the background, READ-WRITE so the container has a writable
-    // root: it can create mountpoints (e.g. /workspace) and write ephemeral
-    // scratch. Writes flow into the content-addressed store as new objects but
-    // are never committed for `run` (we don't read `current_root()`), so they're
-    // discarded — `docker run`-style ephemerality. The session handle keeps the
-    // mount live; dropping it (at return / process exit) unmounts.
-    let _session = hako::fuse::mount_session_rw(store, root, Path::new(MOUNTPOINT))
-        .map_err(|e| io_other(format!("mount FUSE rw: {}", e)))?;
+    use std::os::fd::FromRawFd;
 
-    // (Detachment from the controlling terminal is handled earlier, in the
-    // detached supervisor before the inner fork, so the whole tree — not just
-    // this FUSE server — leaves the launching shell's session. See issue #17.)
+    // Mount FUSE READ-WRITE so the container has a writable root (mountpoints,
+    // ephemeral scratch). For `run` the writes are never read back, so they're
+    // discarded — `docker run`-style ephemerality; for `apply` the final root is
+    // captured below. The session handle keeps the mount live; dropping it
+    // unmounts. (Terminal detachment is handled earlier, before the inner fork,
+    // so the whole tree leaves the launching shell's session — issue #17.)
+    let session = hako::fuse::mount_session_rw(store, root, Path::new(MOUNTPOINT))
+        .map_err(|e| io_other(format!("mount FUSE rw: {}", e)))?;
 
     // Signal the command-setup process that the mount is ready.
     let mut sock = sync_sock;
@@ -477,151 +581,23 @@ fn run_fuse_server(
 
     // Wait for the command process to exit.
     let status = wait_for_child(child)?;
-
     let exit_code = wait_to_exit_code(status);
 
-    // Record the exit code for detached instances, even if the inner process
-    // wrote one — this is the authoritative source.
-    if let Some((workdir, id)) = detached_state {
-        let _ = instances::write_exit_code(&workdir, &id, exit_code);
+    // Detached instances: record the authoritative exit code.
+    if let Some((workdir, id)) = &detached_state {
+        let _ = instances::write_exit_code(workdir, id, exit_code);
     }
 
-    // Drop the session here so the mount is cleanly unmounted before exit.
-    drop(_session);
-    Ok(exit_code)
-}
-
-// ============================================================================
-// RW round-trip — used by `hako apply` to capture mutations setup commands
-// make to the container's tree.
-// ============================================================================
-
-/// Outer process for the RW path. Forks an inner supervisor, waits for it to
-/// exit, then reads the (32-byte root || 4-byte exit-code) tail it wrote
-/// down a pipe just before exiting.
-fn run_outer_rw(
-    store: Arc<dyn ChunkStore + Send + Sync + 'static>,
-    initial_root: Hash,
-    command: Vec<String>,
-    volumes: Vec<VolumeMount>,
-) -> Result<(i32, Hash), RuntimeError> {
-    use nix::unistd::pipe;
-    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-
-    let (read_fd, write_fd): (OwnedFd, OwnedFd) =
-        pipe().map_err(|e| io_other(format!("pipe: {}", e)))?;
-
-    match unsafe { fork() }.map_err(|e| io_other(format!("fork: {}", e)))? {
-        ForkResult::Parent { child } => {
-            // Close the write end in the parent so EOF arrives if the child dies.
-            drop(write_fd);
-            let status = wait_for_child(child)?;
-            let exit_code = wait_to_exit_code(status);
-            // Read the final root the inner supervisor wrote before exiting.
-            // 32 bytes of hash, then we trust the exit code we already have.
-            let mut buf = [0u8; 32];
-            let mut f = unsafe { fs::File::from_raw_fd(read_fd.into_raw_fd()) };
-            match f.read_exact(&mut buf) {
-                Ok(()) => Ok((exit_code, Hash(buf))),
-                Err(_) => {
-                    // Child died before writing — return initial root with the
-                    // exit code so the caller knows nothing was committed.
-                    Ok((exit_code, initial_root))
-                }
-            }
-        }
-        ForkResult::Child => {
-            drop(read_fd);
-            let result = run_inner_rw(store, initial_root, command, volumes, write_fd.as_raw_fd());
-            let exit = match result {
-                Ok(code) => code,
-                Err(e) => {
-                    eprintln!("hako runtime (rw): {}", e);
-                    1
-                }
-            };
-            // write_fd was already consumed in run_inner_rw; just exit.
-            std::process::exit(exit);
-        }
-    }
-}
-
-fn run_inner_rw(
-    store: Arc<dyn ChunkStore + Send + Sync + 'static>,
-    root: Hash,
-    command: Vec<String>,
-    volumes: Vec<VolumeMount>,
-    outer_pipe_fd: std::os::fd::RawFd,
-) -> Result<i32, RuntimeError> {
-    let uid = getuid();
-    let gid = getgid();
-
-    // `apply` is the build phase: isolate IPC + UTS but keep host network so
-    // setup steps (pip/apk/apt …) can reach the internet. Network isolation for
-    // builds is opt-in (a future `--no-network`).
-    unshare(
-        CloneFlags::CLONE_NEWUSER
-            | CloneFlags::CLONE_NEWNS
-            | CloneFlags::CLONE_NEWIPC
-            | CloneFlags::CLONE_NEWUTS,
-    )
-    .map_err(|e| io_other(format!("unshare: {}", e)))?;
-
-    fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid))?;
-    fs::write("/proc/self/setgroups", "deny\n")?;
-    fs::write("/proc/self/gid_map", format!("0 {} 1\n", gid))?;
-
-    let (fuse_sock, shell_sock) =
-        UnixStream::pair().map_err(|e| io_other(format!("socketpair: {}", e)))?;
-    fs::create_dir_all(MOUNTPOINT)?;
-
-    match unsafe { fork() }.map_err(|e| io_other(format!("inner fork: {}", e)))? {
-        ForkResult::Child => {
-            // Command-setup process — same path as the RO flow.
-            drop(fuse_sock);
-            // The pipe to outer is for the FUSE server only.
-            let _ = nix::unistd::close(outer_pipe_fd);
-            run_command_setup(shell_sock, Some(command), false, None, &volumes, false)
-        }
-        ForkResult::Parent { child } => {
-            drop(shell_sock);
-            run_fuse_server_rw(store, root, fuse_sock, child, outer_pipe_fd)
-        }
-    }
-}
-
-/// FUSE-server side, RW edition. Mounts read-write, signals command-setup,
-/// waits for exit, then writes the final root hash to the outer pipe before
-/// dropping the FUSE session (which unmounts).
-fn run_fuse_server_rw(
-    store: Arc<dyn ChunkStore + Send + Sync + 'static>,
-    root: Hash,
-    sync_sock: UnixStream,
-    child: Pid,
-    outer_pipe_fd: std::os::fd::RawFd,
-) -> Result<i32, RuntimeError> {
-    use std::os::fd::FromRawFd;
-
-    let session = hako::fuse::mount_session_rw(store, root, Path::new(MOUNTPOINT))
-        .map_err(|e| io_other(format!("mount FUSE rw: {}", e)))?;
-
-    let mut sock = sync_sock;
-    sock.write_all(&[1])
-        .map_err(|e| io_other(format!("signal: {}", e)))?;
-    drop(sock);
-
-    let status = wait_for_child(child)?;
-    let exit_code = wait_to_exit_code(status);
-
-    // Write the post-exec root to the outer parent over the pipe BEFORE
-    // dropping the session (so the chunk store still has everything).
-    let final_root = session.current_root();
-    {
-        let mut f = unsafe { fs::File::from_raw_fd(outer_pipe_fd) };
+    // RW (`apply`): send the post-exec root to the outer parent BEFORE dropping
+    // the session (so the chunk store still has everything).
+    if let Some(fd) = capture_pipe {
+        let final_root = session.current_root();
+        let mut f = unsafe { fs::File::from_raw_fd(fd) };
         let _ = f.write_all(&final_root.0);
         // f is dropped here, closing the pipe.
     }
 
+    // Drop the session so the mount is cleanly unmounted before exit.
     drop(session);
     Ok(exit_code)
 }
