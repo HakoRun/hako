@@ -41,16 +41,30 @@ pub(super) struct RawManifest {
 }
 
 pub(super) struct Client {
-    registry: String,
+    /// Scheme + registry host, e.g. `https://registry-1.docker.io`.
+    base: String,
     repo: String,
     token: Option<String>,
     agent: ureq::Agent,
 }
 
+/// Scheme + host for a registry. Loopback registries (a local dev registry, or
+/// a test) are plain HTTP by default — matching Docker/containerd's "localhost
+/// is insecure" convention; everything else is https.
+fn registry_base(registry: &str) -> String {
+    let host = registry.rsplit_once(':').map_or(registry, |(h, _)| h);
+    let scheme = if matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
+        "http"
+    } else {
+        "https"
+    };
+    format!("{scheme}://{registry}")
+}
+
 impl Client {
     pub fn new(registry: &str, repo: &str) -> Self {
         Self {
-            registry: registry.to_string(),
+            base: registry_base(registry),
             repo: repo.to_string(),
             token: None,
             agent: ureq::AgentBuilder::new().build(),
@@ -98,10 +112,7 @@ impl Client {
         reference: &str,
         opts: &PullOptions,
     ) -> io::Result<RawManifest> {
-        let url = format!(
-            "https://{}/v2/{}/manifests/{}",
-            self.registry, self.repo, reference
-        );
+        let url = format!("{}/v2/{}/manifests/{}", self.base, self.repo, reference);
         let (body, ctype) = self.get(&url, MANIFEST_ACCEPT)?;
         // If the caller specified a digest (rather than a tag), verify the
         // bytes match. Tag fetches have nothing to verify against; we trust
@@ -150,10 +161,7 @@ impl Client {
     }
 
     pub fn fetch_blob(&mut self, digest: &str) -> io::Result<Vec<u8>> {
-        let url = format!(
-            "https://{}/v2/{}/blobs/{}",
-            self.registry, self.repo, digest
-        );
+        let url = format!("{}/v2/{}/blobs/{}", self.base, self.repo, digest);
         let (body, _) = self.get(&url, "*/*")?;
         verify_digest(digest, &body)?;
         Ok(body)
@@ -362,6 +370,22 @@ mod tests {
     fn verify_digest_case_insensitive_algo() {
         let digest = "SHA256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
         verify_digest(digest, b"hello").unwrap();
+    }
+
+    #[test]
+    fn registry_base_uses_http_only_for_loopback() {
+        assert_eq!(
+            registry_base("registry-1.docker.io"),
+            "https://registry-1.docker.io"
+        );
+        assert_eq!(registry_base("ghcr.io"), "https://ghcr.io");
+        assert_eq!(registry_base("localhost:5000"), "http://localhost:5000");
+        assert_eq!(registry_base("127.0.0.1:8080"), "http://127.0.0.1:8080");
+        // A non-loopback host with a port stays https.
+        assert_eq!(
+            registry_base("registry.example:5000"),
+            "https://registry.example:5000"
+        );
     }
 
     #[test]
