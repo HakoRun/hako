@@ -401,16 +401,32 @@ fn sync_ref(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
     // node's history. A brand-new branch (no current tip) is always allowed, as is
     // a no-op re-push of the same commit. See issue #40.
     if let Some(existing) = repo.read_ref(branch)? {
-        if existing != commit && repo.common_ancestor(existing, commit)? != Some(existing) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "refusing non-fast-forward update to {container}:{branch} \
-                     (current tip {} is not an ancestor of {})",
-                    &hex(&existing.0)[..12],
-                    &hex(&commit.0)[..12]
-                ),
-            ));
+        if existing != commit {
+            // The pushed commit and its history must already be present — SyncPut
+            // runs before SyncRef — for the ancestry walk to resolve. If they are
+            // not, surface a clear "push objects first" instead of the opaque
+            // "missing commit" the walk would otherwise raise.
+            let base = repo.common_ancestor(existing, commit).map_err(|e| {
+                if e.kind() == io::ErrorKind::NotFound {
+                    invalid(
+                        "ref target commit or its history is missing on this node; \
+                         push its objects before the ref",
+                    )
+                } else {
+                    e
+                }
+            })?;
+            if base != Some(existing) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing non-fast-forward update to {container}:{branch} \
+                         (current tip {} is not an ancestor of {})",
+                        &hex(&existing.0)[..12],
+                        &hex(&commit.0)[..12]
+                    ),
+                ));
+            }
         }
     }
     repo.write_ref(branch, commit)?;
@@ -797,6 +813,57 @@ mod tests {
         // A genuine fast-forward is accepted and advances the ref.
         sync_ref(&ctx, &enc(ff)).unwrap();
         assert_eq!(tip(), Some(ff));
+    }
+
+    #[test]
+    fn sync_ref_missing_target_gives_clear_error() {
+        use hako::{Config, Hash, Session, State};
+
+        let d = tempfile::tempdir().unwrap();
+        let state = State::init(&d.path().join(crate::DOT_HAKO)).unwrap();
+        let repo = state.open_container("hako").unwrap();
+        let base = repo
+            .commit(repo.working_tree().unwrap(), vec![], "u", "base", 1)
+            .unwrap();
+        repo.write_ref("main", base).unwrap();
+        drop(repo);
+
+        let session = Session::default();
+        let cfg = Config::default();
+        let ctx = Ctx {
+            state: &state,
+            session: &session,
+            default_container: "hako",
+            workdir: d.path(),
+            cfg: &cfg,
+        };
+
+        // A ref update whose target commit was never pushed: the ancestry walk
+        // can't resolve it, so the error must clearly say "push objects first"
+        // rather than the opaque "missing commit".
+        let ghost = Hash([0x42; 32]);
+        let mut p = Vec::new();
+        p.extend_from_slice(&4u32.to_be_bytes());
+        p.extend_from_slice(b"hako");
+        p.extend_from_slice(&4u32.to_be_bytes());
+        p.extend_from_slice(b"main");
+        p.extend_from_slice(&ghost.0);
+
+        let err = sync_ref(&ctx, &p).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing") && msg.contains("push"),
+            "expected a clear push-objects-first error, got: {msg}"
+        );
+        // The ref must be untouched.
+        assert_eq!(
+            state
+                .open_container("hako")
+                .unwrap()
+                .read_ref("main")
+                .unwrap(),
+            Some(base)
+        );
     }
 
     #[test]
