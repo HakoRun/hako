@@ -29,11 +29,47 @@ impl Identity {
         hex(self.verifying_key().to_bytes().as_slice())
     }
 
-    /// Sign a message with this node's key (e.g. a peer's connection challenge).
-    pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
-        use ed25519_dalek::Signer;
-        self.signing.sign(msg).to_bytes()
+    /// This node's X25519 static **secret** for the Noise (IK) cluster handshake,
+    /// derived from the Ed25519 seed exactly as libsodium's
+    /// `crypto_sign_ed25519_sk_to_curve25519`: clamp the low 32 bytes of
+    /// SHA-512(seed). Once Noise replaces the bespoke handshake the Ed25519 key
+    /// has no signing use left, so this single-purpose derivation carries no
+    /// sign-vs-DH key-reuse hazard (issue #40).
+    pub fn x25519_secret(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha512};
+        let h = Sha512::digest(self.signing.to_bytes());
+        let mut s = [0u8; 32];
+        s.copy_from_slice(&h[..32]);
+        s[0] &= 248;
+        s[31] &= 127;
+        s[31] |= 64;
+        s
     }
+
+    /// This node's X25519 static **public** key — the Montgomery form of its
+    /// Ed25519 public key. Infallible: the node's own key is a valid point.
+    /// Test-only: the daemon authorizes *peers'* statics (via
+    /// [`ed25519_pubkey_to_x25519`]) and never needs its own.
+    #[cfg(test)]
+    pub fn x25519_public(&self) -> [u8; 32] {
+        ed25519_pubkey_to_x25519(&self.verifying_key().to_bytes())
+            .expect("own Ed25519 public key is a valid Edwards point")
+    }
+}
+
+/// Convert an Ed25519 public key to its X25519 (Montgomery-u) form, matching
+/// libsodium's `crypto_sign_ed25519_pk_to_curve25519`. Returns `None` if the
+/// bytes are not a valid compressed Edwards point, so a corrupt registry entry
+/// can never panic the handshake. Used to authenticate a peer's Noise static
+/// against its registered Ed25519 identity.
+pub fn ed25519_pubkey_to_x25519(pk: &[u8; 32]) -> Option<[u8; 32]> {
+    use curve25519_dalek::edwards::CompressedEdwardsY;
+    Some(
+        CompressedEdwardsY(*pk)
+            .decompress()?
+            .to_montgomery()
+            .to_bytes(),
+    )
 }
 
 /// Load the workspace's identity, generating and persisting one on first use.
@@ -114,6 +150,29 @@ mod tests {
         assert_eq!(a.node_id().len(), 64, "32-byte pubkey → 64 hex chars");
         assert!(a.node_id().chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(a.node_id(), b.node_id(), "same seed → same id");
+    }
+
+    #[test]
+    fn x25519_conversion_agrees_on_dh() {
+        use curve25519_dalek::montgomery::MontgomeryPoint;
+        let a = Identity {
+            signing: SigningKey::from_bytes(&[3u8; 32]),
+        };
+        let b = Identity {
+            signing: SigningKey::from_bytes(&[9u8; 32]),
+        };
+        // The derived secret's basepoint mult equals the converted public.
+        assert_eq!(
+            MontgomeryPoint::mul_base_clamped(a.x25519_secret()).to_bytes(),
+            a.x25519_public()
+        );
+        // A Diffie-Hellman between the two identities agrees from both sides —
+        // the end-to-end proof the conversion is mutually consistent (exactly the
+        // agreement the Noise handshake relies on).
+        let ab = MontgomeryPoint(b.x25519_public()).mul_clamped(a.x25519_secret());
+        let ba = MontgomeryPoint(a.x25519_public()).mul_clamped(b.x25519_secret());
+        assert_eq!(ab, ba);
+        assert_ne!(ab.to_bytes(), [0u8; 32]);
     }
 
     #[test]

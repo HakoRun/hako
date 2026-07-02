@@ -3,31 +3,47 @@
 //!
 //! A connection has two phases:
 //!
-//! 1. **Mutual handshake** — both ends prove they hold the Ed25519 key the other
-//!    has registered. The client verifies the server is the node it dialed; the
-//!    server verifies the client is a peer in *its* registry, before serving
-//!    anything. (Station-to-station style: exchange pubkey+nonce, sign the
-//!    other's nonce, verify.)
-//! 2. **Requests** — currently one: `MetaRead(path)`, which runs the node's own
-//!    meta-fs read (e.g. a container `status`) and returns the bytes. This is
-//!    what makes `cat /peers/<node>/containers/<name>/status` work remotely.
+//! 1. **Noise handshake** — a mutually-authenticated
+//!    `Noise_IK_25519_ChaChaPoly_BLAKE2s` handshake (see [`NOISE_PARAMS`]). The
+//!    initiator knows the responder's static key ahead of time from `peers.toml`;
+//!    the responder learns the initiator's static during the handshake and
+//!    authorizes it against *its* registry before serving anything. Both static
+//!    keys are X25519 keys derived from the node's existing Ed25519 identity. The
+//!    result is an encrypted, integrity-protected, forward-secret channel — every
+//!    request/response below rides inside it (a [`NoiseChannel`]).
+//! 2. **Requests** — e.g. `MetaRead(path)`, which runs the node's own meta-fs read
+//!    (a container `status`) and returns the bytes, or the push data plane
+//!    (`SyncHave`/`SyncPut`/`SyncRef`). This is what makes
+//!    `cat /peers/<node>/containers/<name>/status` work remotely.
 //!
 //! `hako peer ping <name>` does the handshake and stops (a reachability +
 //! identity check); `cat /peers/...` does the handshake then a `MetaRead`.
 
 use super::Ctx;
 use crate::cmd::{identity, peers};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use hako::{ChunkStore, Hash, WorkspaceLock};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
 
-/// Cap on a single frame's payload, guarding against a bogus length prefix.
+/// Cap on a single application message, guarding against a bogus length prefix.
 const MAX_FRAME: u32 = 1 << 20;
-const NONCE_LEN: usize = 32;
-const PUBKEY_LEN: usize = 32;
-const SIG_LEN: usize = 64;
+
+/// Noise pattern for the cluster channel: mutual-auth **IK** (the initiator knows
+/// the responder's static ahead of time from `peers.toml`; the responder learns
+/// and authorizes the initiator during the handshake), X25519 DH, ChaCha20-Poly1305
+/// AEAD, BLAKE2s. Gives confidentiality + integrity + forward secrecy, closing the
+/// gap the old sign-the-nonce handshake left (it authenticated but did not bind
+/// or encrypt the session — an active MITM could inject a forged `ctl`). See #40.
+const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
+/// A Noise transport message is capped at 65535 bytes; a plaintext chunk is that
+/// minus the 16-byte ChaChaPoly tag.
+const NOISE_MSG_MAX: usize = 65535;
+const NOISE_PT_MAX: usize = NOISE_MSG_MAX - 16;
+/// Cap on chunks per application message (> MAX_FRAME / NOISE_PT_MAX), bounding
+/// reassembly memory against a bogus chunk count.
+const MAX_APP_CHUNKS: u32 = 64;
 
 /// Request tags (first byte of a post-handshake request frame).
 const TAG_META_READ: u8 = 1;
@@ -93,79 +109,148 @@ fn invalid(msg: &'static str) -> io::Error {
 fn denied(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, msg)
 }
-fn random_nonce() -> io::Result<[u8; NONCE_LEN]> {
-    let mut n = [0u8; NONCE_LEN];
-    getrandom::getrandom(&mut n).map_err(|e| io::Error::other(format!("nonce: {e}")))?;
-    Ok(n)
+fn noise_err(e: impl std::fmt::Display) -> io::Error {
+    io::Error::other(format!("noise: {e}"))
+}
+
+fn read_u32(r: &mut impl Read) -> io::Result<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(u32::from_be_bytes(b))
+}
+
+/// An authenticated, encrypted channel to a peer: the TCP stream plus the Noise
+/// transport state the IK handshake established. Application messages are split
+/// into ≤64 KiB Noise messages (the protocol's per-message limit), framed as a
+/// `[u32 chunk_count]` header then `[u32 ct_len][ciphertext]` per chunk, and
+/// reassembled on the far side. Tampering (a flipped byte, a dropped or reordered
+/// chunk) fails the per-message AEAD, so `recv` errors rather than returning bad
+/// bytes.
+struct NoiseChannel {
+    stream: TcpStream,
+    transport: snow::TransportState,
+}
+
+impl NoiseChannel {
+    fn send(&mut self, plaintext: &[u8]) -> io::Result<()> {
+        // Empty payload → zero chunks; both sides skip write/read_message so the
+        // Noise nonces stay in lockstep.
+        let chunks: Vec<&[u8]> = plaintext.chunks(NOISE_PT_MAX).collect();
+        self.stream
+            .write_all(&(chunks.len() as u32).to_be_bytes())?;
+        let mut buf = vec![0u8; NOISE_MSG_MAX];
+        for c in chunks {
+            let n = self
+                .transport
+                .write_message(c, &mut buf)
+                .map_err(noise_err)?;
+            self.stream.write_all(&(n as u32).to_be_bytes())?;
+            self.stream.write_all(&buf[..n])?;
+        }
+        self.stream.flush()
+    }
+
+    fn recv(&mut self) -> io::Result<Vec<u8>> {
+        let count = read_u32(&mut self.stream)?;
+        if count > MAX_APP_CHUNKS {
+            return Err(invalid("noise: too many chunks"));
+        }
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; NOISE_MSG_MAX];
+        for _ in 0..count {
+            let clen = read_u32(&mut self.stream)? as usize;
+            if clen > NOISE_MSG_MAX {
+                return Err(invalid("noise: message too large"));
+            }
+            let mut ct = vec![0u8; clen];
+            self.stream.read_exact(&mut ct)?;
+            let n = self
+                .transport
+                .read_message(&ct, &mut buf)
+                .map_err(|_| invalid("noise: decrypt failed"))?;
+            out.extend_from_slice(&buf[..n]);
+            if out.len() > MAX_FRAME as usize {
+                return Err(invalid("frame too large"));
+            }
+        }
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Mutual handshake
+// Noise IK handshake  (handshake messages ride the plaintext [u32 len][msg]
+// framing; everything after is the encrypted NoiseChannel)
 // ---------------------------------------------------------------------------
 
-/// Server side: verify the client (via `authorized`, which decides if a pubkey
-/// is a registered peer) and prove our own identity. The `authorized` closure
-/// keeps this decoupled from `Ctx` so it is unit-testable.
+/// Server (Noise IK responder). Reads the initiator's first message — which
+/// carries its static key encrypted to us — hands that key to `authorized` (a
+/// registered peer?), replies, and upgrades to the encrypted transport. The
+/// static passed to `authorized` is the peer's **X25519** key; the registry
+/// stores Ed25519, so the caller compares against the converted form.
 fn handshake_as_server(
-    stream: &mut TcpStream,
+    mut stream: TcpStream,
     id: &identity::Identity,
-    authorized: impl Fn(&[u8; PUBKEY_LEN]) -> bool,
-) -> io::Result<()> {
-    // H1: client_pubkey || client_nonce
-    let h1 = read_frame(stream)?;
-    if h1.len() != PUBKEY_LEN + NONCE_LEN {
-        return Err(invalid("handshake: bad hello"));
-    }
-    let client_pubkey = first_array::<PUBKEY_LEN>(&h1, "handshake: bad hello")?;
-    let client_nonce = &h1[PUBKEY_LEN..];
-    let client_vk =
-        VerifyingKey::from_bytes(&client_pubkey).map_err(|_| invalid("client pubkey invalid"))?;
-    if !authorized(&client_pubkey) {
+    authorized: impl Fn(&[u8; 32]) -> bool,
+) -> io::Result<NoiseChannel> {
+    // `snow::Builder` borrows the secret, so keep it in a local until `build_*`
+    // copies it into the handshake state.
+    let params = NOISE_PARAMS.parse().map_err(noise_err)?;
+    let secret = id.x25519_secret();
+    let mut hs = snow::Builder::new(params)
+        .local_private_key(&secret)
+        .build_responder()
+        .map_err(noise_err)?;
+    let mut buf = vec![0u8; NOISE_MSG_MAX];
+
+    // msg1 (initiator → responder): e, es, s, ss — carries the initiator's static.
+    let m1 = read_frame(&mut stream)?;
+    hs.read_message(&m1, &mut buf)
+        .map_err(|_| denied("handshake: bad client hello"))?;
+    let rs: [u8; 32] = hs
+        .get_remote_static()
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| invalid("handshake: missing client static"))?;
+    if !authorized(&rs) {
         return Err(denied("client is not a registered peer"));
     }
-    // H2: our signature over the client's nonce || our nonce
-    let server_nonce = random_nonce()?;
-    let mut h2 = Vec::with_capacity(SIG_LEN + NONCE_LEN);
-    h2.extend_from_slice(&id.sign(client_nonce));
-    h2.extend_from_slice(&server_nonce);
-    write_frame(stream, &h2)?;
-    // H3: client's signature over our nonce
-    let h3 = read_frame(stream)?;
-    let client_sig: [u8; SIG_LEN] = h3
-        .as_slice()
-        .try_into()
-        .map_err(|_| invalid("handshake: bad client signature"))?;
-    client_vk
-        .verify(&server_nonce, &Signature::from_bytes(&client_sig))
-        .map_err(|_| denied("client failed to prove its identity"))?;
-    Ok(())
+
+    // msg2 (responder → initiator): e, ee, se.
+    let n = hs.write_message(&[], &mut buf).map_err(noise_err)?;
+    write_frame(&mut stream, &buf[..n])?;
+
+    let transport = hs.into_transport_mode().map_err(noise_err)?;
+    Ok(NoiseChannel { stream, transport })
 }
 
-/// Client side: prove our identity and verify the server is `expected`.
+/// Client (Noise IK initiator). `expected` is the server's registered Ed25519
+/// identity; IK requires knowing the responder's static up front, so we convert
+/// it to X25519 and encrypt msg1 to it — which also authenticates the server
+/// (only the real holder of that key can complete the handshake).
 fn handshake_as_client(
-    stream: &mut TcpStream,
+    mut stream: TcpStream,
     id: &identity::Identity,
     expected: &VerifyingKey,
-) -> io::Result<()> {
-    // H1: our pubkey || our nonce
-    let client_nonce = random_nonce()?;
-    let mut h1 = Vec::with_capacity(PUBKEY_LEN + NONCE_LEN);
-    h1.extend_from_slice(&id.verifying_key().to_bytes());
-    h1.extend_from_slice(&client_nonce);
-    write_frame(stream, &h1)?;
-    // H2: server_sig over our nonce || server nonce
-    let h2 = read_frame(stream)?;
-    if h2.len() != SIG_LEN + NONCE_LEN {
-        return Err(invalid("handshake: bad server reply"));
-    }
-    let server_sig = first_array::<SIG_LEN>(&h2, "handshake: bad server reply")?;
-    let server_nonce = &h2[SIG_LEN..];
-    expected
-        .verify(&client_nonce, &Signature::from_bytes(&server_sig))
+) -> io::Result<NoiseChannel> {
+    let server_x = identity::ed25519_pubkey_to_x25519(&expected.to_bytes())
+        .ok_or_else(|| invalid("peer pubkey is not a valid point"))?;
+    let params = NOISE_PARAMS.parse().map_err(noise_err)?;
+    let secret = id.x25519_secret();
+    let mut hs = snow::Builder::new(params)
+        .local_private_key(&secret)
+        .remote_public_key(&server_x)
+        .build_initiator()
+        .map_err(noise_err)?;
+    let mut buf = vec![0u8; NOISE_MSG_MAX];
+
+    let n = hs.write_message(&[], &mut buf).map_err(noise_err)?;
+    write_frame(&mut stream, &buf[..n])?;
+
+    let m2 = read_frame(&mut stream)?;
+    hs.read_message(&m2, &mut buf)
         .map_err(|_| denied("peer failed the identity check"))?;
-    // H3: our signature over the server's nonce
-    write_frame(stream, &id.sign(server_nonce))?;
-    Ok(())
+
+    let transport = hs.into_transport_mode().map_err(noise_err)?;
+    Ok(NoiseChannel { stream, transport })
 }
 
 // ---------------------------------------------------------------------------
@@ -173,9 +258,10 @@ fn handshake_as_client(
 // ---------------------------------------------------------------------------
 
 /// Reject binding a routable (non-loopback) address unless the operator opts in.
-/// The post-handshake channel is authenticated but not yet encrypted, so a
-/// remote-reachable bind should be a deliberate choice (trusted LAN/VPN), not a
-/// surprise. Returns whether the chosen address exposes the node off-host.
+/// The channel is now encrypted and mutually authenticated (Noise IK), so this is
+/// no longer about plaintext exposure — it's that making a node reachable off-host
+/// should be a deliberate choice (trusted LAN/VPN), not a surprise default.
+/// Returns whether the chosen address exposes the node off-host.
 fn check_bind_safety(addr: &str, allow_remote: bool) -> io::Result<bool> {
     use std::net::ToSocketAddrs;
     let exposes_remote = addr.to_socket_addrs()?.any(|sa| !sa.ip().is_loopback());
@@ -183,9 +269,10 @@ fn check_bind_safety(addr: &str, allow_remote: bool) -> io::Result<bool> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "refusing to bind {addr}: the cluster channel is authenticated but not \
-                 encrypted. Re-run with --allow-remote to bind a routable address (use only \
-                 on a trusted LAN/VPN)."
+                "refusing to bind {addr}: making this node reachable off-host should be a \
+                 deliberate choice. Re-run with --allow-remote to bind a routable address \
+                 (the channel is encrypted + peer-authenticated, but expose it only on a \
+                 trusted LAN/VPN)."
             ),
         ));
     }
@@ -224,8 +311,8 @@ pub fn serve(
     }
     for conn in listener.incoming() {
         match conn {
-            Ok(mut stream) => {
-                if let Err(e) = handle_peer(&mut stream, &id, ctx, allow_remote_run) {
+            Ok(stream) => {
+                if let Err(e) = handle_peer(stream, &id, ctx, allow_remote_run) {
                     eprintln!("hako serve: connection error: {e}");
                 }
             }
@@ -236,20 +323,21 @@ pub fn serve(
 }
 
 fn handle_peer(
-    stream: &mut TcpStream,
+    stream: TcpStream,
     id: &identity::Identity,
     ctx: &Ctx<'_>,
     allow_remote_run: bool,
 ) -> io::Result<()> {
-    set_io_timeouts(stream)?;
-    handshake_as_server(stream, id, |pk| {
-        peers::find_by_pubkey(ctx, &hex(pk))
-            .ok()
-            .flatten()
-            .is_some()
+    set_io_timeouts(&stream)?;
+    // Authorize the initiator's Noise (X25519) static against the registry, which
+    // stores Ed25519 — compare against the converted form.
+    let mut ch = handshake_as_server(stream, id, |x| {
+        peers::registered_x25519(ctx)
+            .map(|ks| ks.contains(x))
+            .unwrap_or(false)
     })?;
     loop {
-        let req = match read_frame(stream) {
+        let req = match ch.recv() {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
@@ -280,7 +368,7 @@ fn handle_peer(
                 r
             }
         };
-        write_frame(stream, &resp)?;
+        ch.send(&resp)?;
     }
 }
 
@@ -476,7 +564,7 @@ fn take_lenprefixed_str(buf: &[u8]) -> io::Result<(&str, &[u8])> {
 pub fn ping(ctx: &Ctx<'_>, name: &str) -> io::Result<ExitCode> {
     let peer = peers::lookup(ctx, name)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no peer named {name}")))?;
-    let _stream = connect_and_handshake(ctx, &peer)?;
+    let _ch = connect_and_handshake(ctx, &peer)?;
     println!("peer {name} ({}) verified", peer.address);
     Ok(ExitCode::SUCCESS)
 }
@@ -491,11 +579,11 @@ pub fn remote_cat(ctx: &Ctx<'_>, peer_rest: &str) -> io::Result<ExitCode> {
     })?;
     let peer = peers::lookup(ctx, node)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no peer named {node}")))?;
-    let mut stream = connect_and_handshake(ctx, &peer)?;
+    let mut ch = connect_and_handshake(ctx, &peer)?;
     let mut req = vec![TAG_META_READ];
     req.extend_from_slice(format!("/{subpath}").as_bytes());
-    write_frame(&mut stream, &req)?;
-    read_response(&mut stream, node)
+    ch.send(&req)?;
+    read_response(&mut ch, node)
 }
 
 /// `write /peers/<node>/<subpath>` — handshake, then `MetaWrite(subpath, body)`.
@@ -509,14 +597,14 @@ pub fn remote_write(ctx: &Ctx<'_>, peer_rest: &str, body: &[u8]) -> io::Result<E
     })?;
     let peer = peers::lookup(ctx, node)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no peer named {node}")))?;
-    let mut stream = connect_and_handshake(ctx, &peer)?;
+    let mut ch = connect_and_handshake(ctx, &peer)?;
     let path = format!("/{subpath}");
     let mut req = vec![TAG_META_WRITE];
     req.extend_from_slice(&(path.len() as u32).to_be_bytes());
     req.extend_from_slice(path.as_bytes());
     req.extend_from_slice(body);
-    write_frame(&mut stream, &req)?;
-    read_response(&mut stream, node)
+    ch.send(&req)?;
+    read_response(&mut ch, node)
 }
 
 /// `hako peer push <node> [branch]` — replicate the local container's branch to
@@ -536,7 +624,7 @@ pub fn remote_push(ctx: &Ctx<'_>, node: &str, branch: &str) -> io::Result<ExitCo
     let reachable: Vec<Hash> = repo.reachable_objects(commit)?.into_iter().collect();
     let peer = peers::lookup(ctx, node)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no peer named {node}")))?;
-    let mut stream = connect_and_handshake(ctx, &peer)?;
+    let mut ch = connect_and_handshake(ctx, &peer)?;
 
     // Offer every reachable hash; the peer replies with the subset it lacks.
     let mut have = Vec::with_capacity(1 + reachable.len() * HASH_LEN);
@@ -544,8 +632,8 @@ pub fn remote_push(ctx: &Ctx<'_>, node: &str, branch: &str) -> io::Result<ExitCo
     for h in &reachable {
         have.extend_from_slice(&h.0);
     }
-    write_frame(&mut stream, &have)?;
-    let missing = decode_hashes(&read_ok_payload(&mut stream, node)?)?;
+    ch.send(&have)?;
+    let missing = decode_hashes(&read_ok_payload(&mut ch, node)?)?;
 
     // Send the missing objects, batched to stay well under MAX_FRAME.
     let store = ctx.state.store();
@@ -556,8 +644,8 @@ pub fn remote_push(ctx: &Ctx<'_>, node: &str, branch: &str) -> io::Result<ExitCo
             .get(h)?
             .ok_or_else(|| invalid("a reachable object is missing locally"))?;
         if batch.len() > 1 && batch.len() + 4 + bytes.len() > PUT_BATCH_LIMIT {
-            write_frame(&mut stream, &batch)?;
-            read_ok_payload(&mut stream, node)?;
+            ch.send(&batch)?;
+            read_ok_payload(&mut ch, node)?;
             batch = vec![TAG_SYNC_PUT];
         }
         batch.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
@@ -565,8 +653,8 @@ pub fn remote_push(ctx: &Ctx<'_>, node: &str, branch: &str) -> io::Result<ExitCo
         sent += 1;
     }
     if batch.len() > 1 {
-        write_frame(&mut stream, &batch)?;
-        read_ok_payload(&mut stream, node)?;
+        ch.send(&batch)?;
+        read_ok_payload(&mut ch, node)?;
     }
 
     // Point the peer's ref at the commit (creating the container if needed).
@@ -577,8 +665,8 @@ pub fn remote_push(ctx: &Ctx<'_>, node: &str, branch: &str) -> io::Result<ExitCo
     req.extend_from_slice(&(branch.len() as u32).to_be_bytes());
     req.extend_from_slice(branch.as_bytes());
     req.extend_from_slice(&commit.0);
-    write_frame(&mut stream, &req)?;
-    let confirm = read_ok_payload(&mut stream, node)?;
+    ch.send(&req)?;
+    let confirm = read_ok_payload(&mut ch, node)?;
     println!(
         "pushed {sent} objects to {node}; {}",
         String::from_utf8_lossy(&confirm)
@@ -586,9 +674,9 @@ pub fn remote_push(ctx: &Ctx<'_>, node: &str, branch: &str) -> io::Result<ExitCo
     Ok(ExitCode::SUCCESS)
 }
 
-/// Read a response frame; return its payload on success, an error otherwise.
-fn read_ok_payload(stream: &mut TcpStream, node: &str) -> io::Result<Vec<u8>> {
-    let resp = read_frame(stream)?;
+/// Read a response message; return its payload on success, an error otherwise.
+fn read_ok_payload(ch: &mut NoiseChannel, node: &str) -> io::Result<Vec<u8>> {
+    let resp = ch.recv()?;
     let (&status, payload) = resp
         .split_first()
         .ok_or_else(|| invalid("empty response"))?;
@@ -603,19 +691,18 @@ fn read_ok_payload(stream: &mut TcpStream, node: &str) -> io::Result<Vec<u8>> {
 }
 
 /// Read a response and write its payload to stdout.
-fn read_response(stream: &mut TcpStream, node: &str) -> io::Result<ExitCode> {
-    let payload = read_ok_payload(stream, node)?;
+fn read_response(ch: &mut NoiseChannel, node: &str) -> io::Result<ExitCode> {
+    let payload = read_ok_payload(ch, node)?;
     io::stdout().write_all(&payload)?;
     Ok(ExitCode::SUCCESS)
 }
 
-fn connect_and_handshake(ctx: &Ctx<'_>, peer: &peers::Peer) -> io::Result<TcpStream> {
+fn connect_and_handshake(ctx: &Ctx<'_>, peer: &peers::Peer) -> io::Result<NoiseChannel> {
     let expected = peer.verifying_key()?;
     let id = identity::load_or_create(ctx)?;
-    let mut stream = TcpStream::connect(&peer.address)?;
+    let stream = TcpStream::connect(&peer.address)?;
     set_io_timeouts(&stream)?;
-    handshake_as_client(&mut stream, &id, &expected)?;
-    Ok(stream)
+    handshake_as_client(stream, &id, &expected)
 }
 
 /// Lowercase hex encoding.
@@ -706,24 +793,35 @@ mod tests {
     }
 
     #[test]
-    fn mutual_handshake_succeeds_when_both_are_registered() {
+    fn mutual_handshake_establishes_a_working_channel() {
         let ds = tempfile::tempdir().unwrap();
         let dc = tempfile::tempdir().unwrap();
         let server_id = id_at(ds.path());
         let client_id = id_at(dc.path());
         let server_vk = server_id.verifying_key();
-        let client_pk = client_id.verifying_key().to_bytes();
+        // The server authorizes the client by its X25519 static; the registry
+        // stores Ed25519, so the daemon compares against the converted form.
+        let client_x = client_id.x25519_public();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            handshake_as_server(&mut s, &server_id, |pk| *pk == client_pk)
+        let server = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+            let (s, _) = listener.accept().unwrap();
+            let mut ch = handshake_as_server(s, &server_id, move |x| *x == client_x)?;
+            let greeting = ch.recv()?; // decrypt the client's first message
+            ch.send(b"pong")?; // reply over the same encrypted channel
+            Ok(greeting)
         });
-        let mut stream = TcpStream::connect(addr).unwrap();
-        let client_result = handshake_as_client(&mut stream, &client_id, &server_vk);
-        assert!(client_result.is_ok(), "client: {client_result:?}");
-        assert!(server.join().unwrap().is_ok(), "server");
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut ch = handshake_as_client(stream, &client_id, &server_vk)
+            .expect("client handshake should succeed");
+        ch.send(b"ping").unwrap();
+        assert_eq!(ch.recv().unwrap(), b"pong", "encrypted reply round-trips");
+        assert_eq!(
+            server.join().unwrap().unwrap(),
+            b"ping",
+            "server decrypted the client's greeting"
+        );
     }
 
     #[test]
@@ -736,18 +834,64 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        // The server authorizes nobody.
+        // The server authorizes nobody: it reads the client's static from msg1,
+        // rejects it, and hangs up without completing the handshake.
         let server = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            handshake_as_server(&mut s, &server_id, |_| false)
+            let (s, _) = listener.accept().unwrap();
+            handshake_as_server(s, &server_id, |_| false).map(|_| ())
         });
-        let mut stream = TcpStream::connect(addr).unwrap();
-        let client_result = handshake_as_client(&mut stream, &client_id, &server_vk);
+        let stream = TcpStream::connect(addr).unwrap();
+        let client_result = handshake_as_client(stream, &client_id, &server_vk);
         assert!(
             client_result.is_err(),
             "client handshake must fail when the server rejects it"
         );
         assert!(server.join().unwrap().is_err(), "server rejects");
+    }
+
+    #[test]
+    fn recv_rejects_a_tampered_ciphertext() {
+        let ds = tempfile::tempdir().unwrap();
+        let dc = tempfile::tempdir().unwrap();
+        let server_id = id_at(ds.path());
+        let client_id = id_at(dc.path());
+        let server_vk = server_id.verifying_key();
+        let client_x = client_id.x25519_public();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            handshake_as_server(s, &server_id, move |x| *x == client_x).unwrap()
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut client_ch = handshake_as_client(stream, &client_id, &server_vk).unwrap();
+        let mut server_ch = server.join().unwrap();
+
+        // Encrypt one transport frame exactly as `send` does, but flip a single
+        // ciphertext byte in flight. The AEAD tag must fail closed rather than
+        // surface corrupted plaintext.
+        let mut buf = vec![0u8; NOISE_MSG_MAX];
+        let n = server_ch
+            .transport
+            .write_message(b"top secret", &mut buf)
+            .unwrap();
+        buf[0] ^= 0xff;
+        server_ch.stream.write_all(&1u32.to_be_bytes()).unwrap(); // one chunk
+        server_ch
+            .stream
+            .write_all(&(n as u32).to_be_bytes())
+            .unwrap();
+        server_ch.stream.write_all(&buf[..n]).unwrap();
+        server_ch.stream.flush().unwrap();
+
+        let err = client_ch
+            .recv()
+            .expect_err("a tampered ciphertext must be rejected");
+        assert!(
+            err.to_string().contains("decrypt"),
+            "expected a decrypt failure, got: {err}"
+        );
     }
 
     #[test]
@@ -981,8 +1125,8 @@ mod tests {
 
         std::thread::scope(|s| {
             let server = s.spawn(|| {
-                let (mut stream, _) = listener.accept().unwrap();
-                handle_peer(&mut stream, &a_id, &a_ctx, false)
+                let (stream, _) = listener.accept().unwrap();
+                handle_peer(stream, &a_id, &a_ctx, false)
             });
             let rc = remote_push(&b_ctx, "server", "main");
             assert!(rc.is_ok(), "push failed: {rc:?}");
@@ -1021,8 +1165,8 @@ mod tests {
 
         std::thread::scope(|s| {
             let server = s.spawn(|| {
-                let (mut stream, _) = listener.accept().unwrap();
-                handle_peer(&mut stream, &a_id, &a_ctx, false)
+                let (stream, _) = listener.accept().unwrap();
+                handle_peer(stream, &a_id, &a_ctx, false)
             });
             // Drive the client side directly so we can assert the RETURNED BYTES,
             // not merely that the round-trip completed: read the server's own
@@ -1030,12 +1174,12 @@ mod tests {
             let peer = peers::lookup(&b_ctx, "server")
                 .unwrap()
                 .expect("peer registered");
-            let mut stream = connect_and_handshake(&b_ctx, &peer).unwrap();
+            let mut ch = connect_and_handshake(&b_ctx, &peer).unwrap();
             let mut req = vec![TAG_META_READ];
             req.extend_from_slice(b"/containers/hako/status");
-            write_frame(&mut stream, &req).unwrap();
+            ch.send(&req).unwrap();
 
-            let resp = read_frame(&mut stream).unwrap();
+            let resp = ch.recv().unwrap();
             assert_eq!(
                 resp.first().copied(),
                 Some(RESP_OK),
@@ -1045,7 +1189,7 @@ mod tests {
             assert!(body.contains("container: hako"), "status body: {body:?}");
             assert!(body.contains("branch:"), "status body: {body:?}");
 
-            drop(stream); // client hangs up → server's read loop hits EOF, returns
+            drop(ch); // client hangs up → server's read loop hits EOF, returns
             server.join().unwrap().expect("server handled the peer");
         });
     }
@@ -1071,8 +1215,8 @@ mod tests {
         std::thread::scope(|s| {
             // Server started WITHOUT --allow-remote-run (the false arg).
             let server = s.spawn(|| {
-                let (mut stream, _) = listener.accept().unwrap();
-                handle_peer(&mut stream, &a_id, &a_ctx, false)
+                let (stream, _) = listener.accept().unwrap();
+                handle_peer(stream, &a_id, &a_ctx, false)
             });
             let rc = remote_write(&b_ctx, "server/containers/hako/ctl", b"run echo hi");
             let err = rc.expect_err("remote `ctl run` must be refused when the gate is off");

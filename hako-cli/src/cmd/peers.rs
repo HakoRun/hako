@@ -158,15 +158,21 @@ pub fn lookup(ctx: &Ctx<'_>, name: &str) -> io::Result<Option<Peer>> {
     Ok(load(&registry_path(ctx))?.peers.get(name).cloned())
 }
 
-/// Find a registered peer's name by its public key (hex), if any. Used by the
-/// daemon to decide whether a connecting client is an authorized peer.
-pub fn find_by_pubkey(ctx: &Ctx<'_>, pubkey_hex: &str) -> io::Result<Option<String>> {
+/// The X25519 (Noise) static keys of every registered peer. The registry stores
+/// Ed25519 identities, so each is converted; the Noise IK handshake learns a
+/// connecting peer's X25519 static and the daemon authorizes it against this set.
+/// Malformed entries are skipped rather than failing the whole check.
+pub fn registered_x25519(ctx: &Ctx<'_>) -> io::Result<Vec<[u8; 32]>> {
     let reg = load(&registry_path(ctx))?;
-    Ok(reg
-        .peers
-        .iter()
-        .find(|(_, p)| p.pubkey == pubkey_hex)
-        .map(|(name, _)| name.clone()))
+    let mut out = Vec::new();
+    for peer in reg.peers.values() {
+        if let Ok(vk) = peer.verifying_key() {
+            if let Some(x) = crate::cmd::identity::ed25519_pubkey_to_x25519(&vk.to_bytes()) {
+                out.push(x);
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

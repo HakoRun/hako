@@ -33,13 +33,31 @@ getrandom = { version = "0.2", optional = true }
 # features (parse + display), unlike hako-core's parse-only use.
 serde = { workspace = true, optional = true }
 toml = { version = "0.8", optional = true }
+# Cluster transport encryption (Noise_IK). `snow` on its pure-Rust resolver (no
+# `ring`) keeps the "no C deps" property so the runtime still cross-compiles to a
+# static musl binary. The Noise X25519 static keys are derived from the node's
+# existing Ed25519 identity — `curve25519-dalek` for the Edwards→Montgomery
+# public map, `sha2` for the secret-scalar derivation.
+snow = { version = "0.9", default-features = false, features = [
+    "default-resolver",
+], optional = true }
+curve25519-dalek = { version = "4", optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [features]
 default = []
 # The distributed/cluster surface (Phase 1+): node identity and static peers
 # now, the `serve` daemon + wire protocol later. Gated so the base binary
 # stays lean — see docs/distributed.md.
-cluster = ["dep:ed25519-dalek", "dep:getrandom", "dep:serde", "dep:toml"]
+cluster = [
+    "dep:ed25519-dalek",
+    "dep:getrandom",
+    "dep:serde",
+    "dep:toml",
+    "dep:snow",
+    "dep:curve25519-dalek",
+    "dep:sha2",
+]
 # Embeds a pre-built Linux hako binary into the host (Windows/macOS)
 # wrapper, so `hako apply` etc. can auto-bootstrap a WSL distro / Lima
 # VM without requiring the user to install hako separately inside.
