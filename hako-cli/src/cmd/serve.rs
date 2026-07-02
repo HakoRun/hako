@@ -935,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn two_node_remote_cat_reads_status() {
+    fn two_node_meta_read_returns_status_content() {
         use hako::{Config, Session};
 
         let (a_dir, a_state, a_id) = setup_node(); // server (has the seeded "hako")
@@ -957,9 +957,28 @@ mod tests {
                 let (mut stream, _) = listener.accept().unwrap();
                 handle_peer(&mut stream, &a_id, &a_ctx, false)
             });
-            // Reads the server's own container status over the authenticated wire.
-            let rc = remote_cat(&b_ctx, "server/containers/hako/status");
-            assert!(rc.is_ok(), "remote_cat failed: {rc:?}");
+            // Drive the client side directly so we can assert the RETURNED BYTES,
+            // not merely that the round-trip completed: read the server's own
+            // container status and verify its content came back over the wire.
+            let peer = peers::lookup(&b_ctx, "server")
+                .unwrap()
+                .expect("peer registered");
+            let mut stream = connect_and_handshake(&b_ctx, &peer).unwrap();
+            let mut req = vec![TAG_META_READ];
+            req.extend_from_slice(b"/containers/hako/status");
+            write_frame(&mut stream, &req).unwrap();
+
+            let resp = read_frame(&mut stream).unwrap();
+            assert_eq!(
+                resp.first().copied(),
+                Some(RESP_OK),
+                "expected an OK status response"
+            );
+            let body = String::from_utf8_lossy(&resp[1..]);
+            assert!(body.contains("container: hako"), "status body: {body:?}");
+            assert!(body.contains("branch:"), "status body: {body:?}");
+
+            drop(stream); // client hangs up → server's read loop hits EOF, returns
             server.join().unwrap().expect("server handled the peer");
         });
     }
