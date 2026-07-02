@@ -1,5 +1,5 @@
-//! Tar-layer application: decompress (gzip), normalize archive paths, and
-//! apply OverlayFS-style whiteouts on top of a hako tree.
+//! Tar-layer application: decompress (gzip / zstd), normalize archive paths,
+//! and apply OverlayFS-style whiteouts on top of a hako tree.
 
 use crate::fs::ScopedFs;
 use crate::hash::Hash;
@@ -16,35 +16,56 @@ const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
 /// up-front allocation.
 const MAX_PREALLOC: u64 = 1024 * 1024; // 1 MiB
 
-/// Decompress an OCI/Docker layer blob. Gzip is the overwhelmingly common
-/// case; zstd is recognized but not yet supported.
+/// Decompress an OCI/Docker layer blob. Selects the codec by media type,
+/// falling back to magic-byte sniffing (some registries mislabel), and treats
+/// anything unrecognized as an already-uncompressed tar.
 pub(super) fn decompress(media_type: &str, blob: &[u8]) -> io::Result<Vec<u8>> {
     if media_type.contains("+gzip") || media_type.contains(".gzip") || is_gzip(blob) {
-        let mut out = Vec::new();
-        // Read at most MAX+1 bytes; if we hit the cap the layer is oversized
-        // (or a decompression bomb) — fail rather than exhaust memory.
-        GzDecoder::new(blob)
-            .take(MAX_DECOMPRESSED_LAYER + 1)
-            .read_to_end(&mut out)?;
-        if out.len() as u64 > MAX_DECOMPRESSED_LAYER {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "decompressed layer exceeds size limit",
-            ));
-        }
-        Ok(out)
-    } else if media_type.contains("+zstd") || media_type.contains(".zstd") {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!("zstd-compressed layers not yet supported: {}", media_type),
-        ))
+        read_capped(GzDecoder::new(blob))
+    } else if media_type.contains("+zstd") || media_type.contains(".zstd") || is_zstd(blob) {
+        // Pure-Rust zstd decoder (no C dependency, unlike the reference lib).
+        //
+        // Bomb safety: unlike gzip's fixed tiny window, a zstd frame declares its
+        // window size in the header, which a decoder could allocate up front —
+        // before `read_capped` ever sees a byte. We rely on `ruzstd` NOT eagerly
+        // allocating the declared window: `StreamingDecoder::new` builds an empty
+        // ring buffer that grows lazily as output is produced, so the same
+        // `read_capped` output bound below caps peak memory. (Note this is our
+        // guardrail, not ruzstd's own `MAX_WINDOW_SIZE` check, which the
+        // first-frame path skips.) If a future ruzstd made the window buffer
+        // eager, this bound would no longer cover it — revisit on upgrade.
+        let dec = ruzstd::StreamingDecoder::new(blob)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("zstd init: {e}")))?;
+        read_capped(dec)
     } else {
         Ok(blob.to_vec())
     }
 }
 
+/// Read a decompressor to EOF, capped at [`MAX_DECOMPRESSED_LAYER`]: read at
+/// most MAX+1 bytes and fail past the cap, so a decompression bomb (a tiny blob
+/// that expands without bound) can't exhaust memory. Shared by every codec.
+fn read_capped(reader: impl Read) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    reader
+        .take(MAX_DECOMPRESSED_LAYER + 1)
+        .read_to_end(&mut out)?;
+    if out.len() as u64 > MAX_DECOMPRESSED_LAYER {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decompressed layer exceeds size limit",
+        ));
+    }
+    Ok(out)
+}
+
 fn is_gzip(blob: &[u8]) -> bool {
     blob.len() >= 2 && blob[0] == 0x1f && blob[1] == 0x8b
+}
+
+/// zstd frame magic number (`0xFD2FB528`, little-endian on the wire).
+fn is_zstd(blob: &[u8]) -> bool {
+    blob.len() >= 4 && blob[0] == 0x28 && blob[1] == 0xB5 && blob[2] == 0x2F && blob[3] == 0xFD
 }
 
 /// Apply a decompressed tar archive as an OverlayFS-style layer on top of
@@ -172,6 +193,43 @@ mod tests {
     use super::*;
     use crate::store::MemStore;
     use crate::tree::empty;
+
+    #[test]
+    fn decompress_handles_gzip_zstd_and_plain() {
+        use std::io::Write;
+        let payload = b"hako layer bytes, long enough to actually compress. ".repeat(20);
+
+        // gzip
+        let gz = {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            e.write_all(&payload).unwrap();
+            e.finish().unwrap()
+        };
+        assert_eq!(
+            decompress("application/vnd.oci.image.layer.v1.tar+gzip", &gz).unwrap(),
+            payload
+        );
+
+        // zstd — compressed by the C reference (dev-dep), decoded by our
+        // pure-Rust ruzstd, both by media type and by magic-byte sniffing.
+        let zst = zstd::encode_all(&payload[..], 3).unwrap();
+        assert!(is_zstd(&zst), "fixture should carry the zstd magic");
+        assert_eq!(
+            decompress("application/vnd.oci.image.layer.v1.tar+zstd", &zst).unwrap(),
+            payload
+        );
+        assert_eq!(
+            decompress("application/octet-stream", &zst).unwrap(),
+            payload,
+            "magic-byte sniffing should catch a mislabeled zstd layer"
+        );
+
+        // plain (uncompressed tar) passes through untouched.
+        assert_eq!(
+            decompress("application/vnd.oci.image.layer.v1.tar", &payload).unwrap(),
+            payload
+        );
+    }
 
     #[test]
     fn normalize_drops_leading_slash() {

@@ -17,6 +17,10 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 tar = "0.4"
 flate2 = "1"
+# zstd-compressed OCI layers (increasingly common). `ruzstd` is a pure-Rust
+# *decoder* — we only ever decompress layers — so it keeps the "no C deps"
+# property that lets the runtime cross-compile to a static musl binary.
+ruzstd = "0.7"
 # OCI registries serve blob/manifest digests as SHA-256. Hako uses blake3
 # internally, so we need sha2 for verification on the wire only.
 sha2 = "0.10"
@@ -44,3 +48,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only: the C-backed reference zstd, used to *compress* fixtures so we can
+# verify our pure-Rust `ruzstd` decoder against real zstd frames. Never in a
+# release build (dev-deps are excluded), so the musl embedded build is unaffected.
+zstd = "0.13"
