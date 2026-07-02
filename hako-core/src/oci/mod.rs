@@ -114,12 +114,16 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
 
         let manifest_bytes = manifest.into_bytes();
-        // Detached: served forever; killed when the test process exits.
+        // A single-layer pull makes exactly two requests — the manifest, then the
+        // blob — each on its own connection (we send `Connection: close`). Serve
+        // exactly those two and let the thread return: no lingering accept loop,
+        // and being detached (never joined) it can't deadlock the test if the
+        // pull fails early.
         std::thread::spawn(move || {
-            for conn in listener.incoming() {
-                let mut s = match conn {
-                    Ok(s) => s,
-                    Err(_) => continue,
+            for _ in 0..2 {
+                let mut s = match listener.accept() {
+                    Ok((s, _)) => s,
+                    Err(_) => return,
                 };
                 let mut buf = [0u8; 4096];
                 let n = s.read(&mut buf).unwrap_or(0);

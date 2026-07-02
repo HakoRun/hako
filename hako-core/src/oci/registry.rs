@@ -52,7 +52,12 @@ pub(super) struct Client {
 /// a test) are plain HTTP by default — matching Docker/containerd's "localhost
 /// is insecure" convention; everything else is https.
 fn registry_base(registry: &str) -> String {
-    let host = registry.rsplit_once(':').map_or(registry, |(h, _)| h);
+    // Strip a trailing `:port` to get the host, being careful with a bracketed
+    // IPv6 host (`[::1]:5000`) whose host part itself contains colons.
+    let host = match registry.rfind(']') {
+        Some(end) => &registry[..=end], // `[..]`, with or without a `:port`
+        None => registry.rsplit_once(':').map_or(registry, |(h, _)| h),
+    };
     let scheme = if matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
         "http"
     } else {
@@ -381,6 +386,10 @@ mod tests {
         assert_eq!(registry_base("ghcr.io"), "https://ghcr.io");
         assert_eq!(registry_base("localhost:5000"), "http://localhost:5000");
         assert_eq!(registry_base("127.0.0.1:8080"), "http://127.0.0.1:8080");
+        // Bracketed IPv6 loopback, with and without a port (the host part itself
+        // contains colons, so a naive last-colon split would misparse it).
+        assert_eq!(registry_base("[::1]:5000"), "http://[::1]:5000");
+        assert_eq!(registry_base("[::1]"), "http://[::1]");
         // A non-loopback host with a port stays https.
         assert_eq!(
             registry_base("registry.example:5000"),

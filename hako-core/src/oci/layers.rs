@@ -24,6 +24,16 @@ pub(super) fn decompress(media_type: &str, blob: &[u8]) -> io::Result<Vec<u8>> {
         read_capped(GzDecoder::new(blob))
     } else if media_type.contains("+zstd") || media_type.contains(".zstd") || is_zstd(blob) {
         // Pure-Rust zstd decoder (no C dependency, unlike the reference lib).
+        //
+        // Bomb safety: unlike gzip's fixed tiny window, a zstd frame declares its
+        // window size in the header, which a decoder could allocate up front —
+        // before `read_capped` ever sees a byte. We rely on `ruzstd` NOT eagerly
+        // allocating the declared window: `StreamingDecoder::new` builds an empty
+        // ring buffer that grows lazily as output is produced, so the same
+        // `read_capped` output bound below caps peak memory. (Note this is our
+        // guardrail, not ruzstd's own `MAX_WINDOW_SIZE` check, which the
+        // first-frame path skips.) If a future ruzstd made the window buffer
+        // eager, this bound would no longer cover it — revisit on upgrade.
         let dec = ruzstd::StreamingDecoder::new(blob)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("zstd init: {e}")))?;
         read_capped(dec)
