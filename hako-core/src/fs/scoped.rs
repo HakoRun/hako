@@ -262,6 +262,21 @@ impl<'s> ScopedFs<'s> {
                 "cannot delete root",
             ));
         }
+        // Fast path: a file or symlink can have no children — the file-ancestor
+        // invariant (`reject_file_ancestor`) forbids writing `key/...` beneath a
+        // non-directory — so a single O(log n) tree delete removes it completely.
+        // This avoids the O(n) scan-and-rebuild of the whole tree for the common
+        // `rm <file>` case (which matters at pulled-image scale). The result is
+        // identical: `tree::delete` yields the same canonical tree bulk_build
+        // would from the remaining entries.
+        if matches!(
+            self.entry(root, &key)?,
+            Some(DirEntry::File(_)) | Some(DirEntry::Symlink(_))
+        ) {
+            return tree::delete(self.store, root, key.as_bytes());
+        }
+        // Directory (explicit marker or implicit via descendant keys): drop the
+        // entry and everything beneath it — this genuinely needs the full scan.
         let mut all = tree::scan(self.store, root)?;
         let prefix = format!("{}/", key);
         all.retain(|(k, _)| k != key.as_bytes() && !k.starts_with(prefix.as_bytes()));
@@ -357,6 +372,12 @@ impl<'s> ScopedFs<'s> {
     /// is a file or symlink. This stops the user from writing `/a/b` while
     /// `/a` is a file, which would otherwise leave `/a` and `/a/b` coexisting
     /// invisibly.
+    ///
+    /// Intentional OCI consequence (issue #43): if one image layer makes `/a` a
+    /// symlink and a later layer writes `/a/b`, the write is rejected rather than
+    /// resolved *through* the symlink. Following writes through a symlinked
+    /// ancestor is the classic tar-symlink escape, so refusing it is the safe
+    /// choice; well-formed images write to real paths, so this is rarely hit.
     fn reject_file_ancestor(&self, root: &Hash, key: &str) -> io::Result<()> {
         let mut start = 0;
         while let Some(off) = key[start..].find('/') {
@@ -550,6 +571,30 @@ mod tests {
         let root = fs.delete(&root, "a/b.txt").unwrap();
         assert!(!fs.exists(&root, "a/b.txt").unwrap());
         assert!(!fs.exists(&root, "a").unwrap());
+    }
+
+    #[test]
+    fn delete_file_matches_rebuild_of_remaining() {
+        // The single-file fast path (tree::delete) must produce the exact same
+        // canonical tree as the scan + bulk_build path it replaces.
+        let s = MemStore::new();
+        let fs = ScopedFs::new(&s);
+        let mut root = empty();
+        for i in 0..200 {
+            root = fs
+                .write_file(&root, &format!("dir/f{:03}", i), format!("v{i}").as_bytes())
+                .unwrap();
+        }
+        let after = fs.delete(&root, "dir/f100").unwrap();
+
+        let mut all = crate::tree::scan(&s, &root).unwrap();
+        all.retain(|(k, _)| k.as_slice() != b"dir/f100");
+        let rebuilt = crate::tree::bulk_build(&s, all).unwrap();
+
+        assert_eq!(after, rebuilt, "fast-path delete must match full rebuild");
+        assert!(!fs.exists(&after, "dir/f100").unwrap());
+        assert!(fs.exists(&after, "dir/f099").unwrap());
+        assert!(fs.exists(&after, "dir/f101").unwrap());
     }
 
     #[test]

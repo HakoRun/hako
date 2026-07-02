@@ -77,13 +77,24 @@ impl FsStore {
     }
 
     fn temp_path(&self, hash: &Hash) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // A per-process sequence disambiguates two threads that write the same
+        // content within the same sub-second nanosecond, which would otherwise
+        // collide on the same temp name and make one `put` fail on create_new.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let hex = hash.to_hex();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        self.root
-            .join(format!(".tmp-{}-{}-{}", std::process::id(), nanos, hex))
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        self.root.join(format!(
+            ".tmp-{}-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            seq,
+            hex
+        ))
     }
 }
 

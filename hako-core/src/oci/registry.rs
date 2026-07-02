@@ -263,6 +263,22 @@ fn split_challenge_params(s: &str) -> Vec<String> {
 }
 
 fn fetch_token(agent: &ureq::Agent, params: &AuthParams) -> io::Result<String> {
+    // `realm` comes from the registry's `WWW-Authenticate` header, i.e. it is
+    // attacker-controlled if the registry is malicious or MITM'd. Restrict it to
+    // https so a crafted challenge can't redirect the (credential-free) token
+    // fetch at an arbitrary internal endpoint such as
+    // `http://169.254.169.254/latest/meta-data/` — a blind SSRF. See issue #41.
+    if !params
+        .realm
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("https://")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("refusing non-https auth realm {:?}", params.realm),
+        ));
+    }
     let mut req = agent.get(&params.realm);
     if let Some(s) = &params.service {
         req = req.query("service", s);
@@ -346,5 +362,31 @@ mod tests {
     fn verify_digest_case_insensitive_algo() {
         let digest = "SHA256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
         verify_digest(digest, b"hello").unwrap();
+    }
+
+    #[test]
+    fn fetch_token_rejects_non_https_realm() {
+        // A malicious registry challenge pointing token fetch at an internal /
+        // metadata endpoint must be refused before any request is made (blind
+        // SSRF guard). No network is touched — the guard returns first.
+        let agent = ureq::AgentBuilder::new().build();
+        for realm in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://auth.internal/token",
+            "ftp://example.com/",
+            " HTTP://Example.com/token",
+        ] {
+            let params = AuthParams {
+                realm: realm.to_string(),
+                service: None,
+                scope: None,
+            };
+            let err = fetch_token(&agent, &params).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::PermissionDenied,
+                "realm {realm:?} should be refused"
+            );
+        }
     }
 }

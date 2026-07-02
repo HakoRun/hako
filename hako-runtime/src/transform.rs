@@ -1174,6 +1174,38 @@ fn setup_user_volumes(root: &str, volumes: &[VolumeMount]) -> Result<(), Runtime
             )
             .map_err(|e| io_other(format!("remount {} ro: {}", target, e)))?;
         }
+        // Shadow any masked sub-paths with an empty read-only tmpfs. This is how
+        // the implicit `/workspace` mount hides the workspace's own `.hako/`
+        // (the content-addressed store, refs, and — in cluster builds — the
+        // Ed25519 identity key) from the workload: without it a `run` workload
+        // could read the store or the private key and, because `/workspace` is a
+        // real host mount (not the ephemeral FUSE rootfs), delete or rewrite the
+        // host repo. Overmounts sit on top of the bind, so the ro flag above does
+        // not prevent creating them.
+        //
+        // What actually protects: the tmpfs is *empty* (nothing to read) and
+        // *read-only* (nothing to write). The `mode=0000` is cosmetic — the
+        // workload's userns-root holds CAP_DAC_OVERRIDE and can still traverse
+        // it, but there is nothing underneath to find. The real `.hako` remains
+        // in the bind below, so concealment depends on the workload being unable
+        // to `umount2` this tmpfs or `mount` a fresh view of the host dir — which
+        // the seccomp filter guarantees (it blocks mount/umount2/move_mount/…, see
+        // `apply_seccomp`). With `HAKO_NO_SECCOMP` the mask is liftable via
+        // `umount2`, but so is the rest of the in-container syscall hardening.
+        for sub in &v.mask {
+            let masked = format!("{}/{}", target, sub.trim_matches('/'));
+            // Only shadow a path that actually exists under the mount; a mask
+            // for an absent sub-path is a harmless no-op.
+            if Path::new(&masked).exists() {
+                mount_kind(
+                    "tmpfs",
+                    &masked,
+                    "tmpfs",
+                    MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+                    Some("mode=0000,size=0"),
+                )?;
+            }
+        }
     }
     Ok(())
 }
