@@ -153,9 +153,10 @@ fn run_host_in_container(
     let branch = repo
         .current_branch()?
         .ok_or_else(|| io::Error::other("container has no current branch"))?;
-    eprintln!(
-        "hako: running {} against container '{}' (libraries from the container)",
-        path, container
+    crate::diag!(
+        "running {} against container '{}' (libraries from the container)",
+        path,
+        container
     );
     let code = hako_runtime::transform::run_container(&repo, &branch, command, &volumes)
         .map_err(runtime_to_io)?;
@@ -197,12 +198,12 @@ fn resolve_auto_container(ctx: &Ctx<'_>, path: &str) -> io::Result<String> {
         Libc::Musl => ("musl", "alpine", "alpine"),
         Libc::Glibc => ("glibc", "debian", "debian"),
     };
-    eprintln!("hako: detected {} binary → base image '{}'", libc, image);
+    crate::diag!("detected {} binary → base image '{}'", libc, image);
 
     // Reuse an existing container of that name if present (it may already have
     // the binary's other shared-lib deps installed); otherwise pull the base.
     if ctx.state.list_containers()?.iter().any(|c| c == distro) {
-        eprintln!("hako: reusing existing container '{}'", distro);
+        crate::diag!("reusing existing container '{}'", distro);
     } else {
         let image_ref = hako::ImageRef::parse(image).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidInput, format!("bad image ref: {}", e))

@@ -399,7 +399,7 @@ fn import_path(
             let name = match entry.file_name().into_string() {
                 Ok(s) => s,
                 Err(_) => {
-                    eprintln!("hako: skipping non-utf8 name in {}", src.display());
+                    crate::diag!("skipping non-utf8 name in {}", src.display());
                     continue;
                 }
             };
@@ -446,8 +446,8 @@ fn export_path(
         let target_bytes = scoped.read_symlink(root, src)?;
         let target = bytes_to_path(&target_bytes);
         if let Err(e) = create_host_symlink(&target, dst) {
-            eprintln!(
-                "hako: could not create symlink {} -> {}: {} (writing target as a regular file)",
+            crate::diag!(
+                "could not create symlink {} -> {}: {} (writing target as a regular file)",
                 dst.display(),
                 target.display(),
                 e

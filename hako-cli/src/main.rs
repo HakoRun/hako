@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 mod cmd;
+mod diag;
 mod helpers;
 mod host_bridge;
 
@@ -541,14 +542,14 @@ fn main() -> ExitCode {
         Ok(Some(code)) => return code,
         Ok(None) => {}
         Err(e) => {
-            eprintln!("hako: bundle: {}", e);
+            crate::diag!("bundle: {}", e);
             return ExitCode::FAILURE;
         }
     }
     match run() {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("hako: {}", e);
+            crate::diag!("{}", e);
             ExitCode::FAILURE
         }
     }
@@ -1031,17 +1032,17 @@ fn find_workspace_root(start: &std::path::Path) -> io::Result<PathBuf> {
 
 fn host_bootstrap() -> io::Result<ExitCode> {
     if cfg!(target_os = "linux") {
-        eprintln!("hako: nothing to bootstrap (already on Linux)");
+        crate::diag!("nothing to bootstrap (already on Linux)");
         return Ok(ExitCode::SUCCESS);
     }
     host_bridge::ensure_runtime()?;
     if !host_bridge::has_embedded_binary() {
-        eprintln!(
-            "hako: bootstrap done (no embedded Linux binary; \
+        crate::diag!(
+            "bootstrap done (no embedded Linux binary; \
              expecting hako installed inside the WSL/Lima env)"
         );
     } else {
-        eprintln!("hako: runtime ready");
+        crate::diag!("runtime ready");
     }
     Ok(ExitCode::SUCCESS)
 }

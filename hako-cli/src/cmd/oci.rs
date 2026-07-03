@@ -59,9 +59,14 @@ pub fn pull_into(
     arch: &str,
     per_layer: bool,
 ) -> io::Result<Hash> {
-    eprintln!(
-        "hako: pulling {}/{}:{} ({}/{}) into container {}",
-        image_ref.registry, image_ref.repo, image_ref.reference, os, arch, container
+    crate::diag!(
+        "pulling {}/{}:{} ({}/{}) into container {}",
+        image_ref.registry,
+        image_ref.repo,
+        image_ref.reference,
+        os,
+        arch,
+        container
     );
     // Track whether THIS call created the container, so a mid-pull failure
     // (network drop, registry 5xx, bad layer) doesn't leave a half-created,

@@ -43,11 +43,11 @@ pub fn ensure_runtime() -> io::Result<()> {
                 distro
             )));
         }
-        eprintln!("hako: setting up WSL distro {} (one-time)...", distro);
+        crate::diag!("setting up WSL distro {} (one-time)...", distro);
         create_distro(&distro)?;
         inject_binary(&distro)?;
         write_installed_hash(&distro, &binary_hash())?;
-        eprintln!("hako: runtime ready");
+        crate::diag!("runtime ready");
         return Ok(());
     }
 
@@ -58,7 +58,7 @@ pub fn ensure_runtime() -> io::Result<()> {
     if has_embedded_binary() {
         let want = binary_hash();
         if read_installed_hash(&distro).as_deref() != Some(&want) {
-            eprintln!("hako: updating embedded binary inside {}", distro);
+            crate::diag!("updating embedded binary inside {}", distro);
             inject_binary(&distro)?;
             write_installed_hash(&distro, &want)?;
         }
@@ -101,15 +101,15 @@ fn warn_on_version_skew(distro: &str) {
                 let _ = fs::write(m, want);
             }
         }
-        Some(got) => eprintln!(
-            "hako: WARNING: the hako in WSL distro '{distro}' is {got}, but this \
+        Some(got) => crate::diag!(
+            "warning: the hako in WSL distro '{distro}' is {got}, but this \
              wrapper is {want}. Runtime commands run inside WSL, so they use \
              {got}. Update it with `wsl -d {distro} -- cargo install --force \
              hako-cli`, or rebuild this wrapper with --features embedded to \
              keep it auto-synced."
         ),
-        None => eprintln!(
-            "hako: WARNING: couldn't determine the hako version in WSL distro \
+        None => crate::diag!(
+            "warning: couldn't determine the hako version in WSL distro \
              '{distro}' — it may be missing or too old. If runtime commands \
              fail, update it with `wsl -d {distro} -- cargo install --force \
              hako-cli`."
