@@ -36,14 +36,14 @@ pub fn ensure_runtime() -> io::Result<()> {
                     vm
                 )));
             }
-            eprintln!("hako: setting up Lima VM {} (one-time, ~1-2 min)...", vm);
+            crate::diag!("setting up Lima VM {} (one-time, ~1-2 min)...", vm);
             create_vm(&vm)?;
             inject_binary(&vm)?;
             write_installed_hash(&vm, &binary_hash())?;
-            eprintln!("hako: runtime ready");
+            crate::diag!("runtime ready");
         }
         VmStatus::Stopped => {
-            eprintln!("hako: starting Lima VM {}", vm);
+            crate::diag!("starting Lima VM {}", vm);
             let s = Command::new("limactl").args(["start", &vm]).status()?;
             if !s.success() {
                 return Err(io::Error::other("limactl start failed"));
@@ -174,7 +174,7 @@ fn ensure_binary_current(name: &str) -> io::Result<()> {
     }
     let want = binary_hash();
     if read_installed_hash(name).as_deref() != Some(&want) {
-        eprintln!("hako: updating embedded binary inside {}", name);
+        crate::diag!("updating embedded binary inside {}", name);
         inject_binary(name)?;
         write_installed_hash(name, &want)?;
     }

@@ -142,8 +142,8 @@ fn forward_windows(cwd: &Path, args: &[String]) -> io::Result<ExitCode> {
     let (workdir_win, rest) = extract_w_flag_windows(args);
     let translated_args = translate_run_host_path_windows(rest);
 
-    eprintln!(
-        "hako: forwarding to wsl -d {} (set HAKO_DISTRO to override)",
+    crate::diag!(
+        "forwarding to wsl -d {} (set HAKO_DISTRO to override)",
         distro
     );
 
@@ -169,8 +169,8 @@ fn forward_macos(_cwd: &Path, args: &[String]) -> io::Result<ExitCode> {
     // (`hako-runtime`) is what we forward into.
     let vm = bootstrap_lima::vm_name();
 
-    eprintln!(
-        "hako: forwarding to limactl shell {} (set HAKO_LIMA_VM to override)",
+    crate::diag!(
+        "forwarding to limactl shell {} (set HAKO_LIMA_VM to override)",
         vm
     );
 

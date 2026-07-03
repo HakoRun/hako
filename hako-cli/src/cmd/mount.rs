@@ -17,8 +17,8 @@ pub fn mount(ctx: &Ctx<'_>, mountpoint: PathBuf, from: String) -> io::Result<Exi
     let objs = ctx.workdir.join(DOT_HAKO).join(hako::state::OBJECTS);
     drop(repo);
     let store: Arc<dyn ChunkStore + Send + Sync + 'static> = Arc::new(hako::FsStore::new(objs)?);
-    eprintln!(
-        "hako: mounting tree {} at {} (read-only; Ctrl+C to unmount)",
+    crate::diag!(
+        "mounting tree {} at {} (read-only; Ctrl+C to unmount)",
         &root.to_hex()[..12],
         mountpoint.display()
     );

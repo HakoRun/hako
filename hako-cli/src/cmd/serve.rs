@@ -293,19 +293,19 @@ pub fn serve(
     let exposes_remote = check_bind_safety(addr, allow_remote)?;
     let listener = TcpListener::bind(addr)?;
     println!(
-        "hako serve: listening on {} as {}",
+        "hako: serve: listening on {} as {}",
         listener.local_addr()?,
         id.node_id()
     );
     if exposes_remote {
-        eprintln!(
-            "hako serve: WARNING — bound a routable address; the channel is authenticated \
-             but NOT encrypted. Use only on a trusted LAN/VPN."
+        crate::diag!(
+            "serve: warning: bound a routable address; the channel is encrypted and \
+             peer-authenticated, but expose it only on a trusted LAN/VPN."
         );
     }
     if allow_remote_run {
-        eprintln!(
-            "hako serve: WARNING — remote `ctl run` is ENABLED; any registered peer can \
+        crate::diag!(
+            "serve: warning: remote `ctl run` is enabled; any registered peer can \
              execute commands in a container on this node."
         );
     }
@@ -313,10 +313,10 @@ pub fn serve(
         match conn {
             Ok(stream) => {
                 if let Err(e) = handle_peer(stream, &id, ctx, allow_remote_run) {
-                    eprintln!("hako serve: connection error: {e}");
+                    crate::diag!("serve: connection error: {e}");
                 }
             }
-            Err(e) => eprintln!("hako serve: accept error: {e}"),
+            Err(e) => crate::diag!("serve: accept error: {e}"),
         }
     }
     Ok(ExitCode::SUCCESS)

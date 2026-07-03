@@ -44,7 +44,7 @@ pub fn commit_repo(
         None => None,
     };
     if Some(work) == head_tree {
-        eprintln!("nothing to commit (working tree matches HEAD)");
+        crate::diag!("nothing to commit (working tree matches HEAD)");
         return Ok(ExitCode::from(1));
     }
     let parents = head.into_iter().collect();
@@ -140,7 +140,7 @@ pub fn checkout(ctx: &Ctx<'_>, branch: String, force: bool) -> io::Result<ExitCo
         let head_tree = repo.head_tree()?;
         let work_tree = repo.working_tree()?;
         if head_tree != work_tree {
-            eprintln!("uncommitted changes in working tree; commit, discard, or pass --force");
+            crate::diag!("uncommitted changes in working tree; commit, discard, or pass --force");
             return Ok(ExitCode::from(1));
         }
     }
@@ -195,7 +195,7 @@ pub fn merge(
     if head == theirs {
         // Already pointing at the same commit — merging would create a
         // redundant commit with [head, head] as parents and no tree change.
-        eprintln!("already up to date (HEAD == {})", branch);
+        crate::diag!("already up to date (HEAD == {})", branch);
         return Ok(ExitCode::SUCCESS);
     }
     let base = repo.common_ancestor(head, theirs)?.unwrap_or(Hash::zero());

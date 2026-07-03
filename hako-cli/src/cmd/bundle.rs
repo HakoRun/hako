@@ -209,8 +209,8 @@ fn launch(payload: &[u8]) -> io::Result<ExitCode> {
     let runner_consented =
         std::env::var_os("HAKO_DISPLAY").is_some_and(|v| v != "0" && !v.is_empty());
     if wants_display && !runner_consented {
-        eprintln!(
-            "hako: this bundle can render a GUI on your desktop, which grants it \
+        crate::diag!(
+            "this bundle can render a GUI on your desktop, which grants it \
              access to your display session (X11/Wayland — it could read your \
              screen and keystrokes). To allow it, re-run with HAKO_DISPLAY=1."
         );
@@ -348,8 +348,8 @@ pub fn create(
     // Linux binary (an `--features embedded` build). Without that feature the
     // target's WSL/Lima must already have a current hako, so warn.
     if !cfg!(target_os = "linux") && !crate::host_bridge::has_embedded_binary() {
-        eprintln!(
-            "hako: warning: building a {} bundle without an embedded Linux \
+        crate::diag!(
+            "warning: building a {} bundle without an embedded Linux \
              runtime (--features embedded). It will run on {0}, but the target \
              machine's WSL/Lima must already have a current hako installed; it \
              is not fully self-contained.",
@@ -381,10 +381,7 @@ pub fn create(
     } else {
         cmd.join(" ")
     };
-    eprintln!(
-        "hako: bundled {} reachable objects for '{}'",
-        copied, container
-    );
+    crate::diag!("bundled {} reachable objects for '{}'", copied, container);
     println!(
         "bundled container '{}' [{}] → {} ({:.1} MiB)",
         container,
