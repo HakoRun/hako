@@ -1,33 +1,48 @@
-# Vendored `toybox` binary — provenance
+# Vendored `toybox` binaries — provenance
 
-`src/rootfs/toybox` is a third-party binary vendored into the source tree and
-embedded via `include_bytes!` (see `mod.rs`). It seeds the default `hako`
-container with a usable Linux userland (`bin/<applet>` → `toybox`).
+`src/rootfs/toybox-<arch>` are third-party binaries vendored into the source tree
+and embedded via `include_bytes!` (see `mod.rs`), one per supported target arch.
+The build embeds the binary matching the **build target**, so the default `hako`
+container's `bin/<applet>` → `toybox` userland matches the CPU it runs on. An
+x86_64 shell seeded on an arm64 host execs as `ENOEXEC` — issue #34.
 
-| | |
-|---|---|
-| Project | toybox — https://landley.net/toybox/ |
-| Version | 0.8.13 |
-| Source | https://landley.net/toybox/bin/toybox-x86_64 |
-| Arch / linkage | x86-64, statically linked, stripped (ELF) |
-| Size | 752152 bytes |
-| SHA-256 | `8c98795a15db31ea55c8065fed379db3669766b7a714c46b009d8bfb87b25ffd` |
-| License | 0BSD (Zero-Clause BSD) — see https://landley.net/toybox/license.html |
+| | x86-64 | aarch64 |
+|---|---|---|
+| Project | toybox — https://landley.net/toybox/ | toybox |
+| Version | 0.8.13 | 0.8.13 |
+| Source | `…/downloads/binaries/0.8.13/toybox-x86_64` | `…/downloads/binaries/0.8.13/toybox-aarch64` |
+| Linkage | static, stripped ELF | static, stripped ELF |
+| File | `src/rootfs/toybox-x86_64` | `src/rootfs/toybox-aarch64` |
+| Size | 752152 bytes | 833872 bytes |
+| SHA-256 | `8c98795a15db31ea55c8065fed379db3669766b7a714c46b009d8bfb87b25ffd` | `b3508e5f51a0d429c1bda9d500d98d97dc0b86571762eeb099495eb238a8c52a` |
+| License | 0BSD — https://landley.net/toybox/license.html | 0BSD |
 
-## Why it's vendored (and the plan to stop)
+Both are from the same 0.8.13 release directory:
+<https://landley.net/toybox/downloads/binaries/0.8.13/>
 
-It's committed directly so a fresh `cargo build` produces a self-contained
-binary with no network or build-time fetch. The cost is repo bloat (~734 KB in
-every clone) and no build-time integrity check.
+A target with **no** vendored binary (neither x86_64 nor aarch64) embeds an empty
+slice: `rootfs::is_available()` is then false and `hako init` reports "embedded
+toybox rootfs not available" rather than seeding a rootfs whose shell can't exec.
+Pull an OCI image for a userland on such a target.
 
-**Intended future:** fetch the binary at build time (in `build.rs` or `xtask`),
-verifying the SHA-256 above, and drop it from version control — or move it to a
-release asset / Git LFS. Until then, this file is the provenance record.
+## Why vendored (and the plan to stop)
 
-## Updating it
+Committed directly so a fresh `cargo build` is self-contained — no network or
+build-time fetch. The cost is repo size (~1.5 MB across both arches) and no
+build-time integrity check.
 
-1. Download the new `toybox-<arch>` from the release above.
-2. Verify its checksum, replace `src/rootfs/toybox`, and update the version +
-   SHA-256 + size in this file and the comment in `mod.rs`.
-3. Re-run `cargo test -p hako-core` (the rootfs determinism test pins the tree
-   hash, so a binary change is a deliberate, visible change).
+**Intended future:** fetch only the build target's binary at build time
+(`build.rs`/`xtask`), verifying the SHA-256s above, and drop them from version
+control — or move them to release assets / Git LFS. Until then, these files are
+the provenance record.
+
+## Updating
+
+1. Download `toybox-x86_64` and `toybox-aarch64` from the **same** release under
+   <https://landley.net/toybox/downloads/binaries/> (keep both arches on one
+   version).
+2. Verify each checksum, replace `src/rootfs/toybox-<arch>`, and update the
+   version + SHA-256 + size here and the comment in `mod.rs`.
+3. Re-run `cargo test -p hako-core` (the rootfs tests compare against the embedded
+   bytes) — and note CI runs the isolation check on **both** x86_64 and arm64, so
+   an arch mismatch surfaces there.

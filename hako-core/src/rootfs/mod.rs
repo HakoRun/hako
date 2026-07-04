@@ -14,12 +14,20 @@ use crate::store::ChunkStore;
 use crate::tree::empty;
 use std::io;
 
-// toybox 0.8.13 (x86_64, static, 0BSD) — https://landley.net/toybox/bin/toybox-x86_64
-// Vendored under src/rootfs/toybox (sha256
-// 8c98795a15db31ea55c8065fed379db3669766b7a714c46b009d8bfb87b25ffd).
-// Full provenance + the plan to fetch-at-build instead of vendoring: see
-// src/rootfs/README.md.
-const TOYBOX_BIN: &[u8] = include_bytes!("toybox");
+// toybox 0.8.13, statically linked, 0BSD — one binary per supported target arch,
+// vendored under `src/rootfs/toybox-<arch>` and embedded for the *build* target
+// so the seeded rootfs `/bin/sh` matches the CPU it will run on. An x86_64 binary
+// on an arm64 host execs as `ENOEXEC` (issue #34), which is a real bug for arm64
+// users, not just a CI quirk. Provenance + SHA-256s: see `src/rootfs/README.md`.
+#[cfg(target_arch = "x86_64")]
+const TOYBOX_BIN: &[u8] = include_bytes!("toybox-x86_64");
+#[cfg(target_arch = "aarch64")]
+const TOYBOX_BIN: &[u8] = include_bytes!("toybox-aarch64");
+// Any other target has no vendored toybox: `is_available()` is then false and
+// `hako init` reports "embedded toybox rootfs not available" rather than seeding
+// a rootfs whose shell can't exec. (Pull an OCI image for a userland instead.)
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const TOYBOX_BIN: &[u8] = &[];
 
 /// Toybox applet symlinks. Each becomes `bin/<applet>` → `toybox`.
 /// Runtime dispatch is by argv[0], so the symlink name *is* the command.
