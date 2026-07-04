@@ -65,11 +65,10 @@ jobs:
   isolation:
     name: isolation (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    # arm64 runtime is not yet verified (the hosted arm64 runner's
-    # userns/fuse support is still being characterized); keep it informational
-    # so it can't block a release while we confirm whether failures there are a
-    # runner limitation or a real bug. x86_64 stays blocking.
-    continue-on-error: ${{ matrix.arch == 'arm64' }}
+    # Both arches are blocking. The arm64 runtime is now verified: the seeded
+    # toybox rootfs is arch-matched (#34), so `hako run` execs a native shell and
+    # the isolation check — including the arch-specific seccomp filter — runs for
+    # real. A regression on either arch must fail CI.
     strategy:
       fail-fast: false
       matrix:
