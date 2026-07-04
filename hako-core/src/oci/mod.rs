@@ -182,4 +182,69 @@ mod tests {
             b"hi from a zstd layer"
         );
     }
+
+    /// Serve a single `401 Unauthorized` (with an optional `WWW-Authenticate`
+    /// challenge) from a throwaway loopback registry, attempt a pull, and return
+    /// the resulting error. Exercises the `Client::get` 401 branch end to end —
+    /// the auth path the happy-path pull tests skip. (A full token-retry can't be
+    /// mocked over loopback: the token realm must be https — the #41 SSRF guard
+    /// forbids http realms — and standing up a trusted-cert TLS mock is out of
+    /// proportion for a hardening test.)
+    fn mock_pull_401(www_authenticate: Option<&str>) -> std::io::Error {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let challenge = www_authenticate
+            .map(|w| format!("WWW-Authenticate: {w}\r\n"))
+            .unwrap_or_default();
+        // One connection: the client fails at the challenge (bad realm or none)
+        // before any retry, so a single accept covers the exchange. Detached, so
+        // it can't wedge the test if the pull errors even earlier.
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 401 Unauthorized\r\n{challenge}Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+
+        let image = ImageRef {
+            registry: addr,
+            repo: "testrepo".into(),
+            reference: "latest".into(),
+        };
+        let store = MemStore::new();
+        let scoped = ScopedFs::new(&store);
+        // `PullResult` isn't `Debug`, so match rather than `expect_err`.
+        match pull(&image, &scoped, empty(), &PullOptions::default()) {
+            Ok(_) => panic!("a 401 with an unusable challenge must fail the pull"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn pull_refuses_a_non_https_auth_realm() {
+        // A 401 whose challenge points the credential-free token fetch at an
+        // http realm must be refused, not followed (SSRF guard, #41).
+        let err = mock_pull_401(Some(
+            r#"Bearer realm="http://127.0.0.1:1/token",service="r",scope="s""#,
+        ));
+        assert!(
+            err.to_string().contains("non-https auth realm"),
+            "expected the http realm to be refused: {err}"
+        );
+    }
+
+    #[test]
+    fn pull_reports_a_401_with_no_challenge() {
+        // A 401 with no WWW-Authenticate header can't be retried; the error must
+        // say so rather than surface an opaque HTTP failure.
+        let err = mock_pull_401(None);
+        assert!(
+            err.to_string().contains("no challenge"),
+            "expected a clear no-challenge error: {err}"
+        );
+    }
 }
