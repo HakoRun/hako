@@ -307,7 +307,14 @@ fn fetch_token(agent: &ureq::Agent, params: &AuthParams) -> io::Result<String> {
     })?;
     let mut buf = String::new();
     resp.into_reader().read_to_string(&mut buf)?;
+    parse_token_response(&buf)
+}
 
+/// Extract the bearer token from a registry token endpoint's JSON response.
+/// Docker/OCI registries return `{"token": "..."}`; some (and the OAuth2 refresh
+/// flow) use `{"access_token": "..."}`. Prefer `token`, fall back to
+/// `access_token`, and reject a response carrying neither.
+fn parse_token_response(body: &str) -> io::Result<String> {
     #[derive(Deserialize)]
     struct Token {
         #[serde(default)]
@@ -315,7 +322,7 @@ fn fetch_token(agent: &ureq::Agent, params: &AuthParams) -> io::Result<String> {
         #[serde(default, rename = "access_token")]
         access_token: String,
     }
-    let t: Token = serde_json::from_str(&buf)
+    let t: Token = serde_json::from_str(body)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("token parse: {}", e)))?;
     if !t.token.is_empty() {
         Ok(t.token)
@@ -342,6 +349,39 @@ mod tests {
         assert_eq!(c.realm, "https://auth.docker.io/token");
         assert_eq!(c.service.as_deref(), Some("registry.docker.io"));
         assert_eq!(c.scope.as_deref(), Some("repository:library/busybox:pull"));
+    }
+
+    #[test]
+    fn parse_token_prefers_token_then_access_token() {
+        assert_eq!(parse_token_response(r#"{"token":"abc"}"#).unwrap(), "abc");
+        assert_eq!(
+            parse_token_response(r#"{"access_token":"xyz"}"#).unwrap(),
+            "xyz"
+        );
+        // Both present → `token` wins (the Docker v2 field), regardless of order.
+        assert_eq!(
+            parse_token_response(r#"{"access_token":"b","token":"a"}"#).unwrap(),
+            "a"
+        );
+    }
+
+    #[test]
+    fn parse_token_rejects_empty_and_malformed() {
+        // Neither field, or an empty token, is a permission failure — not an
+        // accidental empty bearer that would then 401 confusingly downstream.
+        assert_eq!(
+            parse_token_response("{}").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            parse_token_response(r#"{"token":""}"#).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // Non-JSON is a clear parse error, not a panic.
+        assert_eq!(
+            parse_token_response("not json").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
