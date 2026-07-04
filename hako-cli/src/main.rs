@@ -124,7 +124,11 @@ enum Cmd {
         depth: Option<usize>,
     },
     /// Show working tree status
-    Status,
+    Status {
+        /// Emit machine-readable JSON instead of the human summary.
+        #[arg(long)]
+        json: bool,
+    },
 
     // ------------------------------------------------------------ Version control
     /// Commit the working tree
@@ -136,7 +140,11 @@ enum Cmd {
         author: Option<String>,
     },
     /// Show commit history
-    Log,
+    Log {
+        /// Emit machine-readable JSON instead of the human summary.
+        #[arg(long)]
+        json: bool,
+    },
     /// List, create, or delete branches. `start` may be a branch name or hash prefix.
     Branch {
         name: Option<String>,
@@ -199,7 +207,11 @@ enum Cmd {
 
     // ------------------------------------------------------------ Containers (workspaces)
     /// List containers
-    Containers,
+    Containers {
+        /// Emit machine-readable JSON instead of the human summary.
+        #[arg(long)]
+        json: bool,
+    },
     /// Create a new container
     NewContainer { name: String },
     /// Delete a container
@@ -339,6 +351,9 @@ enum Cmd {
     Ps {
         #[arg(short = 'a', long)]
         all: bool,
+        /// Emit machine-readable JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
     },
     /// Show the captured stdout/stderr of a runtime instance.
     Logs {
@@ -495,13 +510,13 @@ impl Cmd {
     fn holds_workspace_lock(&self) -> bool {
         match self {
             // Read-only inspection — no lock needed.
-            Cmd::Containers
+            Cmd::Containers { .. }
             | Cmd::Cat { .. }
             | Cmd::Ls { .. }
             | Cmd::Pwd
             | Cmd::Tree { .. }
-            | Cmd::Status
-            | Cmd::Log
+            | Cmd::Status { .. }
+            | Cmd::Log { .. }
             | Cmd::Diff { .. }
             | Cmd::Export { .. }
             | Cmd::Fsck
@@ -762,9 +777,14 @@ fn run() -> io::Result<ExitCode> {
         Cmd::Init { .. } => unreachable!(),
 
         // Containers (workspaces)
-        Cmd::Containers => {
-            for c in state.list_containers()? {
-                println!("{}", c);
+        Cmd::Containers { json } => {
+            let names = state.list_containers()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&names)?);
+            } else {
+                for c in names {
+                    println!("{}", c);
+                }
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -846,11 +866,11 @@ fn run() -> io::Result<ExitCode> {
         Cmd::Pwd => cmd::nav::pwd(&ctx),
         Cmd::Cd { path } => cmd::nav::cd(&ctx, path),
         Cmd::Tree { path, depth } => cmd::nav::tree(&ctx, path, depth),
-        Cmd::Status => cmd::nav::status(&ctx),
+        Cmd::Status { json } => cmd::nav::status(&ctx, json),
 
         // VC
         Cmd::Commit { message, author } => cmd::vc::commit(&ctx, message, author),
-        Cmd::Log => cmd::vc::log(&ctx),
+        Cmd::Log { json } => cmd::vc::log(&ctx, json),
         Cmd::Branch {
             name,
             start,
@@ -933,7 +953,7 @@ fn run() -> io::Result<ExitCode> {
             display,
             cmd,
         } => cmd::bundle::create(&ctx, container, cmd, output, force, display),
-        Cmd::Ps { all } => cmd::runtime::ps(&ctx, all),
+        Cmd::Ps { all, json } => cmd::runtime::ps(&ctx, all, json),
         Cmd::Logs { id, follow } => cmd::runtime::logs(&ctx, id, follow),
         Cmd::Exec { id, command } => cmd::runtime::exec(&ctx, id, command),
         Cmd::Stop { id, force } => cmd::runtime::stop(&ctx, id, force),

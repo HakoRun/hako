@@ -397,25 +397,70 @@ fn build_volumes(
     Ok(user_volumes)
 }
 
-pub fn ps(ctx: &Ctx<'_>, all: bool) -> io::Result<ExitCode> {
+pub fn ps(ctx: &Ctx<'_>, all: bool, json: bool) -> io::Result<ExitCode> {
     let runtime_root = ctx.workdir.join(DOT_HAKO);
     let instances = hako_runtime::instances::list(&runtime_root).map_err(runtime_to_io)?;
-    println!("{:<14} {:<20} {:<10} COMMAND", "ID", "BRANCH", "STATUS");
-    for inst in instances {
-        if !all && !inst.is_running() {
-            continue;
-        }
-        let cmd = if inst.config.command.is_empty() {
+    let shown: Vec<_> = instances
+        .into_iter()
+        .filter(|i| all || i.is_running())
+        .collect();
+
+    if json {
+        let arr: Vec<serde_json::Value> = shown
+            .iter()
+            .map(|i| {
+                serde_json::json!({
+                    "id": i.id,
+                    "container": i.config.container,
+                    "branch": i.config.branch,
+                    "command": i.config.command,
+                    "status": i.status(),
+                    "running": i.is_running(),
+                    "pid": i.pid,
+                    "exit_code": i.exit_code,
+                    "started_unix": i.config.started_unix,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Human table. Size the ID/BRANCH/STATUS columns to the widest value so a
+    // long id or branch can't shove the later columns out of alignment (the old
+    // fixed 14/20/10 widths broke on long names).
+    let statuses: Vec<String> = shown.iter().map(|i| i.status()).collect();
+    let id_w = shown
+        .iter()
+        .map(|i| i.id.len())
+        .max()
+        .unwrap_or(0)
+        .max("ID".len());
+    let br_w = shown
+        .iter()
+        .map(|i| i.config.branch.len())
+        .max()
+        .unwrap_or(0)
+        .max("BRANCH".len());
+    let st_w = statuses
+        .iter()
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0)
+        .max("STATUS".len());
+    println!(
+        "{:<id_w$} {:<br_w$} {:<st_w$} COMMAND",
+        "ID", "BRANCH", "STATUS"
+    );
+    for (i, st) in shown.iter().zip(&statuses) {
+        let cmd = if i.config.command.is_empty() {
             "(shell)".to_string()
         } else {
-            inst.config.command.join(" ")
+            i.config.command.join(" ")
         };
         println!(
-            "{:<14} {:<20} {:<10} {}",
-            inst.id,
-            inst.config.branch,
-            inst.status(),
-            cmd
+            "{:<id_w$} {:<br_w$} {:<st_w$} {}",
+            i.id, i.config.branch, st, cmd
         );
     }
     Ok(ExitCode::SUCCESS)

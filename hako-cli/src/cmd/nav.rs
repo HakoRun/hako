@@ -189,21 +189,51 @@ pub fn tree(ctx: &Ctx<'_>, path: Option<String>, depth: Option<usize>) -> io::Re
     Ok(ExitCode::SUCCESS)
 }
 
-pub fn status(ctx: &Ctx<'_>) -> io::Result<ExitCode> {
+pub fn status(ctx: &Ctx<'_>, json: bool) -> io::Result<ExitCode> {
     let repo = ctx.state.open_container(ctx.default_container)?;
     let branch = repo
         .current_branch()?
         .unwrap_or_else(|| "(detached)".into());
     let head_tree = repo.head_tree()?;
     let work_tree = repo.working_tree()?;
+    let clean = head_tree == work_tree;
+    let diffs = if clean {
+        Vec::new()
+    } else {
+        hako::tree::diff(repo.store(), &head_tree, &work_tree)?
+    };
+
+    if json {
+        let changes: Vec<serde_json::Value> = diffs
+            .iter()
+            .map(|d| {
+                let (change, key) = match d {
+                    hako::tree::DiffEntry::Added { key, .. } => ("added", key),
+                    hako::tree::DiffEntry::Removed { key, .. } => ("removed", key),
+                    hako::tree::DiffEntry::Modified { key, .. } => ("modified", key),
+                };
+                serde_json::json!({
+                    "path": String::from_utf8_lossy(key),
+                    "change": change,
+                })
+            })
+            .collect();
+        let out = serde_json::json!({
+            "branch": branch,
+            "clean": clean,
+            "changes": changes,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+
     println!("on branch {}", branch);
-    if head_tree == work_tree {
+    if clean {
         println!("nothing to commit, working tree clean");
     } else {
         println!("changes since HEAD:");
-        let diffs = hako::tree::diff(repo.store(), &head_tree, &work_tree)?;
-        for d in diffs {
-            print_diff(&d);
+        for d in &diffs {
+            print_diff(d);
         }
     }
     Ok(ExitCode::SUCCESS)

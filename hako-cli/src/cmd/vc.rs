@@ -58,16 +58,38 @@ pub fn commit_repo(
     Ok(ExitCode::SUCCESS)
 }
 
-pub fn log(ctx: &Ctx<'_>) -> io::Result<ExitCode> {
+pub fn log(ctx: &Ctx<'_>, json: bool) -> io::Result<ExitCode> {
     let repo = ctx.state.open_container(ctx.default_container)?;
     let head = match repo.head_commit()? {
         Some(h) => h,
         None => {
-            println!("(no commits yet)");
+            if json {
+                println!("[]");
+            } else {
+                println!("(no commits yet)");
+            }
             return Ok(ExitCode::SUCCESS);
         }
     };
-    for (h, c) in repo.log(head)? {
+    let entries = repo.log(head)?;
+    if json {
+        let arr: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(h, c)| {
+                serde_json::json!({
+                    "hash": h.to_hex(),
+                    "parents": c.parents.iter().map(|p| p.to_hex()).collect::<Vec<_>>(),
+                    "tree": c.tree.to_hex(),
+                    "author": c.author,
+                    "message": c.message,
+                    "timestamp": c.timestamp,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    for (h, c) in entries {
         println!(
             "{}  {}  {} -- {}",
             &h.to_hex()[..12],
