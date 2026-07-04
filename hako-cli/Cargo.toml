@@ -24,6 +24,10 @@ flate2 = "1"
 # in $TMP before `limactl copy` ships it into the VM. RAII cleanup so a
 # crash mid-copy doesn't leak a ~10 MiB file in /tmp.
 tempfile = "3"
+# Machine-readable command output (`--json` on ps/containers/log/status).
+# Already a workspace dep (hako-core/runtime); in the base binary so scripting
+# output needs no feature flag.
+serde_json.workspace = true
 # Cluster node identity (Phase 1): an Ed25519 keypair is the node's stable id.
 # Optional — only the `cluster` feature pulls in the crypto stack, so the
 # single-node FS/dev build carries no crypto/transport weight.

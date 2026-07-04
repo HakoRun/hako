@@ -611,3 +611,47 @@ fn proc_ctl_write_routes_to_the_proc_surface() {
         err(&o)
     );
 }
+
+// Machine-readable output (`--json`): the scripting surface added for #21. Each
+// command's JSON must parse and mirror the state the human output describes.
+#[test]
+fn json_output_is_valid_and_reflects_state() {
+    let d = workspace();
+
+    // containers --json → array including the seeded default container.
+    let containers: serde_json::Value =
+        serde_json::from_str(&ok(d.path(), &["containers", "--json"])).unwrap();
+    assert!(
+        containers.as_array().unwrap().iter().any(|c| c == "hako"),
+        "containers --json lists the default container: {containers}"
+    );
+
+    // A file write → status --json reports not-clean with one "added" change.
+    ok(d.path(), &["write", "/notes.txt", "hi"]);
+    let st: serde_json::Value = serde_json::from_str(&ok(d.path(), &["status", "--json"])).unwrap();
+    assert_eq!(st["branch"], serde_json::json!("main"));
+    assert_eq!(st["clean"], serde_json::json!(false));
+    let changes = st["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1, "one change: {st}");
+    assert_eq!(changes[0]["path"], serde_json::json!("notes.txt"));
+    assert_eq!(changes[0]["change"], serde_json::json!("added"));
+
+    // Commit → log --json is a non-empty array; the newest entry carries the
+    // message and a full 64-hex commit hash. And status --json is clean again.
+    ok(d.path(), &["commit", "-m", "add notes"]);
+    let log: serde_json::Value = serde_json::from_str(&ok(d.path(), &["log", "--json"])).unwrap();
+    let commits = log.as_array().unwrap();
+    assert!(!commits.is_empty(), "log --json has commits: {log}");
+    assert_eq!(commits[0]["message"], serde_json::json!("add notes"));
+    assert_eq!(commits[0]["hash"].as_str().unwrap().len(), 64);
+    assert!(commits[0]["parents"].is_array());
+    assert!(commits[0]["timestamp"].is_number());
+
+    let st: serde_json::Value = serde_json::from_str(&ok(d.path(), &["status", "--json"])).unwrap();
+    assert_eq!(st["clean"], serde_json::json!(true));
+    assert_eq!(st["changes"].as_array().unwrap().len(), 0);
+
+    // ps --json with no running instances → an empty JSON array.
+    let ps: serde_json::Value = serde_json::from_str(&ok(d.path(), &["ps", "--json"])).unwrap();
+    assert_eq!(ps.as_array().unwrap().len(), 0);
+}
