@@ -203,7 +203,6 @@ pub fn run_container_detached(
     // Instance state lives at the WORKSPACE level (`<ws>/.hako/runtime`), the
     // same place the CLI's ps/exec/stop look — NOT under the per-container dir.
     let workdir = hako_dir(repo)?;
-    let id = instances::generate_id();
     let cmd_for_record = command.clone().unwrap_or_default();
     // The container this instance belongs to is the basename of the repo's dir
     // (`<ws>/.hako/containers/<name>`) — what the `proc/` surface groups by.
@@ -212,7 +211,9 @@ pub fn run_container_detached(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    instances::create(&workdir, &id, container, branch, &cmd_for_record)?;
+    // A fresh, collision-checked id: create_unique retries generation if a dir
+    // already exists, so a clash can't silently merge into another instance (#78).
+    let id = instances::create_unique(&workdir, container, branch, &cmd_for_record)?;
     let volumes_owned = volumes.to_vec();
 
     // Outer fork: parent returns immediately; child supervises. If the fork

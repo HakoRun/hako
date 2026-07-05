@@ -120,20 +120,58 @@ pub fn generate_id() -> String {
         .unwrap_or(0);
     h.update(&nanos.to_le_bytes());
     h.update(&std::process::id().to_le_bytes());
-    // OS-provided randomness via blake3's keyed hashing as an entropy
-    // source: re-hash with the high bits of a SystemTime measurement at
-    // a different point. This isn't cryptographic randomness but adds
-    // enough variation that two threads at the same nanosecond on the
-    // same pid still diverge.
-    let extra = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos().wrapping_mul(0x9E3779B97F4A7C15))
-        .unwrap_or(0);
-    h.update(&extra.to_le_bytes());
+    // Real OS entropy so two spawns in the same nanosecond on the same host still
+    // diverge — not just a second clock read. Best-effort with a time+ASLR
+    // fallback; a residual clash is still caught by `create` (#78).
+    h.update(&os_random_bytes());
     h.finalize().to_hex()[..12].to_string()
 }
 
-/// Create a new instance directory and write its config.
+/// 16 bytes of OS randomness, best-effort. Reads `/dev/urandom` (present on the
+/// Linux runtime host where instances are actually created); if that fails, mixes
+/// two clock reads with a stack address (ASLR) so the result still varies.
+fn os_random_bytes() -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    if let Ok(mut f) = fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        if f.read_exact(&mut buf).is_ok() {
+            return buf;
+        }
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let addr = &buf as *const _ as usize as u128;
+    let mix = nanos ^ addr.wrapping_mul(0x9E3779B97F4A7C15);
+    buf.copy_from_slice(&mix.to_le_bytes());
+    buf
+}
+
+/// Create an instance under a freshly generated, collision-checked id, returning
+/// the id. Retries generation if a directory already exists, so a generated-id
+/// clash can never silently merge into (and corrupt) another instance's state.
+pub fn create_unique(
+    workdir: &Path,
+    container: &str,
+    branch: &str,
+    command: &[String],
+) -> Result<String, RuntimeError> {
+    for _ in 0..16 {
+        let id = generate_id();
+        match create(workdir, &id, container, branch, command) {
+            Ok(_) => return Ok(id),
+            Err(RuntimeError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(RuntimeError::Other(
+        "could not allocate a unique instance id after 16 attempts".into(),
+    ))
+}
+
+/// Create a new instance directory and write its config. Fails with
+/// `AlreadyExists` if the id dir already exists (see [`create_unique`]).
 pub fn create(
     workdir: &Path,
     id: &str,
@@ -142,7 +180,11 @@ pub fn create(
     command: &[String],
 ) -> Result<PathBuf, RuntimeError> {
     let dir = instance_dir(workdir, id);
-    fs::create_dir_all(&dir)?;
+    // create_dir (not create_dir_all on `dir`) so an id collision is a hard error
+    // rather than a silent merge that overwrites another instance's config/pid
+    // (#78). The runtime dir is the parent and may need creating first.
+    fs::create_dir_all(runtime_dir(workdir))?;
+    fs::create_dir(&dir)?;
     let config = InstanceConfig {
         container: container.to_string(),
         branch: branch.to_string(),
@@ -178,7 +220,7 @@ pub fn write_nspid(workdir: &Path, id: &str, pid: u32) -> Result<(), RuntimeErro
 }
 
 fn write_pidfile(dir: &Path, name: &str, pid: u32) -> Result<(), RuntimeError> {
-    fs::create_dir_all(dir)?;
+    require_instance_dir(dir)?;
     let line = match read_starttime(pid) {
         Some(st) => format!("{}:{}", pid, st),
         None => pid.to_string(),
@@ -189,8 +231,23 @@ fn write_pidfile(dir: &Path, name: &str, pid: u32) -> Result<(), RuntimeError> {
 /// Record the supervising process exit code. Called when the process dies.
 pub fn write_exit_code(workdir: &Path, id: &str, code: i32) -> Result<(), RuntimeError> {
     let dir = instance_dir(workdir, id);
-    fs::create_dir_all(&dir)?;
+    require_instance_dir(&dir)?;
     write_atomic(&dir.join("exitcode"), code.to_string().as_bytes())
+}
+
+/// Guard the post-`create` write helpers: refuse to write into (and thereby
+/// recreate) an instance dir that no longer exists. Otherwise a `reap --force`
+/// that removes a still-running instance's dir would have its supervisor spring a
+/// config-less dir back to life, which `ps`/`stop` then misread (#78).
+fn require_instance_dir(dir: &Path) -> Result<(), RuntimeError> {
+    if dir.is_dir() {
+        Ok(())
+    } else {
+        Err(RuntimeError::Other(format!(
+            "instance dir {} no longer exists; refusing to recreate it",
+            dir.display()
+        )))
+    }
 }
 
 /// Read the supervising process id, if recorded. Strips the optional
@@ -433,6 +490,42 @@ mod tests {
         assert!(!starttime_matches(Some(500), None)); // recorded, vanished → closed
         assert!(starttime_matches(None, Some(500))); // legacy record → existence
         assert!(starttime_matches(None, None)); // legacy record → existence
+    }
+
+    #[test]
+    fn create_refuses_an_id_collision() {
+        let wd = workdir();
+        create(wd.path(), "dup", "c", "main", &[]).unwrap();
+        // A second create at the same id must fail (not silently merge) so it
+        // can't overwrite the first instance's config/pid (#78).
+        let err = create(wd.path(), "dup", "c", "main", &[]).unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::Io(e) if e.kind() == std::io::ErrorKind::AlreadyExists),
+            "expected AlreadyExists, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn create_unique_yields_distinct_live_ids() {
+        let wd = workdir();
+        let a = create_unique(wd.path(), "c", "main", &[]).unwrap();
+        let b = create_unique(wd.path(), "c", "main", &[]).unwrap();
+        assert_ne!(a, b);
+        assert!(instance_dir(wd.path(), &a).is_dir());
+        assert!(instance_dir(wd.path(), &b).is_dir());
+    }
+
+    #[test]
+    fn write_pid_refuses_a_missing_instance_dir() {
+        let wd = workdir();
+        // No `create` first: the instance dir doesn't exist, so the post-create
+        // write helper must refuse rather than spring a config-less dir to life
+        // (the reap-while-running hazard, #78).
+        let err = write_pid(wd.path(), "ghost", 1234).unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::Other(m) if m.contains("no longer exists")),
+            "expected a missing-dir refusal, got {err:?}"
+        );
     }
 
     #[test]
