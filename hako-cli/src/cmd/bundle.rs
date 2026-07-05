@@ -309,12 +309,13 @@ fn ensure_private_dir(dir: &Path) -> io::Result<()> {
             me
         ));
     }
+    // We own it (a symlink or foreign owner is rejected above). If it is group/
+    // other-accessible — e.g. a pre-#58 cache created at 0755, or a loose umask —
+    // tighten it to 0700 rather than refusing: a directory we own is not an
+    // attack, and refusing would strand every upgrader (#76).
     if md.mode() & 0o077 != 0 {
-        return deny(format!(
-            "refusing bundle cache {}: accessible to group/other (mode {:03o})",
-            dir.display(),
-            md.mode() & 0o777
-        ));
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
@@ -561,19 +562,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ensure_private_dir_rejects_group_or_world_access_and_symlinks() {
-        use std::os::unix::fs::{symlink, DirBuilderExt};
+    fn ensure_private_dir_heals_loose_mode_but_rejects_symlinks() {
+        use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
         let d = tempfile::tempdir().unwrap();
-        // A group/other-accessible dir is refused (an attacker could have pre-
-        // created it as world-writable and seeded a cache).
+        // A group/other-accessible dir WE OWN (e.g. a pre-#58 cache at 0755) is
+        // tightened to 0700 in place, not refused (#76).
         let shared = d.path().join("shared");
         std::fs::DirBuilder::new()
             .mode(0o755)
             .create(&shared)
             .unwrap();
+        ensure_private_dir(&shared).unwrap();
         assert_eq!(
-            ensure_private_dir(&shared).unwrap_err().kind(),
-            io::ErrorKind::PermissionDenied
+            std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "a loose-mode owned cache dir should be healed to 0700"
         );
         // A symlink at the cache path is refused (never followed).
         let real = d.path().join("real");
