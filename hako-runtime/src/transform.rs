@@ -296,12 +296,13 @@ pub fn exec_in_instance(
         )));
     }
     // Target the container's PID-1, which owns the pid/net/ipc/uts namespaces.
-    let (nspid, _st) = instances::read_nspid_with_starttime(workdir, id).ok_or_else(|| {
-        RuntimeError::Other(format!(
-            "instance {} is still starting (no namespace pid yet)",
-            id
-        ))
-    })?;
+    let (nspid, nspid_start) =
+        instances::read_nspid_with_starttime(workdir, id).ok_or_else(|| {
+            RuntimeError::Other(format!(
+                "instance {} is still starting (no namespace pid yet)",
+                id
+            ))
+        })?;
 
     // Open every namespace fd up front so the error path is clean. Order of the
     // setns calls (below) matters; this open order does not.
@@ -317,6 +318,22 @@ pub fn exec_in_instance(
     let net_ns = open_ns("net")?;
     let pid_ns = open_ns("pid")?;
     let mnt_ns = open_ns("mnt")?;
+
+    // Re-validate the target AFTER opening its namespace fds. `is_running()` above
+    // only proves the *supervisor* is alive, not the container's PID-1 host pid
+    // (`nspid`), which could have exited and had its pid recycled to an unrelated
+    // process before we opened `/proc/<nspid>/ns/*` — in which case those fds are
+    // a stranger's namespaces and setns'ing in would be a sandbox escape (#72).
+    // A `(pid, start_time)` identity is unique and a pid cannot exit and reappear
+    // as the same incarnation, so a match here proves `nspid` was continuously the
+    // same process across every open above — every fd is the intended container's.
+    if !instances::process_matches(nspid, nspid_start) {
+        return Err(RuntimeError::Other(format!(
+            "instance {} namespace pid {} was recycled while joining it; aborting exec",
+            id, nspid
+        )));
+    }
+
     let ns_order: [(&fs::File, CloneFlags); 6] = [
         (&user_ns, CloneFlags::CLONE_NEWUSER),
         (&ipc_ns, CloneFlags::CLONE_NEWIPC),
@@ -1389,4 +1406,55 @@ fn io_other(msg: String) -> RuntimeError {
 fn _suppress() {
     let _: Option<Uid> = None;
     let _: Option<Gid> = None;
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::process::{Child, Command};
+
+    /// Kills + reaps its child on drop, so a panicking assertion can't leak a
+    /// `sleep`.
+    struct Reaped(Child);
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// `hako exec` joins a running instance's namespaces by opening
+    /// `/proc/<nspid>/ns/*` and setns'ing in. If PID-1's host pid had been
+    /// recycled to an unrelated process before those opens, joining it would be a
+    /// sandbox escape (#72). The fix re-validates the recorded start_time after
+    /// opening the fds. Here the nspid points at a *live* process recorded with a
+    /// wrong start_time — the exact signature of a recycled pid — so exec must
+    /// refuse before forking. (Neuter the `process_matches` guard and this fails:
+    /// exec proceeds to fork+setns and returns Ok/a setns error, never "recycled".)
+    #[test]
+    fn exec_refuses_a_recycled_namespace_pid() {
+        let wd = tempfile::tempdir().unwrap();
+        let id = "inst1";
+        instances::create(wd.path(), id, "app", "main", &["/bin/true".to_string()]).unwrap();
+
+        // Supervisor recorded with its true start_time, so `is_running()` passes
+        // and control reaches the nspid re-validation.
+        let sup = Reaped(Command::new("sleep").arg("30").spawn().unwrap());
+        instances::write_pid(wd.path(), id, sup.0.id()).unwrap();
+
+        // nspid: a live process, but recorded with start_time 1 — no real process
+        // starts one tick after boot, so this never matches a genuine process.
+        let ns = Reaped(Command::new("sleep").arg("30").spawn().unwrap());
+        std::fs::write(
+            instances::instance_dir(wd.path(), id).join("nspid"),
+            format!("{}:1", ns.0.id()),
+        )
+        .unwrap();
+
+        let err = exec_in_instance(wd.path(), id, vec!["/bin/true".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("recycled"),
+            "expected exec to refuse a recycled namespace pid, got: {err}"
+        );
+    }
 }
