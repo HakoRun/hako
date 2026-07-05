@@ -55,6 +55,11 @@ pub struct Config {
     pub default_container: String,
     /// Application config from hako.toml, if present.
     pub app: Option<AppConfig>,
+    /// Node-local deploy config: what this node (re)launches when a tracked
+    /// branch advances. Present only if hako.toml has a `[deploy]` table.
+    /// Deliberately *not* profile-overlaid — it describes the receiving node,
+    /// not an app profile.
+    pub deploy: Option<DeployConfig>,
 }
 
 impl Default for Config {
@@ -62,6 +67,7 @@ impl Default for Config {
         Self {
             default_container: "hako".into(),
             app: None,
+            deploy: None,
         }
     }
 }
@@ -96,6 +102,26 @@ pub struct AppConfig {
     /// socket to the workload, which weakens isolation (see the runtime's
     /// `setup_display`). Opt in here, with `--display`, or `HAKO_DISPLAY=1`.
     pub display: bool,
+}
+
+/// Node-local deploy target (`[deploy]` in hako.toml). Read by the receiving
+/// node's serve daemon to reconcile a running workload when the tracked branch
+/// advances (push-to-deploy). Its `run`/network/volume shape is declared
+/// receiver-side on purpose, so a push can never dictate what code runs here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeployConfig {
+    /// Container whose branch this node deploys.
+    pub container: String,
+    /// Branch to watch and (re)launch on advance.
+    pub branch: String,
+    /// Graceful-stop drain + health-gate window, seconds.
+    pub grace_secs: u64,
+    /// Networking for the workload (matches `run --network`); `None` = isolated.
+    pub network: Option<String>,
+    /// Published ports, `host:container`.
+    pub ports: Vec<String>,
+    /// Volume mounts, `host:container[:ro]`.
+    pub volumes: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,13 +198,17 @@ impl Config {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e),
         };
-        let raw: AppRaw = toml::from_str(&text)
+        let mut raw: AppRaw = toml::from_str(&text)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("hako.toml: {}", e)))?;
+        // `[deploy]` is node-local, not profile-overlaid — resolve it before the
+        // profile merge consumes `raw`.
+        let deploy = raw.deploy.take().map(DeployRaw::resolve).transpose()?;
         let app = raw.resolve(profile)?;
         let default_container = app.name.clone();
         Ok(Self {
             default_container,
             app: Some(app),
+            deploy,
         })
     }
 }
@@ -210,6 +240,11 @@ struct AppRaw {
     workspace: Option<WorkspaceRaw>,
     display: Option<bool>,
 
+    /// Reserved: a `[deploy]` table is the node's deploy target, NOT a profile.
+    /// This explicit field must precede the `flatten` below, or serde would sweep
+    /// `[deploy]` into `profiles` and silently drop its keys.
+    deploy: Option<DeployRaw>,
+
     /// Catch-all for unknown top-level tables → user-named profiles.
     #[serde(flatten)]
     profiles: BTreeMap<String, ProfileRaw>,
@@ -227,6 +262,43 @@ struct ProfileRaw {
     autocommit: Option<bool>,
     workspace: Option<WorkspaceRaw>,
     display: Option<bool>,
+}
+
+#[derive(Deserialize, Debug, Default, Clone)]
+struct DeployRaw {
+    container: Option<String>,
+    branch: Option<String>,
+    grace_secs: Option<u64>,
+    network: Option<String>,
+    #[serde(default)]
+    ports: Vec<String>,
+    #[serde(default)]
+    volumes: Vec<String>,
+}
+
+impl DeployRaw {
+    fn resolve(self) -> io::Result<DeployConfig> {
+        let required = |field: &str| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("hako.toml [deploy]: `{field}` is required"),
+            )
+        };
+        Ok(DeployConfig {
+            container: self
+                .container
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| required("container"))?,
+            branch: self
+                .branch
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| required("branch"))?,
+            grace_secs: self.grace_secs.unwrap_or(10),
+            network: self.network,
+            ports: self.ports,
+            volumes: self.volumes,
+        })
+    }
 }
 
 /// `run` accepts either a single shell string or an exec-form array.
@@ -430,6 +502,12 @@ mod tests {
         raw.resolve(profile)
     }
 
+    fn parse_deploy(text: &str) -> io::Result<Option<DeployConfig>> {
+        let raw: AppRaw = toml::from_str(text)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        raw.deploy.map(DeployRaw::resolve).transpose()
+    }
+
     #[test]
     fn minimal_config_only_image() {
         let c = parse(r#"image = "python:3.12-slim""#).unwrap();
@@ -463,6 +541,45 @@ mod tests {
     fn empty_image_errors() {
         let r = parse(r#"image = """#);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn deploy_table_parses() {
+        let d = parse_deploy(
+            r#"
+image = "x"
+[deploy]
+container = "app"
+branch = "main"
+ports = ["8080:80"]
+"#,
+        )
+        .unwrap()
+        .expect("deploy present");
+        assert_eq!(d.container, "app");
+        assert_eq!(d.branch, "main");
+        assert_eq!(d.grace_secs, 10); // default
+        assert_eq!(d.ports, vec!["8080:80"]);
+        assert!(d.volumes.is_empty());
+        assert!(d.network.is_none());
+    }
+
+    #[test]
+    fn deploy_requires_container_and_branch() {
+        assert!(parse_deploy("[deploy]\ncontainer = \"app\"").is_err()); // no branch
+        assert!(parse_deploy("[deploy]\nbranch = \"main\"").is_err()); // no container
+    }
+
+    #[test]
+    fn deploy_is_reserved_not_a_selectable_profile() {
+        // `deploy` is an explicit field, so `[deploy]` is NOT swept into the
+        // profile catch-all and can't be selected as `--profile deploy`.
+        let text = "image = \"x\"\n[deploy]\ncontainer = \"app\"\nbranch = \"main\"";
+        let err = parse_with(text, Some("deploy")).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("profile"),
+            "expected an unknown-profile error, got: {err}"
+        );
     }
 
     #[test]

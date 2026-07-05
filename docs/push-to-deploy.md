@@ -284,10 +284,18 @@ it graduates from "open question" to prerequisite for the deploy framing.
 is running**, because a live FUSE session writes uncommitted chunks into the shared
 store. A prod box runs a workload 24/7, so **gc is permanently refused** as written.
 
-**Change.** Have `gc` union each live instance's *resolved tree root hash*
-(recorded at spawn by **P0-2** — this item only consumes that field) into the
-reachable set instead of refusing globally. Then a running box can gc everything
-not reachable from a ref *or* a live instance.
+**Change.** Two protections are needed — root-pinning alone is *insufficient*:
+- Union each live instance's *spawn* tree root (recorded by **P0-2**) into the
+  reachable set — this protects the committed base the instance runs on.
+- **Plus a grace period** (`gc` skips objects whose store mtime is within the last
+  N minutes, à la git's `gc.pruneExpire`). A live RW mount writes *new* chunks
+  continuously and reads them back; its advancing root lives only in the
+  supervisor's memory (`RwSession::current_root`), so no persisted root covers
+  them. The grace window protects those uncommitted-but-in-use chunks (and, as a
+  bonus, objects a concurrent push just wrote) without gc needing the moving root.
+
+Then a running box can gc everything that is neither reachable from a ref / a live
+instance's base, nor recently written.
 
 **Touchpoints.** `hako-core/src/maintenance.rs` (`gc` reachable set),
 `hako-cli/src/cmd/maintenance.rs` (the running-instance check), `instances.rs`.
