@@ -27,6 +27,14 @@ impl Cache {
         self.map.get(hash).cloned()
     }
 
+    /// Copy just the `[offset, offset+len)` slice of a cached object, avoiding a
+    /// clone of the whole blob (the hot path for FUSE reads over a large file).
+    fn get_range(&self, hash: &Hash, offset: usize, len: usize) -> Option<Vec<u8>> {
+        self.map
+            .get(hash)
+            .map(|b| super::slice_clamped(b, offset, len))
+    }
+
     fn contains(&self, hash: &Hash) -> bool {
         self.map.contains_key(hash)
     }
@@ -222,6 +230,18 @@ impl ChunkStore for FsStore {
         }
     }
 
+    fn read_at(&self, hash: &Hash, offset: usize, len: usize) -> io::Result<Option<Vec<u8>>> {
+        // Cache hit: slice without cloning the whole blob — the point of the
+        // override (#74). Miss: fall back to `get` (which reads, verifies, and
+        // caches the object), then slice; subsequent reads take the cache path.
+        if let Some(slice) = self.cache.lock().unwrap().get_range(hash, offset, len) {
+            return Ok(Some(slice));
+        }
+        Ok(self
+            .get(hash)?
+            .map(|b| super::slice_clamped(&b, offset, len)))
+    }
+
     fn has(&self, hash: &Hash) -> io::Result<bool> {
         if self.cache.lock().unwrap().contains(hash) {
             return Ok(true);
@@ -341,6 +361,23 @@ mod tests {
     fn missing() {
         let (_d, s) = store();
         assert!(s.get(&Hash::of(b"nope")).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_at_slices_and_clamps() {
+        let (_d, s) = store();
+        let data: Vec<u8> = (0..500u32).map(|i| i as u8).collect();
+        let h = s.put(&data).unwrap(); // caches on put → exercises the cache path
+        assert_eq!(s.read_at(&h, 100, 50).unwrap().unwrap(), data[100..150]);
+        // size past EOF clamps; offset past EOF is empty; missing is None.
+        assert_eq!(s.read_at(&h, 480, 999).unwrap().unwrap(), data[480..]);
+        assert!(s.read_at(&h, 500, 10).unwrap().unwrap().is_empty());
+        assert!(s.read_at(&Hash::of(b"absent"), 0, 4).unwrap().is_none());
+
+        // Cache-miss path: a fresh store reading the same on-disk object (evict by
+        // clearing the in-memory cache) still slices correctly via `get`.
+        let s2 = FsStore::new(_d.path().to_path_buf()).unwrap();
+        assert_eq!(s2.read_at(&h, 10, 5).unwrap().unwrap(), data[10..15]);
     }
 
     #[test]

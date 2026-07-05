@@ -464,16 +464,17 @@ impl Filesystem for HakoFs {
         };
         let scoped = self.scoped();
         let root = self.current_root();
-        let bytes = match scoped.read_file(&root, &path) {
-            Ok(b) => b,
-            Err(_) => {
-                reply.error(ENOENT);
-                return;
-            }
-        };
-        let start = (offset as usize).min(bytes.len());
-        let end = (start + size as usize).min(bytes.len());
-        reply.data(&bytes[start..end]);
+        // Serve only the requested window: the kernel reads a large file in many
+        // ~128 KiB calls, and loading the whole file each time is O(n^2) (#74). A
+        // negative offset is nonsensical for a plain file — treat it as EOF.
+        if offset < 0 {
+            reply.data(&[]);
+            return;
+        }
+        match scoped.read_file_range(&root, &path, offset as u64, size) {
+            Ok(bytes) => reply.data(&bytes),
+            Err(_) => reply.error(ENOENT),
+        }
     }
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
