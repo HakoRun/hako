@@ -388,8 +388,18 @@ fn handle_peer(
                 r
             }
             Err(e) => {
+                // Log the full error locally, but only echo our own intentional
+                // application errors (PermissionDenied / InvalidData — FF refusal,
+                // the run gate, malformed requests, missing objects) to the peer.
+                // Other kinds are raw filesystem errors that can embed local paths,
+                // so send a generic reply rather than leak host detail (#63).
+                crate::diag!("serve: request error: {e}");
+                let detail = match e.kind() {
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidData => e.to_string(),
+                    _ => "request failed on the remote node".to_string(),
+                };
                 let mut r = vec![RESP_ERR];
-                r.extend_from_slice(e.to_string().as_bytes());
+                r.extend_from_slice(detail.as_bytes());
                 r
             }
         };
@@ -541,6 +551,15 @@ fn sync_ref(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
                 ));
             }
         }
+    }
+    // A brand-new branch (or a no-op re-push) skips the ancestry walk above, so
+    // verify the commit object is actually present before pointing a ref at it —
+    // otherwise a peer could create a ref dangling at a commit it never pushed, a
+    // self-inflicted broken ref that later reads/GC trip over (#63).
+    if !ctx.state.store().has(&commit)? {
+        return Err(invalid(
+            "ref target commit is missing on this node; push its objects before the ref",
+        ));
     }
     repo.write_ref(branch, commit)?;
     Ok(format!("updated {container}:{branch} -> {}", &hex(&commit.0)[..12]).into_bytes())
@@ -977,6 +996,47 @@ mod tests {
             decode_hashes(&[0u8; 5]).is_err(),
             "non-multiple of 32 rejected"
         );
+    }
+
+    #[test]
+    fn sync_ref_new_branch_requires_the_commit_present() {
+        use hako::{Config, Hash, Session, State};
+
+        let d = tempfile::tempdir().unwrap();
+        let state = State::init(&d.path().join(crate::DOT_HAKO)).unwrap();
+        let session = Session::default();
+        let cfg = Config::default();
+        let ctx = Ctx {
+            state: &state,
+            session: &session,
+            default_container: "hako",
+            workdir: d.path(),
+            cfg: &cfg,
+        };
+
+        // Creating a BRAND-NEW branch pointing at a commit whose objects were
+        // never pushed must be refused, not left as a dangling ref (#63). This
+        // path skips the fast-forward ancestry walk, so it needs its own check.
+        let ghost = Hash([0x7c; 32]);
+        let mut p = Vec::new();
+        p.extend_from_slice(&4u32.to_be_bytes());
+        p.extend_from_slice(b"hako");
+        p.extend_from_slice(&5u32.to_be_bytes());
+        p.extend_from_slice(b"feat1");
+        p.extend_from_slice(&ghost.0);
+
+        let err = sync_ref(&ctx, &p).unwrap_err();
+        assert!(
+            err.to_string().contains("missing"),
+            "expected a missing-commit error, got: {err}"
+        );
+        // No dangling ref was created.
+        assert!(state
+            .open_container("hako")
+            .unwrap()
+            .read_ref("feat1")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

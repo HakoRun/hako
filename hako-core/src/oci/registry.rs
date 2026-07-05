@@ -120,6 +120,25 @@ impl Client {
         reference: &str,
         opts: &PullOptions,
     ) -> io::Result<RawManifest> {
+        self.fetch_manifest_at(reference, opts, 0)
+    }
+
+    /// `depth` bounds manifest-index recursion: a malicious registry can serve a
+    /// deep chain of nested, individually-valid indexes, which would otherwise
+    /// recurse without limit and overflow the stack (#62).
+    fn fetch_manifest_at(
+        &mut self,
+        reference: &str,
+        opts: &PullOptions,
+        depth: u32,
+    ) -> io::Result<RawManifest> {
+        const MAX_INDEX_DEPTH: u32 = 4;
+        if depth > MAX_INDEX_DEPTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("manifest index nested deeper than {MAX_INDEX_DEPTH} levels"),
+            ));
+        }
         let url = format!("{}/v2/{}/manifests/{}", self.base, self.repo, reference);
         let (body, ctype) = self.get(&url, MANIFEST_ACCEPT)?;
         // If the caller specified a digest (rather than a tag), verify the
@@ -154,7 +173,7 @@ impl Client {
                     )
                 })?
                 .clone();
-            return self.fetch_manifest(&pick.digest, opts);
+            return self.fetch_manifest_at(&pick.digest, opts, depth + 1);
         }
         if manifest.layers.is_empty() {
             return Err(io::Error::new(

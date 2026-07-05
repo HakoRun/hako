@@ -96,6 +96,12 @@ pub fn apply_tar_layer(
             continue;
         }
         if let Some(name) = fname.strip_prefix(".wh.") {
+            if name.is_empty() {
+                // A bare `.wh.` names no target. Ignore it rather than letting the
+                // empty target resolve to the tree root, whose delete errors and
+                // would abort the whole pull on one malformed entry (#62).
+                continue;
+            }
             let target = if parent.is_empty() {
                 name.to_string()
             } else {
@@ -317,6 +323,21 @@ mod tests {
             fs.read_symlink(&root, "lib/libc.so.6").unwrap(),
             b"libc-2.35.so"
         );
+    }
+
+    #[test]
+    fn apply_layer_ignores_a_bare_whiteout_entry() {
+        // A malformed layer with a bare `.wh.` entry (empty whiteout target) must
+        // not abort the whole apply by resolving to and deleting the tree root
+        // (#62); it is skipped and the rest of the layer still applies.
+        let s = MemStore::new();
+        let fs = ScopedFs::new(&s);
+        let tar = build_tar(vec![
+            (".wh.", tar::EntryType::Regular, Vec::new(), None),
+            ("etc/ok", tar::EntryType::Regular, b"present".to_vec(), None),
+        ]);
+        let root = apply_tar_layer(&fs, empty(), &tar).unwrap();
+        assert_eq!(fs.read_file(&root, "etc/ok").unwrap(), b"present");
     }
 
     #[test]
