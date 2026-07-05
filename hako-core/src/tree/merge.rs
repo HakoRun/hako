@@ -114,6 +114,34 @@ pub fn three_way_merge(
         }
     }
 
+    // File/directory collision: because keys are flat full paths (directories are
+    // implicit), the per-key merge above can keep a file at "a" while the other
+    // side turned "a" into a directory by adding "a/b" — e.g. a ModifyDelete keeps
+    // "a" as a file while theirs deleted it and created "a/b". A real tree can't
+    // have a path be both, so materialising it would be invalid. Drop the file,
+    // keep the directory subtree, and report each collision as a conflict (#73).
+    let keys: BTreeSet<Vec<u8>> = merged.iter().map(|(k, _)| k.clone()).collect();
+    let mut file_dir_keys: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for key in &keys {
+        let mut prefix = key.clone();
+        prefix.push(b'/');
+        // Any key ordered at/after "key/" that still begins with it is a child
+        // under this path — so "key" is simultaneously a file and a directory.
+        if keys
+            .range(prefix.clone()..)
+            .next()
+            .is_some_and(|k| k.starts_with(&prefix))
+        {
+            file_dir_keys.insert(key.clone());
+        }
+    }
+    if !file_dir_keys.is_empty() {
+        merged.retain(|(k, _)| !file_dir_keys.contains(k));
+        for key in file_dir_keys {
+            conflicts.push(Conflict::FileDirectory { key });
+        }
+    }
+
     let merged_root = super::ops::bulk_build(store, merged)?;
     Ok(MergeResult {
         merged: merged_root,
@@ -185,6 +213,31 @@ mod tests {
             get(&s, &m.merged, b"theirs-only").unwrap(),
             Some(Value::Inline(b"t".to_vec()))
         );
+    }
+
+    #[test]
+    fn file_vs_directory_is_conflict() {
+        let s = MemStore::new();
+        let base = bulk_build(&s, base_entries()).unwrap();
+        // ours adds a regular file at "a"; theirs turns "a" into a directory by
+        // adding "a/b". A path can't be both — the flat per-key merge would keep
+        // both silently, producing a structurally-invalid tree.
+        let ours = put(&s, &base, b"a".to_vec(), Value::Inline(b"file".to_vec())).unwrap();
+        let theirs = put(&s, &base, b"a/b".to_vec(), Value::Inline(b"child".to_vec())).unwrap();
+        let m = three_way_merge(&s, &base, &ours, &theirs).unwrap();
+        assert_eq!(m.conflicts.len(), 1, "expected one file/directory conflict");
+        assert!(
+            matches!(&m.conflicts[0], Conflict::FileDirectory { key } if key == b"a"),
+            "got {:?}",
+            m.conflicts[0]
+        );
+        // The directory subtree survives; the colliding file is dropped so no path
+        // is both a file and a directory prefix.
+        assert_eq!(
+            get(&s, &m.merged, b"a/b").unwrap(),
+            Some(Value::Inline(b"child".to_vec()))
+        );
+        assert_eq!(get(&s, &m.merged, b"a").unwrap(), None);
     }
 
     #[test]

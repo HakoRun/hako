@@ -484,13 +484,15 @@ pub fn print_conflict(c: &Conflict) {
         Conflict::BothModified { key, .. }
         | Conflict::ModifyDelete { key, .. }
         | Conflict::DeleteModify { key, .. }
-        | Conflict::BothAdded { key, .. } => key,
+        | Conflict::BothAdded { key, .. }
+        | Conflict::FileDirectory { key, .. } => key,
     };
     let kind = match c {
         Conflict::BothModified { .. } => "both modified",
         Conflict::ModifyDelete { .. } => "modify/delete",
         Conflict::DeleteModify { .. } => "delete/modify",
         Conflict::BothAdded { .. } => "both added",
+        Conflict::FileDirectory { .. } => "file/directory",
     };
     eprintln!("  conflict ({}): {}", kind, String::from_utf8_lossy(key));
 }
