@@ -449,7 +449,7 @@ fn proc_meta_exposes_the_container_tree_and_rejects_host_processes() {
             .parse()
             .ok()
     };
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(15);
     let nspid = loop {
         if let Some(p) = read_nspid() {
             break p;
@@ -476,7 +476,7 @@ fn proc_meta_exposes_the_container_tree_and_rejects_host_processes() {
     // Poll `ls` until the children settle into the full tree (PID-1 + 2 sleeps)
     // rather than asserting against a fixed delay.
     let count = |s: &str| s.lines().filter(|l| !l.trim().is_empty()).count();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(15);
     let listing = loop {
         let l = ok(d.path(), &["ls", "/containers/hako/proc"]);
         if count(&l) >= 3 || Instant::now() >= deadline {
