@@ -56,15 +56,15 @@ fn noise_err(e: impl std::fmt::Display) -> io::Error {
 /// fails the per-message AEAD or leaves the stream with no valid final record, so
 /// `recv` errors rather than returning truncated or forged bytes (#59). Nothing
 /// outside the AEAD (no plaintext length or chunk count) is trusted for framing.
-pub(crate) struct NoiseChannel {
-    stream: TcpStream,
+pub(crate) struct NoiseChannel<S> {
+    stream: S,
     transport: snow::TransportState,
 }
 
 const CHUNK_MORE: u8 = 0;
 const CHUNK_FINAL: u8 = 1;
 
-impl NoiseChannel {
+impl<S: Read + Write> NoiseChannel<S> {
     pub(crate) fn send(&mut self, plaintext: &[u8]) -> io::Result<()> {
         let mut buf = vec![0u8; NOISE_MSG_MAX];
         // Split into ≤NOISE_PT_DATA-byte data chunks; an empty message is one
@@ -136,11 +136,11 @@ impl NoiseChannel {
 /// registered peer?), replies, and upgrades to the encrypted transport. The
 /// static passed to `authorized` is the peer's **X25519** key; the registry
 /// stores Ed25519, so the caller compares against the converted form.
-pub(crate) fn handshake_as_server(
-    mut stream: TcpStream,
+pub(crate) fn handshake_as_server<S: Read + Write>(
+    mut stream: S,
     id: &identity::Identity,
     authorized: impl Fn(&[u8; 32]) -> bool,
-) -> io::Result<NoiseChannel> {
+) -> io::Result<NoiseChannel<S>> {
     // `snow::Builder` borrows the secret, so keep it in a local until `build_*`
     // copies it into the handshake state.
     let params = NOISE_PARAMS.parse().map_err(noise_err)?;
@@ -175,11 +175,11 @@ pub(crate) fn handshake_as_server(
 /// identity; IK requires knowing the responder's static up front, so we convert
 /// it to X25519 and encrypt msg1 to it — which also authenticates the server
 /// (only the real holder of that key can complete the handshake).
-pub(crate) fn handshake_as_client(
-    mut stream: TcpStream,
+pub(crate) fn handshake_as_client<S: Read + Write>(
+    mut stream: S,
     id: &identity::Identity,
     expected: &VerifyingKey,
-) -> io::Result<NoiseChannel> {
+) -> io::Result<NoiseChannel<S>> {
     let server_x = identity::ed25519_pubkey_to_x25519(&expected.to_bytes())
         .ok_or_else(|| invalid("peer pubkey is not a valid point"))?;
     let params = NOISE_PARAMS.parse().map_err(noise_err)?;
@@ -384,5 +384,33 @@ mod tests {
         client_ch
             .recv()
             .expect_err("a truncated multi-chunk message must be rejected, not returned");
+    }
+
+    // `NoiseChannel<S>` is generic over the transport, so the handshake + encrypted
+    // round-trip run over any Read+Write — here a UnixStream pair, with no network
+    // stack at all (the tests above cover the real TcpStream path).
+    #[cfg(unix)]
+    #[test]
+    fn channel_round_trips_over_a_non_tcp_stream() {
+        use std::os::unix::net::UnixStream;
+        let ds = tempfile::tempdir().unwrap();
+        let dc = tempfile::tempdir().unwrap();
+        let server_id = id_at(ds.path());
+        let client_id = id_at(dc.path());
+        let server_vk = server_id.verifying_key();
+        let client_x = client_id.x25519_public();
+
+        let (s, c) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+            let mut ch = handshake_as_server(s, &server_id, move |x| *x == client_x)?;
+            let greeting = ch.recv()?;
+            ch.send(b"pong")?;
+            Ok(greeting)
+        });
+        let mut ch = handshake_as_client(c, &client_id, &server_vk)
+            .expect("client handshake over a unix socket");
+        ch.send(b"ping").unwrap();
+        assert_eq!(ch.recv().unwrap(), b"pong", "encrypted reply round-trips");
+        assert_eq!(server.join().unwrap().unwrap(), b"ping");
     }
 }
