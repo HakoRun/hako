@@ -13,7 +13,7 @@ pub mod state;
 pub mod store;
 pub mod tree;
 
-pub use config::{AppConfig, AppOverrides, Config, RunSpec, WorkspaceMode};
+pub use config::{AppConfig, AppOverrides, Config, DeployConfig, RunSpec, WorkspaceMode};
 pub use fs::{DirChild, DirEntry, DirKind, FileEntry, ScopedFs};
 pub use hash::Hash;
 pub use io_util::WorkspaceLock;
