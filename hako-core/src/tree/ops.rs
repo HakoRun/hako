@@ -318,7 +318,23 @@ fn splice_up(
             .ok_or_else(|| io::Error::other("tree exceeds 256 levels"))?;
         current_children = build_internal_level(store, current_children, current_level)?;
     }
-    Ok(current_children[0].hash)
+    // Collapse a degenerate root. A delete can leave the top level an internal
+    // node wrapping a single child (`build_internal_level` always wraps), which
+    // `bulk_build` never emits — so identical content would hash to a different
+    // root, silently breaking dedup/sync/diff equality (#56). Peel single-child
+    // internal roots until the canonical root (a leaf, or an internal with >= 2
+    // children). Mid-tree single-child internals are canonical and untouched —
+    // only the root can never have exactly one child.
+    let mut root = current_children[0].hash;
+    loop {
+        match load_node(store, &root)?.kind {
+            NodeKind::Internal { child_hashes, .. } if child_hashes.len() == 1 => {
+                root = child_hashes[0];
+            }
+            _ => break,
+        }
+    }
+    Ok(root)
 }
 
 /// Take a flat list of entries and emit one or more leaf nodes, splitting
@@ -564,6 +580,38 @@ mod tests {
                 (k, v)
             })
             .collect()
+    }
+
+    #[test]
+    fn delete_keeps_canonical_root_through_single_child_shape() {
+        // Regression for #56: as a delete shrinks the tree it passes through a
+        // shape where the root has a single child. The result must stay the
+        // canonical root (== bulk_build of the remaining set), never a redundant
+        // Internal{1 child} wrapper that would hash differently and silently
+        // break dedup / sync-equality / diff shortcuts.
+        let store = MemStore::new();
+        let es = entries(300); // sorted ascending by construction
+        let mut root = bulk_build(&store, es.clone()).unwrap();
+        // The tree must be multi-level, or the 1-child-root transition during
+        // deletion is never exercised.
+        assert!(
+            load_node(&store, &root).unwrap().level > 0,
+            "test needs an internal-root tree; bump the entry count"
+        );
+        // Delete largest-key-first so the rightmost subtree empties first,
+        // driving the root down to a single child before it collapses to a leaf.
+        let mut remaining = es.clone();
+        for (k, _) in es.iter().rev() {
+            root = delete(&store, &root, k).unwrap();
+            remaining.pop(); // mirror the deletion of the current largest key
+            let canonical = bulk_build(&store, remaining.clone()).unwrap();
+            assert_eq!(
+                root,
+                canonical,
+                "delete root diverged from bulk_build after removing {:?}",
+                String::from_utf8_lossy(k)
+            );
+        }
     }
 
     #[test]
