@@ -109,6 +109,17 @@ fn fsync_dir(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// fsync a directory for durability, surfacing real errors but tolerating
+/// `EINVAL` — some filesystems (and Windows) don't support directory fsync, and
+/// there a rename is durable without it, so a non-durable-fsync error there must
+/// not fail an otherwise-successful `put`.
+fn durable_dir_sync(path: &Path) -> io::Result<()> {
+    match fsync_dir(path) {
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        other => other,
+    }
+}
+
 impl ChunkStore for FsStore {
     fn put(&self, data: &[u8]) -> io::Result<Hash> {
         let hash = Hash::of(data);
@@ -120,6 +131,10 @@ impl ChunkStore for FsStore {
         }
 
         let parent = path.parent().expect("chunk path has parent");
+        // If this write creates the shard directory, the shard's own entry in
+        // the store root must be made durable below too — else a crash could
+        // drop the whole shard (and every chunk renamed into it).
+        let shard_is_new = !parent.exists();
         fs::create_dir_all(parent)?;
 
         let tmp = self.temp_path(&hash);
@@ -131,23 +146,26 @@ impl ChunkStore for FsStore {
         }
 
         if let Err(rename_err) = fs::rename(&tmp, &path) {
-            if path.exists() {
-                let _ = fs::remove_file(&tmp);
-            } else {
-                // Possibly EXDEV (temp on a different filesystem); fall back to copy.
-                match fs::copy(&tmp, &path) {
-                    Ok(_) => {
-                        let _ = fs::remove_file(&tmp);
-                    }
-                    Err(_) => {
-                        let _ = fs::remove_file(&tmp);
-                        return Err(rename_err);
-                    }
-                }
+            // Another writer may have created the chunk between our exists-check
+            // and here — content-addressed, so it's the same bytes; that's fine.
+            // Any other failure is a real error: do NOT fall back to a non-atomic
+            // copy to the final content address (a crash mid-copy would leave a
+            // torn object at a canonical hash). `temp_path` is always under
+            // `self.root`, the same filesystem, so EXDEV cannot occur here (#60).
+            let _ = fs::remove_file(&tmp);
+            if !path.exists() {
+                return Err(rename_err);
             }
         }
 
-        let _ = fsync_dir(parent);
+        // Durability: the chunk's dirent (and, for a first-time shard, the shard
+        // directory's own entry in the store root) must reach disk, or a crash
+        // could leave a committed root referencing a chunk that is gone. Surface
+        // real I/O errors instead of reporting a non-durable write as success.
+        durable_dir_sync(parent)?;
+        if shard_is_new {
+            durable_dir_sync(&self.root)?;
+        }
 
         self.cache.lock().unwrap().store(hash, data.to_vec());
         Ok(hash)
@@ -165,7 +183,12 @@ impl ChunkStore for FsStore {
                     self.cache.lock().unwrap().store(*hash, data.clone());
                     Ok(Some(data))
                 } else {
-                    // Bit rot: treat as missing rather than serve corrupted bytes.
+                    // The stored bytes don't hash to their address — corruption
+                    // (bit rot, a torn write, a poisoned store). Remove the bad
+                    // file so a later `put` of the true content can heal the
+                    // store, and report missing rather than serve wrong bytes.
+                    // Best-effort: a writer racing us just rewrites it (#60).
+                    let _ = fs::remove_file(&path);
                     Ok(None)
                 }
             }
@@ -183,6 +206,12 @@ impl ChunkStore for FsStore {
 
     fn find_by_prefix(&self, prefix: &str) -> io::Result<Vec<Hash>> {
         let prefix = prefix.to_ascii_lowercase();
+        // A hash prefix is hex; anything else matches no object. This also
+        // guarantees the prefix is ASCII, so the `[..2]`/`[2..]` byte-slicing
+        // below can never split a multi-byte char and panic (#60).
+        if !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
         // Two cases: prefix is shorter than the shard prefix (2 chars), or longer.
         let scan_dir =
@@ -290,14 +319,21 @@ mod tests {
     }
 
     #[test]
-    fn detects_bit_rot() {
+    fn corrupt_chunk_is_removed_on_read_and_re_put_heals() {
         let (d, s) = store();
         let h = s.put(b"original").unwrap();
         let p = s.chunk_path(&h);
-        // Bypass cache so the bit-rot check fires.
+        // Bypass cache so the on-disk hash check fires; corrupt the file.
         s.cache.lock().unwrap().remove(&h);
         fs::write(&p, b"tampered").unwrap();
+        // get() refuses the corrupted bytes AND removes the bad file, so the
+        // store can self-heal rather than shadow the true content forever (#60).
         assert!(s.get(&h).unwrap().is_none());
+        assert!(!p.exists(), "corrupt chunk must be removed on read");
+        // Re-putting the true content now succeeds (previously a silent no-op:
+        // the corrupt file's mere existence shadowed the correct object).
+        assert_eq!(s.put(b"original").unwrap(), h);
+        assert_eq!(s.get(&h).unwrap().as_deref(), Some(&b"original"[..]));
         drop(d);
     }
 
@@ -332,6 +368,16 @@ mod tests {
         // 'zz' is unlikely to match any blake3 hex prefix; if collision, the test
         // becomes flaky — extremely improbable.
         assert!(s.find_by_prefix("zzzzzzzz").unwrap().is_empty());
+    }
+
+    #[test]
+    fn find_by_prefix_rejects_non_hex_without_panicking() {
+        let (_d, s) = store();
+        let _ = s.put(b"x").unwrap();
+        // A multi-byte prefix used to panic on `&prefix[..2]` (non-char-boundary
+        // byte slice); a non-hex prefix now matches nothing (#60). '€' is 3 bytes.
+        assert!(s.find_by_prefix("\u{20ac}a").unwrap().is_empty());
+        assert!(s.find_by_prefix("nothex!!").unwrap().is_empty());
     }
 
     #[test]
