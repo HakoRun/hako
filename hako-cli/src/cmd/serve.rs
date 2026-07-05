@@ -361,6 +361,15 @@ fn handle_peer(
             .map(|ks| ks.contains(x))
             .unwrap_or(false)
     })?;
+    // A push (SYNC_HAVE -> PUT... -> REF) holds the workspace lock across the whole
+    // unit, so a concurrent `gc` can't sweep objects between the HAVE that vouches
+    // they are present and the REF that makes them reachable — the HAVE reply is a
+    // reachability claim gc would otherwise be free to invalidate (#71). Acquired on
+    // the first request of a unit (HAVE for a push, or a bare PUT/REF/meta-write) and
+    // released at its terminal request (REF / meta-write), so a peer that keeps the
+    // connection open between pushes doesn't hold the lock idle and starve local
+    // commands. Read-only meta-reads never lock.
+    let mut session_lock: Option<WorkspaceLock> = None;
     loop {
         let req = match ch.recv() {
             Ok(f) => f,
@@ -370,6 +379,14 @@ fn handle_peer(
         let Some((&tag, payload)) = req.split_first() else {
             return Ok(());
         };
+        if session_lock.is_none()
+            && matches!(
+                tag,
+                TAG_SYNC_HAVE | TAG_SYNC_PUT | TAG_SYNC_REF | TAG_META_WRITE
+            )
+        {
+            session_lock = Some(lock_workspace(ctx)?);
+        }
         let result: io::Result<Vec<u8>> = match tag {
             TAG_META_READ => std::str::from_utf8(payload)
                 .map_err(|_| invalid("request path is not UTF-8"))
@@ -380,6 +397,12 @@ fn handle_peer(
             TAG_SYNC_REF => sync_ref(ctx, payload),
             _ => Err(invalid("unknown request")),
         };
+        // Terminal request of a push cycle / ctl verb: the ref is now durable and
+        // its object closure reachable, so gc is safe and the lock can be dropped
+        // rather than held idle until the peer disconnects (#71, liveness).
+        if matches!(tag, TAG_SYNC_REF | TAG_META_WRITE) {
+            session_lock = None;
+        }
         let resp = match &result {
             Ok(bytes) => {
                 let mut r = Vec::with_capacity(1 + bytes.len());
@@ -423,10 +446,16 @@ fn meta_read(ctx: &Ctx<'_>, path: &str) -> io::Result<Vec<u8>> {
     }
 }
 
-/// Acquire the workspace lock for the duration of a daemon-side mutation, so a
-/// remote write serializes against concurrent *local* commands (which hold the
-/// same lock). `serve` never holds it globally, so this can't self-deadlock; the
-/// guard is dropped as soon as the mutation returns (short-lived).
+/// Acquire the workspace lock, so a daemon-side mutation serializes against
+/// concurrent *local* commands (which hold the same lock) and a concurrent `gc`.
+///
+/// The caller (`handle_peer`) holds the returned guard for a whole push cycle
+/// (SYNC_HAVE..REF) or ctl verb — NOT per single mutation — so the object closure
+/// a push depends on can't be swept between the HAVE and the REF (#71). It is
+/// acquired at most once per connection unit, so it can't self-deadlock, but note
+/// it is now held across multiple requests: do not add a nested `lock_workspace`
+/// on any path reachable while a session lock is held (`WorkspaceLock` is a fresh
+/// flock per acquire and would hang against itself).
 fn lock_workspace(ctx: &Ctx<'_>) -> io::Result<WorkspaceLock> {
     WorkspaceLock::acquire(&ctx.workdir.join(crate::DOT_HAKO))
 }
@@ -462,9 +491,9 @@ fn meta_write(ctx: &Ctx<'_>, payload: &[u8], allow_remote_run: bool) -> io::Resu
                      start it with `hako serve --allow-remote-run` to permit it",
                 ));
             }
-            // A `ctl` verb (commit/branch/tag/run) mutates refs/state — serialize
-            // it against local commands for the duration of the dispatch.
-            let _lock = lock_workspace(ctx)?;
+            // A `ctl` verb (commit/branch/tag/run) mutates refs/state; the caller
+            // (`handle_peer`) holds the workspace lock for the connection, so this
+            // is serialized against local commands without re-locking (#71).
             let mut buf = Vec::new();
             crate::cmd::files::dispatch_ctl(ctx, &name, body, &mut buf)?;
             Ok(buf)
@@ -511,9 +540,9 @@ fn sync_ref(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
     let (branch, rest) = take_lenprefixed_str(rest)?;
     let commit =
         Hash(<[u8; HASH_LEN]>::try_from(rest).map_err(|_| invalid("malformed ref request"))?);
-    // Serialize the create-container + ref update against concurrent local
-    // commands (which hold the workspace lock); released as this fn returns.
-    let _lock = lock_workspace(ctx)?;
+    // The workspace lock is held by the caller (`handle_peer`) for the whole
+    // push session, so the create-container + ref update here is serialized
+    // against local commands and a concurrent `gc` without re-locking (#71).
     if !ctx.state.list_containers()?.iter().any(|c| c == container) {
         ctx.state.create_container(container)?;
     }
