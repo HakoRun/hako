@@ -349,6 +349,7 @@ fn run() -> io::Result<ExitCode> {
             author,
             abort,
         } => cmd::vc::merge(&ctx, branch, author, abort),
+        Cmd::Revert { refspec, author } => cmd::vc::revert(&ctx, refspec, author),
         Cmd::Diff { from, to } => cmd::vc::diff(&ctx, from, to),
         Cmd::Tag {
             name,

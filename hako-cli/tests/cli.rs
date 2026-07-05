@@ -103,6 +103,45 @@ fn cat_via_ref_reads_from_a_commit() {
 }
 
 #[test]
+fn revert_rolls_back_to_an_older_tree_via_a_new_commit() {
+    let d = workspace();
+    ok(d.path(), &["write", "/app.txt", "v1"]);
+    ok(d.path(), &["commit", "-m", "v1"]);
+    ok(d.path(), &["tag", "v1"]); // tag the good state
+    ok(d.path(), &["write", "/app.txt", "v2-broken"]);
+    ok(d.path(), &["commit", "-m", "v2"]);
+    assert_eq!(ok(d.path(), &["cat", "/app.txt"]), "v2-broken");
+
+    // Revert to v1 — a NEW commit on top of the tip, working tree restored.
+    let out = ok(d.path(), &["revert", "v1"]);
+    assert!(out.contains("reverted"), "got: {out}");
+    assert_eq!(
+        ok(d.path(), &["cat", "/app.txt"]),
+        "v1",
+        "working tree restored to v1"
+    );
+    // main fast-forwarded to the revert commit (FF-safe, replicable over the wire).
+    assert_eq!(ok(d.path(), &["cat", "main:/app.txt"]), "v1");
+    // History records the rollback rather than rewriting it.
+    assert!(ok(d.path(), &["log"]).contains("revert to v1"));
+}
+
+#[test]
+fn revert_to_the_current_tree_is_refused() {
+    let d = workspace();
+    ok(d.path(), &["write", "/x", "1"]);
+    ok(d.path(), &["commit", "-m", "c1"]);
+    // Reverting to where we already are is a no-op — fail cleanly, don't commit.
+    let o = hako(d.path(), &["revert", "main"]);
+    assert!(!o.status.success(), "self-revert should be refused");
+    assert!(
+        err(&o).contains("nothing to revert"),
+        "expected a clean refusal, got: {}",
+        err(&o)
+    );
+}
+
+#[test]
 fn branch_create_and_list() {
     let d = workspace();
     ok(d.path(), &["write", "/x", "1"]);

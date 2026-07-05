@@ -290,6 +290,49 @@ pub fn merge(
     Ok(ExitCode::SUCCESS)
 }
 
+/// Roll back the current branch to an older tree by committing that tree on top
+/// of the current tip. Because the push wire is fast-forward-only, this is the
+/// only rollback that replicates — and it records the rollback in history rather
+/// than rewriting it.
+pub fn revert(ctx: &Ctx<'_>, refspec: String, author: Option<String>) -> io::Result<ExitCode> {
+    let repo = ctx.state.open_container(ctx.default_container)?;
+    let author = resolve_author(author);
+    let head = repo
+        .head_commit()?
+        .ok_or_else(|| io::Error::other("nothing to revert (no commits yet)"))?;
+    let target = resolve_commit(&repo, &refspec)?;
+    let target_tree = repo.load_commit(&target)?.tree;
+    if target_tree == repo.load_commit(&head)?.tree {
+        crate::diag!(
+            "already at {}'s tree ({}); nothing to revert",
+            refspec,
+            &target.to_hex()[..12]
+        );
+        return Ok(ExitCode::from(1));
+    }
+    let cur = repo.current_branch()?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot revert with a detached HEAD — check out a branch first",
+        )
+    })?;
+    let msg = format!("revert to {} ({})", refspec, &target.to_hex()[..12]);
+    // Working tree first, then the ref: a crash in between leaves HEAD on the old
+    // tip with the target tree shown as uncommitted changes — recoverable, no ref
+    // lost (mirrors `checkout`).
+    repo.set_working(target_tree)?;
+    let commit = repo.commit(target_tree, vec![head], &author, &msg, now_secs())?;
+    repo.write_ref(&cur, commit)?;
+    println!(
+        "reverted {} to {} ({}) as {}",
+        cur,
+        refspec,
+        &target.to_hex()[..12],
+        &commit.to_hex()[..12]
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 pub fn tag(
     ctx: &Ctx<'_>,
     name: Option<String>,
