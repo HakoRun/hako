@@ -10,23 +10,28 @@ const NODE_VERSION: u8 = 1;
 const TAG_INLINE: u8 = 0x00;
 const TAG_EXTERNAL: u8 = 0x01;
 
-pub fn encode(node: &Node) -> Vec<u8> {
+pub fn encode(node: &Node) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     buf.push(NODE_VERSION);
     buf.push(node.level);
+    // Counts and key/value lengths are u16 on the wire. A silent `as u16` wrap
+    // here would encode a node that stores fine but decodes with "trailing
+    // bytes", permanently corrupting the tree (#57) — so fail loudly instead.
+    // Content-defined chunking keeps real nodes far below these caps; only an
+    // adversarial run of non-boundary keys (or a >64 KiB key/inline value) can
+    // approach them, and rejecting those is the safe outcome.
     match &node.kind {
         NodeKind::Leaf { entries } => {
-            let n = entries.len() as u16;
-            buf.extend_from_slice(&n.to_be_bytes());
+            buf.extend_from_slice(&u16_field(entries.len(), "leaf entry count")?.to_be_bytes());
             for e in entries {
-                let key_len = e.key.len() as u16;
-                buf.extend_from_slice(&key_len.to_be_bytes());
+                buf.extend_from_slice(&u16_field(e.key.len(), "key length")?.to_be_bytes());
                 buf.extend_from_slice(&e.key);
                 match &e.value {
                     Value::Inline(data) => {
                         buf.push(TAG_INLINE);
-                        let len = data.len() as u16;
-                        buf.extend_from_slice(&len.to_be_bytes());
+                        buf.extend_from_slice(
+                            &u16_field(data.len(), "inline value length")?.to_be_bytes(),
+                        );
                         buf.extend_from_slice(data);
                     }
                     Value::External(h) => {
@@ -41,11 +46,11 @@ pub fn encode(node: &Node) -> Vec<u8> {
             child_hashes,
             child_counts,
         } => {
-            let n = child_keys.len() as u16;
-            buf.extend_from_slice(&n.to_be_bytes());
+            buf.extend_from_slice(
+                &u16_field(child_keys.len(), "internal child count")?.to_be_bytes(),
+            );
             for (k, h) in child_keys.iter().zip(child_hashes.iter()) {
-                let key_len = k.len() as u16;
-                buf.extend_from_slice(&key_len.to_be_bytes());
+                buf.extend_from_slice(&u16_field(k.len(), "child key length")?.to_be_bytes());
                 buf.extend_from_slice(k);
                 buf.extend_from_slice(&h.0);
             }
@@ -54,7 +59,18 @@ pub fn encode(node: &Node) -> Vec<u8> {
             }
         }
     }
-    buf
+    Ok(buf)
+}
+
+/// A length/count that must fit the node format's `u16` field, or a loud error
+/// rather than a silent `as u16` wrap that would corrupt the encoded node (#57).
+fn u16_field(n: usize, what: &str) -> io::Result<u16> {
+    u16::try_from(n).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{what} {n} exceeds the node-format limit of {}", u16::MAX),
+        )
+    })
 }
 
 pub fn decode(data: &[u8]) -> io::Result<Node> {
@@ -148,7 +164,7 @@ pub fn decode(data: &[u8]) -> io::Result<Node> {
 }
 
 pub fn store_node(store: &dyn ChunkStore, node: &Node) -> io::Result<Hash> {
-    let bytes = encode(node);
+    let bytes = encode(node)?;
     store.put(&bytes)
 }
 
@@ -229,7 +245,7 @@ mod tests {
                 ],
             },
         };
-        assert_eq!(decode(&encode(&n)).unwrap(), n);
+        assert_eq!(decode(&encode(&n).unwrap()).unwrap(), n);
     }
 
     #[test]
@@ -249,7 +265,7 @@ mod tests {
                 ],
             },
         };
-        assert_eq!(decode(&encode(&n)).unwrap(), n);
+        assert_eq!(decode(&encode(&n).unwrap()).unwrap(), n);
     }
 
     #[test]
@@ -262,7 +278,7 @@ mod tests {
                 child_counts: vec![10, 20],
             },
         };
-        assert_eq!(decode(&encode(&n)).unwrap(), n);
+        assert_eq!(decode(&encode(&n).unwrap()).unwrap(), n);
     }
 
     #[test]
@@ -276,7 +292,7 @@ mod tests {
                 }],
             },
         };
-        assert_eq!(encode(&n), encode(&n));
+        assert_eq!(encode(&n).unwrap(), encode(&n).unwrap());
     }
 
     #[test]
@@ -294,6 +310,39 @@ mod tests {
         let h = store_node(&s, &n).unwrap();
         let loaded = load_node(&s, &h).unwrap();
         assert_eq!(n, loaded);
+    }
+
+    #[test]
+    fn encode_rejects_u16_overflow_instead_of_corrupting() {
+        // Regression for #57: counts/lengths beyond the u16 wire fields must fail
+        // loudly, not silently wrap into a node that stores fine but decodes as
+        // garbage ("trailing bytes"). Previously `encode` used `as u16`.
+        let entries: Vec<Entry> = (0..=u16::MAX as usize + 1)
+            .map(|i| Entry {
+                key: (i as u32).to_be_bytes().to_vec(),
+                value: Value::Inline(Vec::new()),
+            })
+            .collect();
+        let over = Node {
+            level: 0,
+            kind: NodeKind::Leaf { entries },
+        };
+        assert_eq!(
+            encode(&over).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // An over-long key (> u16::MAX bytes) is likewise rejected, not truncated.
+        let big_key = Node {
+            level: 0,
+            kind: NodeKind::Leaf {
+                entries: vec![Entry {
+                    key: vec![0u8; u16::MAX as usize + 1],
+                    value: Value::Inline(Vec::new()),
+                }],
+            },
+        };
+        assert!(encode(&big_key).is_err());
     }
 
     #[test]
@@ -336,7 +385,7 @@ mod tests {
                 }],
             },
         };
-        let mut bytes = encode(&n);
+        let mut bytes = encode(&n).unwrap();
         bytes.push(0xFF);
         assert!(decode(&bytes).is_err());
     }
