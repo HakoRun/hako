@@ -76,6 +76,12 @@ pub enum Conflict {
         ours: Value,
         theirs: Value,
     },
+    /// One side has a regular file at `key` while the other has entries *under*
+    /// `key/` (making it a directory). The flat key space lets both survive the
+    /// per-key merge, but a path can't be a file and a directory at once — so the
+    /// merge drops the file, keeps the directory subtree, and reports this for the
+    /// user to resolve, rather than emitting a structurally-invalid tree.
+    FileDirectory { key: Vec<u8> },
 }
 
 #[derive(Clone, Debug)]
