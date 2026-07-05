@@ -353,9 +353,36 @@ fn enter_and_exec(
         ForkResult::Child => {
             // cwd from the host may not exist in the container's mount ns.
             env::set_current_dir("/")?;
+            // Apply the same rlimit + seccomp hardening as the run/apply workload.
+            // Seccomp filters do NOT survive `setns`, so without this an exec'd
+            // process would run with the full syscall surface the workload was
+            // denied (#61). Unlike run/apply — which own a fresh userns with
+            // CAP_SYS_ADMIN and deliberately omit no_new_privs to keep in-container
+            // setuid working — this setns'd child sets no_new_privs first so the
+            // filter installs unprivileged; it also blocks setuid-based escalation,
+            // which an exec'd command never needs.
+            if let Err(e) = set_no_new_privs().and_then(|()| harden_workload()) {
+                eprintln!("hako: exec sandbox hardening failed: {}", e);
+                std::process::exit(126);
+            }
             exec_command(command)
         }
     }
+}
+
+/// `PR_SET_NO_NEW_PRIVS`: lets an unprivileged process install a seccomp filter,
+/// and prevents setuid / file-capabilities from ever granting new privileges.
+/// Used by the `exec` path before hardening (see [`enter_and_exec`]).
+fn set_no_new_privs() -> Result<(), RuntimeError> {
+    // Safe: prctl with a valid option and no pointer arguments.
+    let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if rc != 0 {
+        return Err(io_other(format!(
+            "prctl(PR_SET_NO_NEW_PRIVS): {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -1036,7 +1063,15 @@ fn setup_special_mounts(root: &str) -> Result<(), RuntimeError> {
     // the container's own processes, not the host's. ===
     let proc_path = format!("{}/proc", root);
     fs::create_dir_all(&proc_path)?;
-    mount_kind("proc", &proc_path, "proc", MsFlags::empty(), None)?;
+    // nosuid/nodev/noexec: a procfs never legitimately hosts device nodes or
+    // setuid/executable content, so deny them as defense-in-depth (#61).
+    mount_kind(
+        "proc",
+        &proc_path,
+        "proc",
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        None,
+    )?;
 
     // /sys is mounted separately (setup_sysfs), AFTER the network namespace is
     // unshared — a fresh read-only sysfs requires owning the netns.
@@ -1057,16 +1092,19 @@ fn setup_sysfs(root: &str, net_isolated: bool) -> Result<(), RuntimeError> {
     let sys_path = format!("{}/sys", root);
     fs::create_dir_all(&sys_path)?;
     let ro = MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
-    if net_isolated
-        && mount(
+    if net_isolated {
+        // Isolated netns: a fresh read-only sysfs is REQUIRED. Do not fall back
+        // to binding the host /sys (the fallback below is only for the shared-
+        // netns case) — fail closed if the kernel refuses the fresh mount, rather
+        // than silently exposing the host sysfs to an isolated run (#61).
+        mount(
             Some("sysfs"),
             sys_path.as_str(),
             Some("sysfs"),
             ro,
             None::<&str>,
         )
-        .is_ok()
-    {
+        .map_err(|e| io_other(format!("fresh sysfs mount (isolated netns): {}", e)))?;
         return Ok(());
     }
     // Fallback (shared netns, e.g. `apply`): bind the host /sys, then remount the
