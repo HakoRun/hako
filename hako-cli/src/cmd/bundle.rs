@@ -56,7 +56,11 @@ fn read_appended_payload(exe: &Path) -> io::Result<Option<Vec<u8>>> {
         return Ok(None);
     }
     let payload_len = u64::from_le_bytes(trailer[8..16].try_into().unwrap());
-    if payload_len == 0 || payload_len + TRAILER_LEN as u64 > len {
+    // Checked bound: `len >= TRAILER_LEN` above, so `len - TRAILER_LEN` can't
+    // underflow. Writing it this way avoids the `payload_len + TRAILER_LEN`
+    // overflow that a hostile trailer could use to wrap past the check and then
+    // attempt a ~2^64-byte allocation (#58).
+    if payload_len == 0 || payload_len > len - TRAILER_LEN as u64 {
         return Ok(None);
     }
     let start = len - TRAILER_LEN as u64 - payload_len;
@@ -161,13 +165,18 @@ fn unpack_hardened(payload: &[u8], dst: &Path) -> io::Result<()> {
 fn launch(payload: &[u8]) -> io::Result<ExitCode> {
     let id = hako::Hash::of(payload).to_hex()[..12].to_string();
     let base = bundle_cache_dir();
+    // The cache path is predictable (`id` is derived from the public payload), so
+    // make the cache root a private directory we own *before* trusting any
+    // `.ready` marker in it — otherwise a pre-seeded cache could make us run an
+    // attacker's baked command/workspace (#58). Everything below is then created
+    // inside our own 0700 directory, which only we can write.
+    ensure_private_dir(&base)?;
     let cache = base.join(&id);
     // `.ready` is written INSIDE the temp dir *before* the dir is moved into
     // place, so the cache appears atomically and complete — never half-
     // extracted. Concurrent launches each extract to their own temp dir and
     // race to rename; the loser sees the cache already present and discards.
     if !cache.join(".ready").exists() {
-        std::fs::create_dir_all(&base)?;
         let tmp = base.join(format!(".{id}.tmp.{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp)?;
@@ -240,11 +249,79 @@ fn bundle_cache_dir() -> PathBuf {
     if let Some(d) = env::var_os("LOCALAPPDATA") {
         return PathBuf::from(d).join("hako-bundles");
     }
-    let base = env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(env::temp_dir);
-    base.join("hako-bundles")
+    if let Some(d) = env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(d).join("hako-bundles");
+    }
+    if let Some(h) = env::var_os("HOME") {
+        return PathBuf::from(h).join(".cache").join("hako-bundles");
+    }
+    // No per-user cache home (systemd services, cron, minimal containers). Use a
+    // per-uid name under the (possibly world-shared) temp dir — never a shared
+    // `hako-bundles` a local attacker on a multi-user host could pre-seed. Its
+    // ownership is verified by `ensure_private_dir` regardless (#58).
+    #[cfg(unix)]
+    {
+        env::temp_dir().join(format!("hako-bundles-{}", current_euid()))
+    }
+    #[cfg(not(unix))]
+    {
+        env::temp_dir().join("hako-bundles")
+    }
+}
+
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    // SAFETY: geteuid() always succeeds and has no preconditions.
+    unsafe { libc::geteuid() }
+}
+
+/// Ensure `dir` is a private directory owned by the current user before we trust
+/// anything inside it. Create it `0700` if absent; if it already exists, refuse
+/// (fail closed) when it is a symlink, not owned by us, or accessible to group/
+/// other. The bundle cache path is predictable (derived from the public payload
+/// hash), so without this a local attacker could pre-seed it and make us run
+/// their baked command against their workspace (#58).
+#[cfg(unix)]
+fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {} // verify below
+        Err(e) => return Err(e),
+    }
+    let md = std::fs::symlink_metadata(dir)?; // does NOT follow a symlink
+    let deny = |msg: String| Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
+    if md.file_type().is_symlink() || !md.is_dir() {
+        return deny(format!(
+            "refusing bundle cache {}: not a real directory (possible attack)",
+            dir.display()
+        ));
+    }
+    let me = current_euid();
+    if md.uid() != me {
+        return deny(format!(
+            "refusing bundle cache {}: owned by uid {}, not {}",
+            dir.display(),
+            md.uid(),
+            me
+        ));
+    }
+    if md.mode() & 0o077 != 0 {
+        return deny(format!(
+            "refusing bundle cache {}: accessible to group/other (mode {:03o})",
+            dir.display(),
+            md.mode() & 0o777
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)
 }
 
 // ============================================================================
@@ -450,6 +527,63 @@ mod tests {
         bytes.extend_from_slice(&9_999_999u64.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
         assert!(read_appended_payload(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn overflowing_payload_len_reads_as_none() {
+        // A hostile `payload_len` chosen so `payload_len + TRAILER_LEN` would wrap
+        // must still be rejected — not slip past the bound and attempt a giant
+        // allocation (#58).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evil");
+        let mut bytes = b"prefix".to_vec();
+        bytes.extend_from_slice(TRAILER_MAGIC);
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(read_appended_payload(&path).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_creates_0700_and_is_idempotent() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().join("hako-bundles");
+        ensure_private_dir(&base).unwrap();
+        assert_eq!(
+            std::fs::metadata(&base).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "cache dir must be private"
+        );
+        // Idempotent on our own 0700 directory.
+        ensure_private_dir(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_rejects_group_or_world_access_and_symlinks() {
+        use std::os::unix::fs::{symlink, DirBuilderExt};
+        let d = tempfile::tempdir().unwrap();
+        // A group/other-accessible dir is refused (an attacker could have pre-
+        // created it as world-writable and seeded a cache).
+        let shared = d.path().join("shared");
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&shared)
+            .unwrap();
+        assert_eq!(
+            ensure_private_dir(&shared).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // A symlink at the cache path is refused (never followed).
+        let real = d.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = d.path().join("link");
+        symlink(&real, &link).unwrap();
+        assert_eq!(
+            ensure_private_dir(&link).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
