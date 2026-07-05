@@ -115,7 +115,17 @@ fn fsync_dir(_path: &Path) -> io::Result<()> {
 /// not fail an otherwise-successful `put`.
 fn durable_dir_sync(path: &Path) -> io::Result<()> {
     match fsync_dir(path) {
-        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        // EINVAL (-> InvalidInput) or ENOTSUP/ENOSYS (-> Unsupported): the
+        // filesystem doesn't support directory fsync, where a rename is durable
+        // without it — so don't fail an otherwise-successful put (#77).
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
         other => other,
     }
 }
@@ -184,11 +194,26 @@ impl ChunkStore for FsStore {
                     Ok(Some(data))
                 } else {
                     // The stored bytes don't hash to their address — corruption
-                    // (bit rot, a torn write, a poisoned store). Remove the bad
-                    // file so a later `put` of the true content can heal the
-                    // store, and report missing rather than serve wrong bytes.
-                    // Best-effort: a writer racing us just rewrites it (#60).
-                    let _ = fs::remove_file(&path);
+                    // (bit rot, a torn write, a poisoned store). Atomically CLAIM
+                    // the file by renaming it to a unique quarantine name, so we
+                    // only ever act on the exact bytes we observed and never
+                    // race-delete a good file a concurrent `put` just wrote. If
+                    // the quarantined bytes turn out correct (we grabbed a file a
+                    // writer had just healed), republish them; otherwise drop them
+                    // so a later `put` heals the store. Missing either way (#77).
+                    let quarantine = self.temp_path(hash);
+                    if fs::rename(&path, &quarantine).is_ok() {
+                        match fs::read(&quarantine) {
+                            Ok(bytes) if Hash::of(&bytes) == *hash => {
+                                let _ = fs::rename(&quarantine, &path);
+                                self.cache.lock().unwrap().store(*hash, bytes.clone());
+                                return Ok(Some(bytes));
+                            }
+                            _ => {
+                                let _ = fs::remove_file(&quarantine);
+                            }
+                        }
+                    }
                     Ok(None)
                 }
             }
