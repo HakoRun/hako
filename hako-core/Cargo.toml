@@ -15,6 +15,11 @@ serde.workspace = true
 serde_json.workspace = true
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+# Parse the registry's (attacker-controlled) bearer-auth realm with the *same*
+# URL parser ureq connects with, so the host we security-check is exactly the
+# host it dials — no substring matching that `http://127.0.0.1@evil.com/` slips
+# past. Already in the tree via ureq. See `realm_is_allowed` (#41 SSRF guard).
+url = "2"
 tar = "0.4"
 flate2 = "1"
 # zstd-compressed OCI layers (increasingly common). `ruzstd` is a pure-Rust

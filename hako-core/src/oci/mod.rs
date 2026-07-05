@@ -185,11 +185,10 @@ mod tests {
 
     /// Serve a single `401 Unauthorized` (with an optional `WWW-Authenticate`
     /// challenge) from a throwaway loopback registry, attempt a pull, and return
-    /// the resulting error. Exercises the `Client::get` 401 branch end to end —
-    /// the auth path the happy-path pull tests skip. (A full token-retry can't be
-    /// mocked over loopback: the token realm must be https — the #41 SSRF guard
-    /// forbids http realms — and standing up a trusted-cert TLS mock is out of
-    /// proportion for a hardening test.)
+    /// the resulting error. Exercises the *rejection* side of the `Client::get`
+    /// 401 branch (a bad or missing challenge, refused before any token fetch);
+    /// the successful token-retry is covered by
+    /// `pull_completes_the_401_token_retry_over_loopback_http`.
     fn mock_pull_401(www_authenticate: Option<&str>) -> std::io::Error {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -225,15 +224,17 @@ mod tests {
     }
 
     #[test]
-    fn pull_refuses_a_non_https_auth_realm() {
-        // A 401 whose challenge points the credential-free token fetch at an
-        // http realm must be refused, not followed (SSRF guard, #41).
+    fn pull_refuses_a_non_loopback_http_auth_realm() {
+        // The mock registry is on loopback, but a 401 whose challenge aims the
+        // credential-free token fetch at a NON-loopback http endpoint (here the
+        // cloud metadata service) must still be refused, not followed — a local
+        // registry cannot redirect the fetch off-box (SSRF guard, #41).
         let err = mock_pull_401(Some(
-            r#"Bearer realm="http://127.0.0.1:1/token",service="r",scope="s""#,
+            r#"Bearer realm="http://169.254.169.254/latest/meta-data/",service="r",scope="s""#,
         ));
         assert!(
-            err.to_string().contains("non-https auth realm"),
-            "expected the http realm to be refused: {err}"
+            err.to_string().contains("refusing auth realm"),
+            "expected the non-loopback http realm to be refused: {err}"
         );
     }
 
@@ -246,5 +247,91 @@ mod tests {
             err.to_string().contains("no challenge"),
             "expected a clear no-challenge error: {err}"
         );
+    }
+
+    /// Serve a single-layer image from a loopback registry that requires bearer
+    /// token auth, over plain http. Drives the full auth retry: manifest → 401
+    /// (Bearer challenge pointing at a loopback token realm on the same server) →
+    /// credential-free token GET → manifest with `Authorization: Bearer` → blob.
+    /// Returns `etc/hello` from the resulting tree. This is the token-retry path
+    /// #47's happy-path test skips — testable over http precisely because the
+    /// registry and realm are both loopback (the local-registry exception in
+    /// `registry::realm_is_allowed`).
+    fn mock_pull_hello_token_auth(layer: Vec<u8>) -> Vec<u8> {
+        let digest = format!("sha256:{}", sha256_hex(&layer));
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{digest}","size":{}}}]}}"#,
+            layer.len()
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let manifest_bytes = manifest.into_bytes();
+        let realm = format!("http://{addr}/token");
+
+        // Four requests, each on its own connection (`Connection: close`):
+        //   1. manifest, no auth      → 401 + Bearer challenge (realm on THIS host)
+        //   2. GET the token realm    → 200 {"token": ...}
+        //   3. manifest, with Bearer  → 200 manifest
+        //   4. blob, with Bearer      → 200 layer
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let mut s = match listener.accept() {
+                    Ok((s, _)) => s,
+                    Err(_) => return,
+                };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req.split_whitespace().nth(1).unwrap_or("");
+                let has_bearer = req.to_ascii_lowercase().contains("authorization: bearer");
+
+                if path.contains("/manifests/") && !has_bearer {
+                    let head = format!(
+                        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"{realm}\",service=\"testrepo\",scope=\"repository:testrepo:pull\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = s.write_all(head.as_bytes());
+                    continue;
+                }
+                let (ctype, body): (&str, &[u8]) = if path.contains("/token") {
+                    ("application/json", br#"{"token":"testtoken"}"#)
+                } else if path.contains("/manifests/") {
+                    (
+                        "application/vnd.oci.image.manifest.v1+json",
+                        &manifest_bytes,
+                    )
+                } else if path.contains("/blobs/") {
+                    ("application/octet-stream", &layer)
+                } else {
+                    let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                    continue;
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(body);
+            }
+        });
+
+        let image = ImageRef {
+            registry: addr,
+            repo: "testrepo".into(),
+            reference: "latest".into(),
+        };
+        let store = MemStore::new();
+        let scoped = ScopedFs::new(&store);
+        let result = pull(&image, &scoped, empty(), &PullOptions::default())
+            .expect("token-auth pull from mock registry");
+        scoped.read_file(&result.root, "etc/hello").unwrap()
+    }
+
+    #[test]
+    fn pull_completes_the_401_token_retry_over_loopback_http() {
+        let layer = gzip(&tar_with("etc/hello", b"authed hello"));
+        assert_eq!(mock_pull_hello_token_auth(layer), b"authed hello");
     }
 }

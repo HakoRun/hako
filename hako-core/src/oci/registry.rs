@@ -104,7 +104,10 @@ impl Client {
                             format!("unauthorized, no challenge: {}", chal),
                         )
                     })?;
-                    self.token = Some(fetch_token(&self.agent, &params)?);
+                    // `registry_base` emits an `http` base only for a loopback
+                    // registry, so the scheme is the loopback signal (#41).
+                    let registry_is_loopback = self.base.starts_with("http://");
+                    self.token = Some(fetch_token(&self.agent, &params, registry_is_loopback)?);
                     attempt += 1;
                 }
                 Err(e) => return Err(io::Error::other(format!("HTTP {}: {}", url, e))),
@@ -275,21 +278,64 @@ fn split_challenge_params(s: &str) -> Vec<String> {
     out
 }
 
-fn fetch_token(agent: &ureq::Agent, params: &AuthParams) -> io::Result<String> {
-    // `realm` comes from the registry's `WWW-Authenticate` header, i.e. it is
-    // attacker-controlled if the registry is malicious or MITM'd. Restrict it to
-    // https so a crafted challenge can't redirect the (credential-free) token
-    // fetch at an arbitrary internal endpoint such as
-    // `http://169.254.169.254/latest/meta-data/` — a blind SSRF. See issue #41.
-    if !params
-        .realm
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("https://")
-    {
+/// Whether the (registry-controlled) token `realm` is safe to fetch from.
+///
+/// The realm comes from the `WWW-Authenticate` header — attacker-controlled if
+/// the registry is malicious or MITM'd — and the fetch is a *credential-free*
+/// GET, so an unrestricted realm is a blind SSRF: `realm="http://169.254.169.254/…"`
+/// would hit the cloud metadata service (issue #41). Rule:
+///   - `https` realms are always allowed (unchanged);
+///   - an `http` realm is allowed **only** when the realm host *and* the registry
+///     being pulled from are both loopback — i.e. the operator deliberately chose
+///     a local registry (mirroring [`registry_base`]'s http-for-loopback rule), so
+///     a local dev registry can use token auth over http without reopening the
+///     SSRF for public/MITM registries. Both conditions are load-bearing: without
+///     realm-loopback a local registry could still redirect to the metadata
+///     service; without registry-loopback a public registry could aim the fetch
+///     at the victim's own loopback.
+///
+/// The host is read from a real URL parse (the same `url` crate ureq dials with),
+/// never a substring test — so `http://127.0.0.1@evil.com/` (host `evil.com`),
+/// v4-mapped IPv6, IPv4 shorthand, and trailing-dot/userinfo tricks cannot smuggle
+/// a non-loopback target past the check.
+fn realm_is_allowed(realm: &str, registry_is_loopback: bool) -> bool {
+    let Ok(url) = url::Url::parse(realm) else {
+        return false;
+    };
+    match url.scheme() {
+        "https" => true,
+        "http" => registry_is_loopback && url_host_is_loopback(&url),
+        _ => false,
+    }
+}
+
+/// Whether a parsed URL's host is a literal loopback: `localhost` (exact — no
+/// trailing dot, no subdomain), `127.0.0.1`, or `::1`. Other 127/8 addresses and
+/// v4-mapped IPv6 (`::ffff:127.0.0.1`) are rejected — fail closed, matching the
+/// literal set [`registry_base`] accepts.
+fn url_host_is_loopback(url: &url::Url) -> bool {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    match url.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(a)) => a == Ipv4Addr::new(127, 0, 0, 1),
+        Some(url::Host::Ipv6(a)) => a == Ipv6Addr::LOCALHOST,
+        None => false,
+    }
+}
+
+fn fetch_token(
+    agent: &ureq::Agent,
+    params: &AuthParams,
+    registry_is_loopback: bool,
+) -> io::Result<String> {
+    if !realm_is_allowed(&params.realm, registry_is_loopback) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("refusing non-https auth realm {:?}", params.realm),
+            format!(
+                "refusing auth realm {:?} (only https, or http loopback from a \
+                 loopback registry, is allowed)",
+                params.realm
+            ),
         ));
     }
     let mut req = agent.get(&params.realm);
@@ -385,6 +431,61 @@ mod tests {
     }
 
     #[test]
+    fn realm_https_is_always_allowed() {
+        assert!(realm_is_allowed("https://auth.docker.io/token", false));
+        assert!(realm_is_allowed("https://auth.docker.io/token", true));
+        // https is allowed regardless of host (unchanged from #41).
+        assert!(realm_is_allowed("https://evil.example/token", true));
+    }
+
+    #[test]
+    fn realm_http_needs_both_registry_and_host_loopback() {
+        // From a PUBLIC registry, every http realm is refused (the #41 threat).
+        assert!(!realm_is_allowed("http://127.0.0.1/token", false));
+        assert!(!realm_is_allowed("http://localhost/token", false));
+        // From a loopback registry, an http loopback realm is allowed (local dev).
+        assert!(realm_is_allowed("http://127.0.0.1:5000/token", true));
+        assert!(realm_is_allowed("http://localhost:5000/token", true));
+        assert!(realm_is_allowed("http://[::1]:5000/token", true));
+        // ...but a NON-loopback http realm is still refused even from a loopback
+        // registry — a local registry must not redirect the fetch at the metadata
+        // service or the LAN.
+        assert!(!realm_is_allowed(
+            "http://169.254.169.254/latest/meta-data/",
+            true
+        ));
+        assert!(!realm_is_allowed("http://evil.example/token", true));
+    }
+
+    #[test]
+    fn realm_loopback_check_resists_host_spoofing() {
+        // Userinfo before '@' is NOT the host: ureq would dial evil.example.
+        assert!(!realm_is_allowed(
+            "http://127.0.0.1@evil.example/token",
+            true
+        ));
+        assert!(!realm_is_allowed(
+            "http://localhost@evil.example/token",
+            true
+        ));
+        // ...but a genuine loopback host with a decoy userinfo is fine.
+        assert!(realm_is_allowed(
+            "http://evil.example@127.0.0.1/token",
+            true
+        ));
+        // v4-mapped IPv6 of loopback is not ::1 → refused (fail closed).
+        assert!(!realm_is_allowed("http://[::ffff:127.0.0.1]/token", true));
+        // A subdomain of localhost is a different host → refused.
+        assert!(!realm_is_allowed("http://x.localhost/token", true));
+        // Other 127/8 addresses → refused (matches registry_base's literal set).
+        assert!(!realm_is_allowed("http://127.0.0.2/token", true));
+        // Non-http(s) schemes and unparseable input → refused.
+        assert!(!realm_is_allowed("file:///etc/passwd", true));
+        assert!(!realm_is_allowed("gopher://127.0.0.1/", true));
+        assert!(!realm_is_allowed("not a url", true));
+    }
+
+    #[test]
     fn verify_digest_accepts_matching_sha256() {
         // sha256 of "hello" = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
         let digest = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
@@ -438,10 +539,12 @@ mod tests {
     }
 
     #[test]
-    fn fetch_token_rejects_non_https_realm() {
-        // A malicious registry challenge pointing token fetch at an internal /
-        // metadata endpoint must be refused before any request is made (blind
-        // SSRF guard). No network is touched — the guard returns first.
+    fn fetch_token_rejects_dangerous_realm_before_any_request() {
+        // A malicious registry challenge pointing the credential-free token fetch
+        // at an internal / metadata endpoint must be refused before any request is
+        // made (blind SSRF guard, #41). No network is touched — the guard returns
+        // first. Each is refused whether or not the *registry* is loopback: a
+        // non-loopback http realm is never honoured, even for a local registry.
         let agent = ureq::AgentBuilder::new().build();
         for realm in [
             "http://169.254.169.254/latest/meta-data/",
@@ -449,17 +552,19 @@ mod tests {
             "ftp://example.com/",
             " HTTP://Example.com/token",
         ] {
-            let params = AuthParams {
-                realm: realm.to_string(),
-                service: None,
-                scope: None,
-            };
-            let err = fetch_token(&agent, &params).unwrap_err();
-            assert_eq!(
-                err.kind(),
-                io::ErrorKind::PermissionDenied,
-                "realm {realm:?} should be refused"
-            );
+            for registry_is_loopback in [false, true] {
+                let params = AuthParams {
+                    realm: realm.to_string(),
+                    service: None,
+                    scope: None,
+                };
+                let err = fetch_token(&agent, &params, registry_is_loopback).unwrap_err();
+                assert_eq!(
+                    err.kind(),
+                    io::ErrorKind::PermissionDenied,
+                    "realm {realm:?} (registry_loopback={registry_is_loopback}) must be refused"
+                );
+            }
         }
     }
 }
