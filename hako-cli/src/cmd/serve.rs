@@ -41,6 +41,9 @@ const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 /// minus the 16-byte ChaChaPoly tag.
 const NOISE_MSG_MAX: usize = 65535;
 const NOISE_PT_MAX: usize = NOISE_MSG_MAX - 16;
+/// Data bytes carried per chunk: the plaintext room minus the 1-byte `[final]`
+/// flag that authenticates the message boundary inside the AEAD (#59).
+const NOISE_PT_DATA: usize = NOISE_PT_MAX - 1;
 /// Cap on chunks per application message (> MAX_FRAME / NOISE_PT_MAX), bounding
 /// reassembly memory against a bogus chunk count.
 const MAX_APP_CHUNKS: u32 = 64;
@@ -120,29 +123,44 @@ fn read_u32(r: &mut impl Read) -> io::Result<u32> {
 }
 
 /// An authenticated, encrypted channel to a peer: the TCP stream plus the Noise
-/// transport state the IK handshake established. Application messages are split
-/// into ≤64 KiB Noise messages (the protocol's per-message limit), framed as a
-/// `[u32 chunk_count]` header then `[u32 ct_len][ciphertext]` per chunk, and
-/// reassembled on the far side. Tampering (a flipped byte, a dropped or reordered
-/// chunk) fails the per-message AEAD, so `recv` errors rather than returning bad
-/// bytes.
+/// transport state the IK handshake established. An application message is split
+/// into ≤64 KiB Noise messages (the protocol's per-message limit) and sent as a
+/// sequence of `[u32 ct_len][ciphertext]` records. Each record's *authenticated*
+/// plaintext is `[final: u8][data…]`; `recv` reassembles until it decrypts a
+/// record whose `final` flag is set. Because the terminator lives inside the
+/// AEAD, tampering — a flipped byte, or a dropped / reordered / truncated chunk —
+/// fails the per-message AEAD or leaves the stream with no valid final record, so
+/// `recv` errors rather than returning truncated or forged bytes (#59). Nothing
+/// outside the AEAD (no plaintext length or chunk count) is trusted for framing.
 struct NoiseChannel {
     stream: TcpStream,
     transport: snow::TransportState,
 }
 
+const CHUNK_MORE: u8 = 0;
+const CHUNK_FINAL: u8 = 1;
+
 impl NoiseChannel {
     fn send(&mut self, plaintext: &[u8]) -> io::Result<()> {
-        // Empty payload → zero chunks; both sides skip write/read_message so the
-        // Noise nonces stay in lockstep.
-        let chunks: Vec<&[u8]> = plaintext.chunks(NOISE_PT_MAX).collect();
-        self.stream
-            .write_all(&(chunks.len() as u32).to_be_bytes())?;
         let mut buf = vec![0u8; NOISE_MSG_MAX];
-        for c in chunks {
+        // Split into ≤NOISE_PT_DATA-byte data chunks; an empty message is one
+        // empty final chunk (so both directions always exchange ≥1 record and
+        // the Noise nonces stay in lockstep). Each Noise message's authenticated
+        // plaintext is [final flag][data].
+        let data_chunks: Vec<&[u8]> = if plaintext.is_empty() {
+            vec![&[][..]]
+        } else {
+            plaintext.chunks(NOISE_PT_DATA).collect()
+        };
+        let last = data_chunks.len() - 1;
+        let mut framed = Vec::with_capacity(NOISE_PT_MAX);
+        for (i, data) in data_chunks.iter().enumerate() {
+            framed.clear();
+            framed.push(if i == last { CHUNK_FINAL } else { CHUNK_MORE });
+            framed.extend_from_slice(data);
             let n = self
                 .transport
-                .write_message(c, &mut buf)
+                .write_message(&framed, &mut buf)
                 .map_err(noise_err)?;
             self.stream.write_all(&(n as u32).to_be_bytes())?;
             self.stream.write_all(&buf[..n])?;
@@ -151,13 +169,12 @@ impl NoiseChannel {
     }
 
     fn recv(&mut self) -> io::Result<Vec<u8>> {
-        let count = read_u32(&mut self.stream)?;
-        if count > MAX_APP_CHUNKS {
-            return Err(invalid("noise: too many chunks"));
-        }
         let mut out = Vec::new();
         let mut buf = vec![0u8; NOISE_MSG_MAX];
-        for _ in 0..count {
+        // Read records until an authenticated `final` chunk, bounded by
+        // MAX_APP_CHUNKS. A truncated stream (missing final record) hits EOF or a
+        // nonce mismatch here rather than being accepted as complete.
+        for _ in 0..MAX_APP_CHUNKS {
             let clen = read_u32(&mut self.stream)? as usize;
             if clen > NOISE_MSG_MAX {
                 return Err(invalid("noise: message too large"));
@@ -168,12 +185,20 @@ impl NoiseChannel {
                 .transport
                 .read_message(&ct, &mut buf)
                 .map_err(|_| invalid("noise: decrypt failed"))?;
-            out.extend_from_slice(&buf[..n]);
+            let (&flag, data) = buf[..n]
+                .split_first()
+                .ok_or_else(|| invalid("noise: empty chunk (no flag)"))?;
+            out.extend_from_slice(data);
             if out.len() > MAX_FRAME as usize {
                 return Err(invalid("frame too large"));
             }
+            match flag {
+                CHUNK_FINAL => return Ok(out),
+                CHUNK_MORE => continue,
+                _ => return Err(invalid("noise: bad chunk flag")),
+            }
         }
-        Ok(out)
+        Err(invalid("noise: too many chunks"))
     }
 }
 
@@ -868,16 +893,17 @@ mod tests {
         let mut client_ch = handshake_as_client(stream, &client_id, &server_vk).unwrap();
         let mut server_ch = server.join().unwrap();
 
-        // Encrypt one transport frame exactly as `send` does, but flip a single
-        // ciphertext byte in flight. The AEAD tag must fail closed rather than
-        // surface corrupted plaintext.
+        // Encrypt one transport frame exactly as `send` does (authenticated
+        // plaintext = [final flag][data]), but flip a single ciphertext byte in
+        // flight. The AEAD tag must fail closed rather than surface corrupt bytes.
         let mut buf = vec![0u8; NOISE_MSG_MAX];
+        let mut framed = vec![CHUNK_FINAL];
+        framed.extend_from_slice(b"top secret");
         let n = server_ch
             .transport
-            .write_message(b"top secret", &mut buf)
+            .write_message(&framed, &mut buf)
             .unwrap();
         buf[0] ^= 0xff;
-        server_ch.stream.write_all(&1u32.to_be_bytes()).unwrap(); // one chunk
         server_ch
             .stream
             .write_all(&(n as u32).to_be_bytes())
@@ -892,6 +918,51 @@ mod tests {
             err.to_string().contains("decrypt"),
             "expected a decrypt failure, got: {err}"
         );
+    }
+
+    #[test]
+    fn recv_rejects_a_truncated_multi_chunk_message() {
+        // #59: an application message split across chunks must not be accepted
+        // when the trailing chunk(s) are dropped. The server emits a valid
+        // non-final chunk and hangs up; `recv` must error (the authenticated
+        // terminator never arrives) rather than return the partial plaintext.
+        let ds = tempfile::tempdir().unwrap();
+        let dc = tempfile::tempdir().unwrap();
+        let server_id = id_at(ds.path());
+        let client_id = id_at(dc.path());
+        let server_vk = server_id.verifying_key();
+        let client_x = client_id.x25519_public();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            handshake_as_server(s, &server_id, move |x| *x == client_x).unwrap()
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut client_ch = handshake_as_client(stream, &client_id, &server_vk).unwrap();
+        let mut server_ch = server.join().unwrap();
+
+        // One authentic non-final chunk, then hang up: the final chunk that would
+        // complete the message never arrives.
+        let mut buf = vec![0u8; NOISE_MSG_MAX];
+        let mut framed = vec![CHUNK_MORE];
+        framed.extend_from_slice(b"first half only");
+        let n = server_ch
+            .transport
+            .write_message(&framed, &mut buf)
+            .unwrap();
+        server_ch
+            .stream
+            .write_all(&(n as u32).to_be_bytes())
+            .unwrap();
+        server_ch.stream.write_all(&buf[..n]).unwrap();
+        server_ch.stream.flush().unwrap();
+        drop(server_ch); // close the connection with no final chunk
+
+        client_ch
+            .recv()
+            .expect_err("a truncated multi-chunk message must be rejected, not returned");
     }
 
     #[test]
