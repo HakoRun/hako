@@ -655,3 +655,33 @@ fn json_output_is_valid_and_reflects_state() {
     let ps: serde_json::Value = serde_json::from_str(&ok(d.path(), &["ps", "--json"])).unwrap();
     assert_eq!(ps.as_array().unwrap().len(), 0);
 }
+
+#[test]
+fn push_replicates_a_branch_to_another_workspace() {
+    let a = workspace();
+    ok(a.path(), &["write", "/hello.txt", "from A"]);
+    ok(a.path(), &["commit", "-m", "c1"]);
+
+    let b = workspace();
+    // Push A's `main` into B's workspace (both locks taken in canonical order).
+    ok(a.path(), &["push", b.path().to_str().unwrap(), "main"]);
+
+    // B now has the branch and the exact file content.
+    assert_eq!(ok(b.path(), &["cat", "main:/hello.txt"]), "from A");
+}
+
+#[test]
+fn push_to_the_same_workspace_is_refused() {
+    let a = workspace();
+    ok(a.path(), &["write", "/x", "y"]);
+    ok(a.path(), &["commit", "-m", "c"]);
+    // Pushing a workspace into itself must be refused cleanly, never deadlock on
+    // the workspace lock (#75). `.output()` would hang forever on a deadlock.
+    let o = hako(a.path(), &["push", a.path().to_str().unwrap(), "main"]);
+    assert!(!o.status.success(), "self-push should fail, not succeed");
+    assert!(
+        err(&o).contains("itself"),
+        "expected a self-sync refusal, got: {}",
+        err(&o)
+    );
+}
