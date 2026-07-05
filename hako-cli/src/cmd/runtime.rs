@@ -75,6 +75,11 @@ pub fn run_host(
     command: Vec<String>,
 ) -> io::Result<ExitCode> {
     set_display_env(ctx, display);
+    // The Windows host bridge forwards the binary path via $HAKO_RUN_HOST_BIN
+    // (WSLENV path-translated) instead of an argv token, so a spaced path survives
+    // the wsl.exe boundary even when 8.3 short names are disabled (#79). When set,
+    // it IS the binary path and `command` holds only the program's own args.
+    let mut command = resolve_run_host_command(command, std::env::var("HAKO_RUN_HOST_BIN").ok());
     // command[0] is the host binary path; the rest are its arguments. Resolve
     // it to a canonical absolute path: this turns `./app`, `app`, `../app`,
     // and symlinks into a real absolute path with no `.`/`..` components — so
@@ -92,7 +97,6 @@ pub fn run_host(
         )
     })?;
     let path = abs.to_string_lossy().to_string();
-    let mut command = command;
     command[0] = path.clone();
 
     match in_container.as_deref() {
@@ -103,6 +107,16 @@ pub fn run_host(
         }
         Some(name) => run_host_in_container(ctx, name, &path, command),
     }
+}
+
+/// Prepend an env-provided binary path (from `$HAKO_RUN_HOST_BIN`, set by the
+/// Windows host bridge, #79) so `command[0]` is the path — matching the argv
+/// form the guest otherwise expects. An unset/empty env leaves `command` as-is.
+fn resolve_run_host_command(mut command: Vec<String>, env_bin: Option<String>) -> Vec<String> {
+    if let Some(bin) = env_bin.filter(|b| !b.is_empty()) {
+        command.insert(0, bin);
+    }
+    command
 }
 
 /// Tier 1: libraries from the host system.
@@ -555,5 +569,33 @@ fn exit_code_from(code: i32) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(u8::try_from(code).unwrap_or(1))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_host_env_bin_becomes_command0() {
+        // The Windows bridge sends the (already WSL-translated) binary path via
+        // $HAKO_RUN_HOST_BIN; it must land as command[0], ahead of program args.
+        let out = resolve_run_host_command(
+            vec!["--flag".to_string(), "arg".to_string()],
+            Some("/mnt/c/Users/First Last/app".to_string()),
+        );
+        assert_eq!(out, vec!["/mnt/c/Users/First Last/app", "--flag", "arg"]);
+    }
+
+    #[test]
+    fn run_host_without_env_is_unchanged() {
+        let argv = vec!["/bin/app".to_string(), "--flag".to_string()];
+        // Unset and empty both leave the argv form untouched (the guest then uses
+        // command[0] as the path, as before).
+        assert_eq!(resolve_run_host_command(argv.clone(), None), argv);
+        assert_eq!(
+            resolve_run_host_command(argv.clone(), Some(String::new())),
+            argv
+        );
     }
 }
