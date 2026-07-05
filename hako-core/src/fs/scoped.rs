@@ -96,6 +96,43 @@ impl<'s> ScopedFs<'s> {
         }
     }
 
+    /// Read just the `[offset, offset+size)` slice of a file, clamped to its end,
+    /// without materialising the whole file. This is the FUSE read hot path: the
+    /// kernel issues reads in ~128 KiB windows, so a whole-file load per call is
+    /// O(n^2) on a large file (#74). Inline content is sliced directly; external
+    /// content is served through `ChunkStore::read_at` (cache-aware on `FsStore`).
+    pub fn read_file_range(
+        &self,
+        root: &Hash,
+        path: &str,
+        offset: u64,
+        size: u32,
+    ) -> io::Result<Vec<u8>> {
+        let key = normalize_path(path)?;
+        if key.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "root is not a file",
+            ));
+        }
+        let v = tree::get(self.store, root, key.as_bytes())?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))?;
+        let bytes = require_inline(v)?;
+        let offset = offset as usize;
+        let len = size as usize;
+        match decode_entry(&bytes)? {
+            DirEntry::File(f) => match &f.content {
+                Value::Inline(data) => Ok(crate::store::slice_clamped(data, offset, len)),
+                Value::External(h) => self
+                    .store
+                    .read_at(h, offset, len)?
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing value chunk")),
+            },
+            DirEntry::Directory => Err(io::Error::other("is a directory")),
+            DirEntry::Symlink(_) => Err(io::Error::other("is a symlink")),
+        }
+    }
+
     pub fn read_symlink(&self, root: &Hash, path: &str) -> io::Result<Vec<u8>> {
         let key = normalize_path(path)?;
         if key.is_empty() {
@@ -818,5 +855,42 @@ mod tests {
         let root = fs.write_file(&root, "blocker", b"f").unwrap();
         // Try to copy /src to /blocker/inside — blocker is a file.
         assert!(fs.cp(&root, "src", "blocker/inside").is_err());
+    }
+
+    #[test]
+    fn read_file_range_serves_windows_and_clamps() {
+        let s = MemStore::new();
+        let fs = ScopedFs::new(&s);
+        // A body larger than INLINE_THRESHOLD (64) so content is External — the
+        // path #74 is about (the FUSE read window over a chunk-backed file).
+        let body: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        let root = fs.write_file(&empty(), "big", &body).unwrap();
+
+        // A window in the middle matches the same slice of the whole file.
+        assert_eq!(
+            fs.read_file_range(&root, "big", 100, 50).unwrap(),
+            body[100..150]
+        );
+        // Size past EOF is clamped to the end, not an error.
+        assert_eq!(
+            fs.read_file_range(&root, "big", 990, 100).unwrap(),
+            body[990..]
+        );
+        // Offset at/after EOF yields an empty read.
+        assert!(fs
+            .read_file_range(&root, "big", 1000, 10)
+            .unwrap()
+            .is_empty());
+        assert!(fs
+            .read_file_range(&root, "big", 5000, 10)
+            .unwrap()
+            .is_empty());
+        // Full-file window equals the whole file / read_file.
+        assert_eq!(fs.read_file_range(&root, "big", 0, 1000).unwrap(), body);
+
+        // Inline (small) content takes the direct-slice branch.
+        let small = fs.write_file(&empty(), "s", b"hello world").unwrap();
+        assert_eq!(fs.read_file_range(&small, "s", 6, 5).unwrap(), b"world");
+        assert!(fs.read_file_range(&small, "s", 99, 5).unwrap().is_empty());
     }
 }
