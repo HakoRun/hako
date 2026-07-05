@@ -113,8 +113,9 @@ fn create_vm(name: &str) -> io::Result<()> {
     let yaml_path = std::env::temp_dir().join(format!("hako-lima-{}.yaml", name));
     fs::write(&yaml_path, &yaml)?;
 
+    let yaml_str = super::path_str(&yaml_path)?;
     let create = Command::new("limactl")
-        .args(["create", "--name", name, yaml_path.to_str().unwrap()])
+        .args(["create", "--name", name, yaml_str])
         .status()?;
     let _ = fs::remove_file(&yaml_path);
     if !create.success() {
@@ -142,8 +143,9 @@ fn inject_binary(name: &str) -> io::Result<()> {
     tmp.flush()?;
     let tmp_path = tmp.path().to_path_buf();
     let dest = format!("{}:/tmp/hako-bin", name);
+    let tmp_str = super::path_str(&tmp_path)?;
     let copy = Command::new("limactl")
-        .args(["copy", tmp_path.to_str().unwrap(), &dest])
+        .args(["copy", tmp_str, &dest])
         .status()?;
     // tmp drops here on the way out; explicit close to surface any cleanup
     // I/O error rather than swallowing it in Drop.

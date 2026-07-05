@@ -137,10 +137,13 @@ fn forward_windows(cwd: &Path, args: &[String]) -> io::Result<ExitCode> {
     // `Ubuntu` distro and getting "command not found" or worse).
     let distro = bootstrap_wsl::distro_name();
     let wsl_cwd = win_to_wsl_path(cwd);
-    // Lift -w out to an env var (forwarded via WSLENV path translation) so a
-    // spaced workspace path survives wsl.exe; translate a run-host binary path.
+    // Lift the two spaced-path-sensitive values — the workspace (`-w`) and a
+    // run-host binary path — out of argv and forward them as env vars. `wsl.exe`
+    // re-splits an argv token on spaces, but an env var's value survives intact,
+    // and WSLENV `/p` translates each Windows path to a WSL path on the far side.
+    // This is robust even when 8.3 short-name generation is disabled (#79).
     let (workdir_win, rest) = extract_w_flag_windows(args);
-    let translated_args = translate_run_host_path_windows(rest);
+    let (runhost_bin, rest) = extract_run_host_bin_windows(rest);
 
     crate::diag!(
         "forwarding to wsl -d {} (set HAKO_DISTRO to override)",
@@ -149,15 +152,26 @@ fn forward_windows(cwd: &Path, args: &[String]) -> io::Result<ExitCode> {
 
     let mut cmd = Command::new("wsl");
     cmd.args(["-d", &distro, "--cd", &wsl_cwd, "--", "hako"]);
-    cmd.args(&translated_args);
-    if let Some(w) = workdir_win {
-        // WSLENV with the `/p` flag tells WSL to translate HAKO_WORKDIR (a
-        // Windows path) into a WSL path. Append to any existing WSLENV.
+    cmd.args(&rest);
+
+    let mut wslenv_parts: Vec<&str> = Vec::new();
+    if let Some(w) = &workdir_win {
+        cmd.env("HAKO_WORKDIR", w);
+        wslenv_parts.push("HAKO_WORKDIR/p");
+    }
+    if let Some(b) = &runhost_bin {
+        cmd.env("HAKO_RUN_HOST_BIN", b);
+        wslenv_parts.push("HAKO_RUN_HOST_BIN/p");
+    }
+    if !wslenv_parts.is_empty() {
+        // WSLENV `/p` tells WSL to translate each named var's Windows path into a
+        // WSL path. Append to any existing WSLENV rather than clobbering it.
+        let extra = wslenv_parts.join(":");
         let wslenv = match env::var("WSLENV") {
-            Ok(prev) if !prev.is_empty() => format!("{prev}:HAKO_WORKDIR/p"),
-            _ => "HAKO_WORKDIR/p".to_string(),
+            Ok(prev) if !prev.is_empty() => format!("{prev}:{extra}"),
+            _ => extra,
         };
-        cmd.env("HAKO_WORKDIR", w).env("WSLENV", wslenv);
+        cmd.env("WSLENV", wslenv);
     }
 
     spawn_and_wait(cmd, "wsl")
@@ -193,6 +207,18 @@ fn spawn_and_wait(mut cmd: Command, tool: &str) -> io::Result<ExitCode> {
     })?;
     let code = status.code().unwrap_or(1);
     Ok(ExitCode::from(code as u8))
+}
+
+/// A path as `&str`, or an `io` error rather than a panic if it isn't valid
+/// UTF-8 — a non-UTF-8 `%LOCALAPPDATA%`/`TEMP` shouldn't crash bootstrap (#79).
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+pub(super) fn path_str(p: &Path) -> io::Result<&str> {
+    p.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path is not valid UTF-8: {}", p.display()),
+        )
+    })
 }
 
 /// `C:\Users\foo\bar` → `/mnt/c/Users/foo/bar`. WSL's path-translation
@@ -293,16 +319,19 @@ fn extract_w_flag_windows(args: &[String]) -> (Option<String>, Vec<String>) {
     (workdir, out)
 }
 
-/// Translate the binary path of a `run-host` invocation from a Windows path to
-/// a WSL path, so `hako run-host [--in X] [--display] C:\Users\me\app` works
-/// from a Windows shell. We skip run-host's own options (`--in <val>`/`--in=`,
-/// `--display`, and a `--` terminator) to find the first positional — the
-/// binary path — and rewrite only that; the program's own arguments pass
-/// through verbatim (we can't know whether they're paths the guest interprets).
+/// Pull the binary-path positional out of a `run-host` invocation, returning it
+/// (the verbatim Windows path) and `args` with it removed. The bridge forwards it
+/// via `$HAKO_RUN_HOST_BIN` + WSLENV translation instead of an argv token, so
+/// `hako run-host [--in X] [--display] "C:\Users\First Last\app"` survives the
+/// `wsl.exe` boundary even where 8.3 short names are disabled (#79). We skip
+/// run-host's own options (`--in <val>`/`--in=`, `--display`, a `--` terminator)
+/// to find the first positional; the program's own arguments stay in `args`
+/// verbatim (we can't know whether they're paths the guest interprets). Returns
+/// `None` (args unchanged) when this isn't a run-host call or has no positional.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn translate_run_host_path_windows(mut args: Vec<String>) -> Vec<String> {
+fn extract_run_host_bin_windows(mut args: Vec<String>) -> (Option<String>, Vec<String>) {
     let Some(pos) = args.iter().position(|a| a == "run-host") else {
-        return args;
+        return (None, args);
     };
     let mut i = pos + 1;
     while let Some(tok) = args.get(i).map(String::as_str) {
@@ -320,10 +349,11 @@ fn translate_run_host_path_windows(mut args: Vec<String>) -> Vec<String> {
             _ => break,
         }
     }
-    if let Some(p) = args.get(i) {
-        args[i] = win_to_wsl_path(Path::new(p));
+    if i < args.len() {
+        (Some(args.remove(i)), args)
+    } else {
+        (None, args)
     }
-    args
 }
 
 #[cfg(test)]
@@ -350,85 +380,82 @@ mod tests {
     }
 
     #[test]
-    fn run_host_path_is_translated() {
-        // Bare: the binary path is rewritten, guest args left alone.
-        let args = vec![
+    fn run_host_bin_is_extracted_verbatim() {
+        // Bare: the binary path is pulled out (unchanged — WSLENV translates it),
+        // and the guest args stay put.
+        let (bin, rest) = extract_run_host_bin_windows(vec![
             "run-host".to_string(),
-            r"C:\Users\me\app".to_string(),
+            r"C:\Users\First Last\app".to_string(),
             r"--config=C:\keep".to_string(),
-        ];
-        let out = translate_run_host_path_windows(args);
-        assert_eq!(
-            out,
-            vec!["run-host", "/mnt/c/Users/me/app", r"--config=C:\keep"]
-        );
+        ]);
+        assert_eq!(bin.as_deref(), Some(r"C:\Users\First Last\app"));
+        assert_eq!(rest, vec!["run-host", r"--config=C:\keep"]);
     }
 
     #[test]
-    fn run_host_path_translated_past_in_and_display_options() {
+    fn run_host_bin_extracted_past_in_and_display_options() {
         // `--in <container>` (value) and `--display` (flag) precede the binary
-        // path; the path must still be the token that gets translated.
-        let args = vec![
+        // path; it's still the token that gets pulled out.
+        let (bin, rest) = extract_run_host_bin_windows(vec![
             "run-host".to_string(),
             "--in".to_string(),
             "alpine".to_string(),
             "--display".to_string(),
             r"C:\Users\me\app".to_string(),
             r"--guestflag=C:\keep".to_string(),
-        ];
-        let out = translate_run_host_path_windows(args);
+        ]);
+        assert_eq!(bin.as_deref(), Some(r"C:\Users\me\app"));
         assert_eq!(
-            out,
+            rest,
             vec![
                 "run-host",
                 "--in",
                 "alpine",
                 "--display",
-                "/mnt/c/Users/me/app",
                 r"--guestflag=C:\keep"
             ]
         );
 
         // `--in=value` (equals form) likewise.
-        let args2 = vec![
+        let (bin2, rest2) = extract_run_host_bin_windows(vec![
             "run-host".to_string(),
             "--in=debian".to_string(),
             r"C:\x\y".to_string(),
-        ];
-        let out2 = translate_run_host_path_windows(args2);
-        assert_eq!(out2, vec!["run-host", "--in=debian", "/mnt/c/x/y"]);
+        ]);
+        assert_eq!(bin2.as_deref(), Some(r"C:\x\y"));
+        assert_eq!(rest2, vec!["run-host", "--in=debian"]);
     }
 
     #[test]
-    fn run_host_path_after_double_dash_and_globals() {
+    fn run_host_bin_after_double_dash_and_globals() {
         // Leading hako globals + an explicit `--` before the binary.
-        let args = vec![
+        let (bin, rest) = extract_run_host_bin_windows(vec![
             "-c".to_string(),
             "ubuntu".to_string(),
             "run-host".to_string(),
             "--".to_string(),
             r"D:\bin\tool.bin".to_string(),
             "-v".to_string(),
-        ];
-        let out = translate_run_host_path_windows(args);
-        assert_eq!(
-            out,
-            vec![
-                "-c",
-                "ubuntu",
-                "run-host",
-                "--",
-                "/mnt/d/bin/tool.bin",
-                "-v"
-            ]
-        );
+        ]);
+        assert_eq!(bin.as_deref(), Some(r"D:\bin\tool.bin"));
+        assert_eq!(rest, vec!["-c", "ubuntu", "run-host", "--", "-v"]);
     }
 
     #[test]
     fn non_run_host_is_untouched() {
         let args = vec!["run".to_string(), "alpine".to_string(), "sh".to_string()];
-        let out = translate_run_host_path_windows(args.clone());
-        assert_eq!(out, args);
+        let (bin, rest) = extract_run_host_bin_windows(args.clone());
+        assert_eq!(bin, None);
+        assert_eq!(rest, args);
+    }
+
+    #[test]
+    fn run_host_with_no_positional_extracts_nothing() {
+        // Only options, no binary yet — nothing to extract, args unchanged.
+        let args = vec!["run-host".to_string(), "--display".to_string()];
+        let (bin, rest) = extract_run_host_bin_windows(args.clone());
+        assert_eq!(bin, None);
+        assert_eq!(rest, args);
     }
 
     #[test]

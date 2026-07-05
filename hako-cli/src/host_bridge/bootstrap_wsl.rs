@@ -171,15 +171,10 @@ fn create_distro(name: &str) -> io::Result<()> {
     let tar_path = std::env::temp_dir().join(format!("hako-rootfs-{}.tar", name));
     write_minimal_rootfs(&tar_path)?;
 
+    let install_str = super::path_str(&install_dir)?;
+    let tar_str = super::path_str(&tar_path)?;
     let status = Command::new("wsl")
-        .args([
-            "--import",
-            name,
-            install_dir.to_str().unwrap(),
-            tar_path.to_str().unwrap(),
-            "--version",
-            "2",
-        ])
+        .args(["--import", name, install_str, tar_str, "--version", "2"])
         .status()?;
     let _ = fs::remove_file(&tar_path);
     if !status.success() {
