@@ -2,6 +2,11 @@ use crate::hash::Hash;
 use std::sync::OnceLock;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
+// On-disk format invariants. Changing any of these changes the boundary decision
+// for content-defined chunking, hence every node and root hash — breaking
+// compatibility with existing stores and cross-node dedup. Crate-internal on
+// purpose (not re-exported from `tree`): nothing outside `hako` may depend on the
+// chunking geometry.
 pub const TARGET_FANOUT: u64 = 64;
 pub const INLINE_THRESHOLD: usize = 64;
 
