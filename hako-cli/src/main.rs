@@ -544,6 +544,11 @@ impl Cmd {
             // against it).
             #[cfg(feature = "cluster")]
             Cmd::Id | Cmd::Serve { .. } | Cmd::Peer { .. } => false,
+            // fetch/push lock BOTH the local and remote workspaces themselves, in
+            // a global order that refuses a self-sync. main must NOT pre-lock the
+            // local workspace here, or the second acquire would self-deadlock when
+            // local and remote resolve to the same path (#75).
+            Cmd::Fetch { .. } | Cmd::Push { .. } => false,
             // Everything else is RMW on workspace state.
             _ => true,
         }
