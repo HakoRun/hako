@@ -245,7 +245,11 @@ fn entry_to_attr(
         DirEntry::File(f) => (FileType::RegularFile, f.size, f.mode, f.mtime),
         DirEntry::Symlink(s) => (FileType::Symlink, s.target.len() as u64, s.mode, s.mtime),
     };
-    let t = UNIX_EPOCH + Duration::from_secs(mtime);
+    // A hostile or corrupt mtime near u64::MAX would overflow `SystemTime` and
+    // panic; clamp to the epoch instead (not workload-reachable today, #78).
+    let t = UNIX_EPOCH
+        .checked_add(Duration::from_secs(mtime))
+        .unwrap_or(UNIX_EPOCH);
     Ok(FileAttr {
         ino,
         size,
@@ -1083,6 +1087,11 @@ impl InodeTable {
     /// path under `new`. Preserves inode numbers across the rename so any
     /// open fds keep working.
     fn rename_subtree(&mut self, old: &str, new: &str) {
+        // Renaming over an existing destination: drop the clobbered dest's inode
+        // mapping first, or its `fwd` entry dangles — an fd still open on the old
+        // destination would then read the renamed-in content, and the stale entry
+        // leaks on repeated overwrites (#78).
+        self.forget_path(new);
         let old_prefix = format!("{}/", old);
         let entries: Vec<(String, u64)> = self
             .rev
@@ -1163,5 +1172,20 @@ mod tests {
         // old paths gone.
         assert!(!t.rev.contains_key("src"));
         assert!(!t.rev.contains_key("src/file.txt"));
+    }
+
+    #[test]
+    fn rename_over_existing_forgets_the_clobbered_dest() {
+        let mut t = InodeTable::new();
+        let src = t.intern("src");
+        let dst_old = t.intern("dst"); // destination already exists
+        assert_ne!(src, dst_old);
+        t.rename_subtree("src", "dst");
+        // `dst` now resolves to the moved-in inode, and the clobbered dest's old
+        // inode is fully forgotten (no dangling fwd entry that would let an fd on
+        // it read the renamed-in content).
+        assert_eq!(t.path_of(src), Some("dst"));
+        assert!(t.path_of(dst_old).is_none());
+        assert_eq!(t.rev.get("dst"), Some(&src));
     }
 }
