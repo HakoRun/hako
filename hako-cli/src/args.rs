@@ -160,6 +160,15 @@ pub(crate) enum Cmd {
         #[arg(long)]
         abort: bool,
     },
+    /// Roll back: commit an older tree on top of the current tip. This is the only
+    /// rollback the fast-forward-only push protocol permits, and history records it.
+    /// `refspec` is a branch, tag, or commit-hash prefix.
+    Revert {
+        refspec: String,
+        /// Commit author (default: $HAKO_AUTHOR, else "user")
+        #[arg(short = 'a', long)]
+        author: Option<String>,
+    },
     /// Diff working tree against HEAD (or specified refs). Refs may be branches or hash prefixes.
     Diff {
         from: Option<String>,
