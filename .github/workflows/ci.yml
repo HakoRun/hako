@@ -33,6 +33,23 @@ jobs:
       # build, so lint it explicitly.
       - run: cargo clippy -p hako-cli --all-targets --features cluster --locked -- -D warnings
 
+  features:
+    name: feature matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # hako-core's optional surfaces must each still build on their own, or a
+      # feature combination silently rots. The default (oci + fuse) build is
+      # already covered by the test/clippy jobs; here we exercise the slices that
+      # nothing else builds — most importantly the "pure VC filesystem" config
+      # with no registry/FUSE dependency surface. Three explicit invocations beat
+      # a feature powerset for two features.
+      - run: cargo check -p hako --no-default-features --locked
+      - run: cargo check -p hako --no-default-features --features oci --locked
+      - run: cargo check -p hako --no-default-features --features fuse --locked
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
