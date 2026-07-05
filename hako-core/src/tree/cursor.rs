@@ -167,10 +167,6 @@ impl<'a> Cursor<'a> {
         Ok(Some(entry))
     }
 
-    pub fn done(&self) -> bool {
-        self.done
-    }
-
     /// Hash of the next subtree the cursor would descend into, without
     /// loading. Returns `None` if the cursor is already at a leaf entry
     /// (no pending descent), is done, or has exhausted all internal frames.
@@ -355,7 +351,6 @@ mod tests {
     fn open_empty_is_done() {
         let s = MemStore::new();
         let mut c = Cursor::open(&s, empty()).unwrap();
-        assert!(c.done());
         assert!(c.current().unwrap().is_none());
     }
 
@@ -418,7 +413,7 @@ mod tests {
         let root = bulk_build(&s, entries(100)).unwrap();
         let mut c = Cursor::open(&s, root).unwrap();
         c.seek(b"zzzzz").unwrap();
-        assert!(c.done());
+        assert!(c.current().unwrap().is_none());
         assert!(c.current().unwrap().is_none());
     }
 
@@ -450,7 +445,7 @@ mod tests {
         let s = MemStore::new();
         let mut c = Cursor::open(&s, empty()).unwrap();
         c.seek(b"anything").unwrap();
-        assert!(c.done());
+        assert!(c.current().unwrap().is_none());
     }
 
     #[test]
