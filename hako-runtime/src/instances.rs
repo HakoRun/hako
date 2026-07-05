@@ -342,24 +342,40 @@ pub fn stop(_workdir: &Path, _id: &str, _force: bool) -> Result<(), RuntimeError
 // Helpers
 // ============================================================================
 
-/// True iff a process exists at `pid` AND (when both sides have a recorded
-/// start_time) the start times match. Without a recorded start_time we fall
-/// back to mere existence — better than nothing, but lossy under pid reuse.
+/// True iff a process exists at `pid` AND, when a start_time was recorded, the
+/// current one matches it. Without a *recorded* start_time we fall back to mere
+/// existence — lossy under pid reuse, but the best a legacy record allows.
 #[cfg(target_os = "linux")]
-fn process_matches(pid: u32, recorded_start: Option<u64>) -> bool {
+pub(crate) fn process_matches(pid: u32, recorded_start: Option<u64>) -> bool {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
     if kill(Pid::from_raw(pid as i32), None).is_err() {
         return false;
     }
-    match (recorded_start, read_starttime(pid)) {
+    starttime_matches(recorded_start, read_starttime(pid))
+}
+
+/// Decide whether a recorded start_time agrees with the freshly-read one for the
+/// pid-reuse check. Split out from [`process_matches`] so the fail-closed policy
+/// is unit-testable without racing a real exiting process.
+///
+/// A recorded start_time that can't be re-read now (`current == None`) fails
+/// **closed**: `kill(pid, 0)` just said something exists at that pid, but its
+/// `/proc/<pid>/stat` vanished — the process is exiting, possibly mid-recycle, so
+/// we cannot confirm identity and must not trust bare existence (a recycler that
+/// grabbed the pid would satisfy it). Only a fully-absent *recorded* start_time
+/// (a legacy/non-Linux record) falls back to existence-only.
+#[cfg(target_os = "linux")]
+fn starttime_matches(recorded: Option<u64>, current: Option<u64>) -> bool {
+    match (recorded, current) {
         (Some(a), Some(b)) => a == b,
-        _ => true, // can't compare → trust existence
+        (Some(_), None) => false,
+        (None, _) => true,
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn process_matches(_pid: u32, _recorded_start: Option<u64>) -> bool {
+pub(crate) fn process_matches(_pid: u32, _recorded_start: Option<u64>) -> bool {
     // Non-Unix host can't check process state at all. Used only for the
     // read-only "ps from Mac/Windows" flow.
     false
@@ -403,6 +419,20 @@ mod tests {
 
     fn workdir() -> TempDir {
         TempDir::new().expect("tempdir")
+    }
+
+    // The pid-reuse identity check must fail CLOSED when a start_time was recorded
+    // but can't be re-read (the process is exiting, possibly mid-recycle) — else a
+    // recycler that grabbed the pid passes `exec`'s guard (#72 review). Only a
+    // legacy record with no start_time at all may fall back to existence-only.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn starttime_matches_fails_closed_when_recorded_but_unreadable() {
+        assert!(starttime_matches(Some(500), Some(500))); // same incarnation
+        assert!(!starttime_matches(Some(500), Some(501))); // recycled: different start
+        assert!(!starttime_matches(Some(500), None)); // recorded, vanished → closed
+        assert!(starttime_matches(None, Some(500))); // legacy record → existence
+        assert!(starttime_matches(None, None)); // legacy record → existence
     }
 
     #[test]
