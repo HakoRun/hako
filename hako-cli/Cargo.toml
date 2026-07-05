@@ -48,6 +48,12 @@ snow = { version = "0.9", default-features = false, features = [
 curve25519-dalek = { version = "4", optional = true }
 sha2 = { version = "0.10", optional = true }
 
+# `geteuid` for verifying the bundle cache directory is private and owned by us
+# before trusting its contents (issue #58). Unix-only; the security check is a
+# no-op on Windows, where LOCALAPPDATA is already a per-user ACL'd location.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 # The distributed/cluster surface (Phase 1+): node identity and static peers
