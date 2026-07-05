@@ -6,7 +6,7 @@ use super::channel::*;
 use super::proto::*;
 use crate::cmd::{identity, peers, Ctx};
 use hako::{ChunkStore, Hash};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::process::ExitCode;
 
@@ -125,7 +125,7 @@ pub fn remote_push(ctx: &Ctx<'_>, node: &str, branch: &str) -> io::Result<ExitCo
 }
 
 /// Read a response message; return its payload on success, an error otherwise.
-fn read_ok_payload(ch: &mut NoiseChannel, node: &str) -> io::Result<Vec<u8>> {
+fn read_ok_payload<S: Read + Write>(ch: &mut NoiseChannel<S>, node: &str) -> io::Result<Vec<u8>> {
     let resp = ch.recv()?;
     let (&status, payload) = resp
         .split_first()
@@ -141,13 +141,16 @@ fn read_ok_payload(ch: &mut NoiseChannel, node: &str) -> io::Result<Vec<u8>> {
 }
 
 /// Read a response and write its payload to stdout.
-fn read_response(ch: &mut NoiseChannel, node: &str) -> io::Result<ExitCode> {
+fn read_response<S: Read + Write>(ch: &mut NoiseChannel<S>, node: &str) -> io::Result<ExitCode> {
     let payload = read_ok_payload(ch, node)?;
     io::stdout().write_all(&payload)?;
     Ok(ExitCode::SUCCESS)
 }
 
-pub(crate) fn connect_and_handshake(ctx: &Ctx<'_>, peer: &peers::Peer) -> io::Result<NoiseChannel> {
+pub(crate) fn connect_and_handshake(
+    ctx: &Ctx<'_>,
+    peer: &peers::Peer,
+) -> io::Result<NoiseChannel<TcpStream>> {
     let expected = peer.verifying_key()?;
     let id = identity::load_or_create(ctx)?;
     let stream = TcpStream::connect(&peer.address)?;
