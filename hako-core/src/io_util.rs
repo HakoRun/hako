@@ -8,7 +8,7 @@
 use fs2::FileExt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Atomically write `data` to `path`. Internally:
@@ -87,8 +87,6 @@ fn fsync_dir(_path: &Path) -> io::Result<()> {
 pub struct WorkspaceLock {
     // Hold the File alive; dropping it releases the lock.
     _file: File,
-    #[allow(dead_code)]
-    path: PathBuf,
 }
 
 impl WorkspaceLock {
@@ -104,7 +102,7 @@ impl WorkspaceLock {
             .truncate(false)
             .open(&path)?;
         file.lock_exclusive()?;
-        Ok(WorkspaceLock { _file: file, path })
+        Ok(WorkspaceLock { _file: file })
     }
 
     /// Try to acquire without blocking. Returns `None` if another process holds it.
@@ -118,7 +116,7 @@ impl WorkspaceLock {
             .truncate(false)
             .open(&path)?;
         match file.try_lock_exclusive() {
-            Ok(()) => Ok(Some(WorkspaceLock { _file: file, path })),
+            Ok(()) => Ok(Some(WorkspaceLock { _file: file })),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(e),
         }

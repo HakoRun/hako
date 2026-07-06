@@ -2,6 +2,10 @@
 /target
 /target-s
 
+# Local hako workspace state (dogfooding `hako init` in the repo root).
+# Workspace state — objects, refs, session — is never committed.
+.hako/
+
 # Backup files from rustfmt
 **/*.rs.bk
 

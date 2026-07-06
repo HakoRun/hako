@@ -1,7 +1,10 @@
 # Push-to-deploy: hako as git-for-infrastructure
 
-**Status:** Draft / proposed. Supersedes the "auto-mesh" direction sketched in the
-later phases of `distributed.md` (see Non-goals).
+**Status:** Accepted / in progress. Supersedes the "auto-mesh" direction sketched
+in the later phases of `distributed.md` (see Non-goals). Landed so far:
+**P1-2** (`hako revert`), **P2-3** (`hako peer fetch` — network fetch), and the
+**P1-1 prerequisite** (`[deploy]` parsed as a reserved node-local table). Each
+landed item is marked in place below.
 
 ## Thesis
 
@@ -156,6 +159,10 @@ notes already flag this). Ref-mutating work must serialize; reads must not.
 
 ### P1-1 — The deploy hook (a remote that runs)
 
+> **Partially landed:** the `[deploy]` table is parsed as a reserved node-local
+> table in `config.rs` (the "reserve `[deploy]` as a real table" note below).
+> The hook itself — reconciling on ref advance — is not built.
+
 **Problem.** Today you can `push` and remotely `run`, but nothing ties a ref
 advance to the running workload.
 
@@ -216,7 +223,7 @@ fn), `hako-core/src/config.rs` (`[deploy]`), `instances.rs`, `transform.rs`.
 **Risk.** RCE-on-ref-advance — mitigated by receiver-side config + opt-in + P2-1
 capabilities. In-flight requests: SIGTERM + drain window, same contract as Docker.
 
-### P1-2 — `hako revert`
+### P1-2 — `hako revert` ✅ LANDED
 
 **Problem.** The wire is FF-only, so rollback **cannot** be a backward ref move.
 The only rollback the protocol permits is a *revert-commit* (a new commit whose
@@ -302,9 +309,11 @@ instance's base, nor recently written.
 
 **Risk.** Small; mirrors the existing reachable-roots logic.
 
-### P2-3 — Network fetch (recovery + hub topology)
+### P2-3 — Network fetch (recovery + hub topology) ✅ LANDED
 
-**Problem.** The wire is **push-only** (`HAVE`/`PUT`/`REF`, no `WANT`/`GET`);
+(Shipped as `hako peer fetch <node> [branch]`.)
+
+**Problem.** The wire was **push-only** (`HAVE`/`PUT`/`REF`, no `WANT`/`GET`);
 `cmd/sync.rs` fetch is path-local. A peer whose push is refused (non-FF) has **no
 way to reconcile over the network** — git says "fetch, integrate, re-push"; hako
 can't fetch. This is needed regardless of topology and is the other half of a real
@@ -406,11 +415,11 @@ not more namespace.
 **Milestone 1 (makes it real):** P0-1 networking, P0-2 supervision, P0-3 concurrent
 daemon. Without these there is no production and no demo.
 
-**Milestone 2 (makes it push-to-deploy):** P1-1 hook, P1-2 `hako revert`, P1-3
-remote stop/proc/logs, P2-1 capabilities (ship with P1-3).
+**Milestone 2 (makes it push-to-deploy):** P1-1 hook, P1-2 `hako revert` ✅,
+P1-3 remote stop/proc/logs, P2-1 capabilities (ship with P1-3).
 
-**Milestone 3 (makes it safe & operable):** P2-2 gc-on-prod, P2-3 fetch, P2-4
-secrets.
+**Milestone 3 (makes it safe & operable):** P2-2 gc-on-prod, P2-3 fetch ✅,
+P2-4 secrets.
 
 The auto-mesh (gossip/converged namespace) is **not** a milestone; it becomes an
 optional convergence layer only if node count ever outgrows explicit push — and the

@@ -13,9 +13,9 @@ cargo build --workspace        # full build
 cargo build -p hako-cli        # just the `hako` binary
 ```
 
-The Linux container runtime links `libfuse`; on Debian/Ubuntu install
-`libfuse3-dev` + `pkg-config`. For the cross-platform / embedded build, see
-[BUILD.md](BUILD.md).
+No system libraries are needed — hako mounts FUSE via `mount(2)` directly, so
+there is no libfuse/pkg-config build dependency. For the cross-platform /
+embedded build, see [BUILD.md](BUILD.md).
 
 ## Before you open a PR
 
@@ -26,7 +26,16 @@ cargo fmt --all                                        # format
 cargo fmt --all -- --check                             # CI check
 cargo clippy --workspace --all-targets -- -D warnings  # lint (warnings are errors)
 cargo test --workspace                                 # unit + integration tests
+
+# The opt-in cluster surface isn't built by the default workspace commands;
+# CI lints and tests it explicitly — do the same if you touch it:
+cargo clippy -p hako-cli --all-targets --features cluster -- -D warnings
+cargo test -p hako-cli --features cluster
 ```
+
+CI additionally checks a hako-core feature matrix (`--no-default-features`,
+`oci`, `fuse`), runs `cargo-deny`, and builds the Windows/macOS embedded
+wrappers on every PR.
 
 ### Runtime / isolation changes
 

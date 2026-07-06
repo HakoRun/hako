@@ -1,9 +1,16 @@
 # Distributed hako — design notes
 
-Status: **conceptual / in progress.** This is the north star for turning hako
-into a private, trusted-fleet distributed runtime — "compose N hako nodes into
-one logical computer." It is *not* a public, untrusted marketplace (that needs a
-microVM isolation tier we deliberately keep off the critical path).
+Status: **largely landed.** Phases 0–3 below are built (`ctl` lifecycle, node
+identity + peers, the `hako serve` daemon with a Noise-encrypted wire protocol,
+and the `/peers/` client surface). The successor spec —
+[push-to-deploy.md](push-to-deploy.md) — supersedes the auto-mesh/orchestrator
+direction sketched in the later phases and is where new work is scoped. This
+document remains the architectural rationale.
+
+The goal is a private, trusted-fleet distributed runtime — "compose N hako
+nodes into one logical computer." It is *not* a public, untrusted marketplace
+(that needs a microVM isolation tier we deliberately keep off the critical
+path).
 
 ## Goal & posture
 
@@ -19,8 +26,8 @@ microVM isolation tier we deliberately keep off the critical path).
 ## The foundation we already have (`main`)
 
 - **The namespace is the right shape.** `RouteTarget = Local | ContainersList |
-  Container | Workspace | Peers`. `/peers/<node>/…` is a pre-carved (stubbed)
-  extension point.
+  Container | Workspace | Peers`. `/peers/<node>/…` was pre-carved as an
+  extension point and is now wired to the daemon.
 - **Control is a file write.** `ctl` (Plan 9 control-file model) already turns
   "act on a container" into "write a verb." Remoting it is transport, not
   redesign.
@@ -30,18 +37,15 @@ microVM isolation tier we deliberately keep off the critical path).
 - **Host-scoping separates the planes.** `/containers` + `/peers` are host-only;
   guests are pure — exactly the orchestrator/workload split a cluster wants.
 
-## The keystone gap: there is no daemon
+## The keystone: the node daemon (built)
 
-hako is a one-shot CLI; there is **no listener/socket/service loop** anywhere.
-For a peer to receive a remote op, a process must be *listening on the node* —
-a supervised, long-lived **`hako serve`**. This is the largest unbuilt component
-and the honest center of gravity for distribution.
-
-Good news: it is not built on nothing. `hako run -d` already spawns a supervised,
-shell-surviving process per instance (`instances.rs` + `transform.rs`: spawn,
-pidfile, start-time liveness, graceful SIGTERM teardown). `hako serve` reuses
-that lifecycle — it is net-new only as a **socket + request loop**, not as
-"invent persistent processes."
+hako was a one-shot CLI with no listener anywhere; for a peer to receive a
+remote op, a process must be *listening on the node*. That component now
+exists: **`hako serve`** (`hako-cli/src/cmd/serve/`) — bind + safety gate,
+per-connection Noise handshake, then per-request dispatch of the control and
+data planes described below. It is currently a serial accept loop; making it
+concurrent (and the fork-safety work that forces) is scoped as P0-3 in
+[push-to-deploy.md](push-to-deploy.md).
 
 ## Architecture: `/peers/<node>/…` is the same op, run *there*
 
@@ -74,10 +78,11 @@ network — this is the most underestimated piece, git's hardest problem):
 
 ## Identity & trust
 
-- **Ed25519 identity per node** (hako lacks this today; mesh has it). A peer is
-  `{ name, address, pubkey }`, in a static `peers.toml` first (discovery evolves
-  static → mDNS → DHT; do not build the DHT first).
-- **Mutual auth** via a Noise handshake (both ends verify pubkeys).
+- **Ed25519 identity per node** (built: `hako id`, seed at `.hako/identity`).
+  A peer is `{ name, address, pubkey }`, in a static `peers.toml` (discovery
+  evolves static → mDNS → DHT; do not build the DHT first).
+- **Mutual auth + encryption** via a Noise IK handshake (built — see "Current
+  posture" below).
 - **Per-peer capability** — read-only telemetry vs. `ctl`-control vs. data-sync.
   A `ctl`-capable peer can run code on you; this is a real trust grant and needs
   a real (not sketched) capability + revocation model.
@@ -96,21 +101,22 @@ Concurrency split: a **node serving** requests is fine blocking; an
 **orchestrator fanning out** to N nodes wants async/threads — so the orchestrator
 is a separate binary that can afford a heavier stack without bloating the agent.
 
-**Current posture (Noise not yet wired).** The shipped channel does the framed
-TCP + the mutual Ed25519 handshake, but **not** the `snow` session yet — so the
-channel is *authenticated* (you know which registered peer you're talking to) but
-**not encrypted or per-message-authenticated**. On a network where an attacker can
-inject into the TCP session that is exploitable (e.g. a forged `ctl` write). Until
-the Noise layer lands, `hako serve` therefore **defaults to loopback** and refuses
-a routable bind unless you pass `--allow-remote` (intended for a trusted LAN/VPN,
-and it warns). Treat `--allow-remote` over the open internet as unsafe.
+**Current posture (Noise wired).** The shipped channel is a full **Noise IK**
+session (`Noise_IK_25519_ChaChaPoly_BLAKE2s` via `snow`, `serve/channel.rs`),
+with the Noise static keys derived from each node's Ed25519 identity — every
+message after the mutual handshake is encrypted and authenticated. `hako serve`
+still **defaults to loopback** and refuses a routable bind without
+`--allow-remote`: no longer about plaintext exposure, but because making a node
+reachable off-host should be a deliberate choice (trusted LAN/VPN), not a
+surprise default.
 
-Two further interim gates shrink the per-peer blast radius until Noise lands:
+Two further gates shrink the per-peer blast radius until real per-peer
+capabilities land (P2-1 in [push-to-deploy.md](push-to-deploy.md)):
 peer-triggered command execution (`ctl "run …"`) is refused unless the node is
 started with `--allow-remote-run` (off by default), and remote ref updates
-(`sync_ref`) are **fast-forward-only**, so a registered peer cannot force-rewrite
-a branch's history. Replication and the version-control `ctl` verbs
-(commit/branch/tag) stay available without the flag.
+(`sync_ref`) are **fast-forward-only**, so a registered peer cannot
+force-rewrite a branch's history. Replication and the version-control `ctl`
+verbs (commit/branch/tag) stay available without the flag.
 
 ## Known wrinkles (found while reviewing the code)
 
@@ -128,19 +134,20 @@ a branch's history. Replication and the version-control `ctl` verbs
 
 ## Phasing (corrected critical path)
 
-0. **`ctl` lifecycle (local, no network).** `ctl "run"` (spawn) + per-process
+0. ✅ **`ctl` lifecycle (local, no network).** `ctl "run"` (spawn) + per-process
    `proc/<pid>/ctl` signal. Reuses `run_container_detached` + the runtime's
-   guarded stop. Fully testable on the existing harness. *This branch.*
-1. **Identity + static peers.** Ed25519 keypair; `peers.toml`; bootstrapping UX.
-2. **The node daemon (`hako serve`) + wire protocol.** Control RPC + batched data
-   sync. The real lift.
-3. **Wire `/peers/` (client).** `RouteTarget::Peers` resolves against the daemon.
-4. **Orchestrator.** Thin scheduler over the `/peers/` file interface; separate
-   binary; async.
-
-Phases 0–1 are local and land on the current tests. 2–3 want a two-node
-integration test (two WSL distros, like the proc test used `unshare`). 4 is the
-cloud.
+   guarded stop.
+1. ✅ **Identity + static peers.** Ed25519 keypair (`hako id`); `peers.toml`
+   (`hako peer add|list|remove`).
+2. ✅ **The node daemon (`hako serve`) + wire protocol.** Control RPC + batched
+   data sync (`peer push`/`peer fetch`) over Noise.
+3. ✅ **Wire `/peers/` (client).** `RouteTarget::Peers` resolves against the
+   daemon (`cat`/`write` on `/peers/<node>/containers/<name>/{status,ctl}`).
+4. **Orchestrator — superseded.** [push-to-deploy.md](push-to-deploy.md)
+   deliberately rejects a scheduler: placement stays explicit, and an
+   "orchestrator" is a thin client that pushes to N remotes and reads N
+   statuses. Remaining work (networking, supervision, deploy hook,
+   capabilities, gc-on-prod) is phased there.
 
 ## Open questions
 
