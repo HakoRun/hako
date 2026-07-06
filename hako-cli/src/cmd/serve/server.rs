@@ -118,6 +118,10 @@ fn handle_peer(
             TAG_SYNC_HAVE => sync_have(ctx, payload),
             TAG_SYNC_PUT => sync_put(ctx, payload),
             TAG_SYNC_REF => sync_ref(ctx, payload),
+            // Fetch (pull): reads only. The objects served are reachable from a
+            // ref, which `gc` preserves, so no session lock is needed.
+            TAG_SYNC_WANT => sync_want(ctx, payload),
+            TAG_SYNC_GET => sync_get(ctx, payload),
             _ => Err(invalid("unknown request")),
         };
         // Terminal request of a push cycle: the ref is now durable and its object
@@ -247,6 +251,48 @@ fn sync_have(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
     Ok(missing)
 }
 
+/// Fetch, step 1: resolve `container:branch`'s tip and reply `[tip: 32]` followed
+/// by every object hash reachable from it (the client then requests the subset it
+/// lacks via SyncGet).
+fn sync_want(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
+    let (container, rest) = take_lenprefixed_str(payload)?;
+    let (branch, _rest) = take_lenprefixed_str(rest)?;
+    if !ctx.state.list_containers()?.iter().any(|c| c == container) {
+        return Err(invalid("no such container on this node"));
+    }
+    let repo = ctx.state.open_container(container)?;
+    let tip = repo
+        .read_ref(branch)?
+        .ok_or_else(|| invalid("no such branch on this node"))?;
+    let reachable = repo.reachable_objects(tip)?;
+    let mut out = Vec::with_capacity(HASH_LEN * (1 + reachable.len()));
+    out.extend_from_slice(&tip.0);
+    for h in &reachable {
+        out.extend_from_slice(&h.0);
+    }
+    Ok(out)
+}
+
+/// Fetch, step 2: return the requested objects as `[obj_len: u32][obj]...`, in the
+/// order asked, for the longest prefix that fits under `PUT_BATCH_LIMIT` (the
+/// client re-requests the rest). A single object is always included even if it
+/// alone exceeds the cap. A requested object that isn't present is an error.
+fn sync_get(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
+    let store = ctx.state.store();
+    let mut out = Vec::new();
+    for h in decode_hashes(payload)? {
+        let obj = store
+            .get(&h)?
+            .ok_or_else(|| invalid("requested object is not present on this node"))?;
+        if !out.is_empty() && out.len() + 4 + obj.len() > PUT_BATCH_LIMIT {
+            break;
+        }
+        out.extend_from_slice(&(obj.len() as u32).to_be_bytes());
+        out.extend_from_slice(&obj);
+    }
+    Ok(out)
+}
+
 /// Data plane: store a batch of objects (`[obj_len: u32][obj]...`).
 fn sync_put(ctx: &Ctx<'_>, mut payload: &[u8]) -> io::Result<Vec<u8>> {
     let store = ctx.state.store();
@@ -329,7 +375,7 @@ mod tests {
     use super::*;
     // The two-node integration tests drive the client verbs against this server.
     use super::super::client::connect_and_handshake;
-    use crate::cmd::serve::{remote_push, remote_write};
+    use crate::cmd::serve::{remote_fetch, remote_push, remote_write};
 
     #[test]
     fn loopback_bind_needs_no_optin() {
@@ -608,6 +654,58 @@ mod tests {
                 .read_file(&t, "hello.txt")
                 .unwrap(),
             b"from client"
+        );
+    }
+
+    #[test]
+    fn two_node_fetch_pulls_a_branch() {
+        use hako::{Config, ScopedFs, Session};
+
+        let (a_dir, a_state, a_id) = setup_node(); // server (has the branch)
+        let (b_dir, b_state, b_id) = setup_node(); // client (fetches)
+
+        // The server builds a container with a commit for the client to pull.
+        let repo = a_state.create_container("app").unwrap();
+        let base = repo.working_tree().unwrap();
+        let tree = ScopedFs::new(repo.store())
+            .write_file(&base, "hello.txt", b"from server")
+            .unwrap();
+        let commit = repo.commit(tree, vec![], "a", "add hello", 1).unwrap();
+        repo.write_ref("main", commit).unwrap();
+        drop(repo);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let (a_sess, a_cfg) = (Session::default(), Config::default());
+        let a_ctx = ctx(&a_state, &a_sess, &a_cfg, "app", a_dir.path());
+        let (b_sess, b_cfg) = (Session::default(), Config::default());
+        let b_ctx = ctx(&b_state, &b_sess, &b_cfg, "app", b_dir.path());
+
+        peers::add(&a_ctx, "client".into(), "unused".into(), b_id.node_id()).unwrap();
+        peers::add(&b_ctx, "server".into(), addr, a_id.node_id()).unwrap();
+
+        std::thread::scope(|s| {
+            let server = s.spawn(|| {
+                // A fetch is two requests (WANT + GET), so one accept serves the
+                // whole connection until the client disconnects.
+                let (stream, _) = listener.accept().unwrap();
+                handle_peer(stream, &a_id, &a_ctx, false)
+            });
+            let rc = remote_fetch(&b_ctx, "server", "main");
+            assert!(rc.is_ok(), "fetch failed: {rc:?}");
+            server.join().unwrap().expect("server handled the peer");
+        });
+
+        // The client now has the pulled container, ref, and objects.
+        let b_repo = b_state.open_container("app").expect("client created 'app'");
+        assert_eq!(b_repo.read_ref("main").unwrap(), Some(commit));
+        let t = b_repo.load_commit(&commit).unwrap().tree;
+        assert_eq!(
+            ScopedFs::new(b_repo.store())
+                .read_file(&t, "hello.txt")
+                .unwrap(),
+            b"from server"
         );
     }
 

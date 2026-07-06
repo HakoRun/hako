@@ -270,6 +270,7 @@ fn run() -> io::Result<ExitCode> {
             PeerCmd::Remove { name } => cmd::peers::remove(&ctx, name),
             PeerCmd::Ping { name } => cmd::serve::ping(&ctx, &name),
             PeerCmd::Push { node, branch } => cmd::serve::remote_push(&ctx, &node, &branch),
+            PeerCmd::Fetch { node, branch } => cmd::serve::remote_fetch(&ctx, &node, &branch),
         },
         #[cfg(feature = "cluster")]
         Cmd::Serve {

@@ -124,6 +124,106 @@ pub fn remote_push(ctx: &Ctx<'_>, node: &str, branch: &str) -> io::Result<ExitCo
     Ok(ExitCode::SUCCESS)
 }
 
+/// `hako peer fetch <node> <branch>` — the pull half of push: ask a peer for the
+/// branch tip + its reachable object hashes, download the objects we lack (in
+/// bounded, verified batches), then fast-forward the local ref. FF-only — refuses
+/// if the peer's tip doesn't descend from the local one.
+pub fn remote_fetch(ctx: &Ctx<'_>, node: &str, branch: &str) -> io::Result<ExitCode> {
+    let peer = peers::lookup(ctx, node)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no peer named {node}")))?;
+    let container = ctx.default_container;
+    if !ctx.state.list_containers()?.iter().any(|c| c == container) {
+        ctx.state.create_container(container)?;
+    }
+    let repo = ctx.state.open_container(container)?;
+    let local_tip = repo.read_ref(branch)?;
+    let mut ch = connect_and_handshake(ctx, &peer)?;
+
+    // Step 1: WANT the tip and its reachable object hashes.
+    let mut want = vec![TAG_SYNC_WANT];
+    want.extend_from_slice(&(container.len() as u32).to_be_bytes());
+    want.extend_from_slice(container.as_bytes());
+    want.extend_from_slice(&(branch.len() as u32).to_be_bytes());
+    want.extend_from_slice(branch.as_bytes());
+    ch.send(&want)?;
+    let reply = read_ok_payload(&mut ch, node)?;
+    let tip = Hash(first_array::<HASH_LEN>(&reply, "malformed want reply")?);
+    let reachable = decode_hashes(&reply[HASH_LEN..])?;
+
+    if local_tip == Some(tip) {
+        println!(
+            "{node}: already up to date ({container}:{branch} at {})",
+            &tip.to_hex()[..12]
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Step 2: GET the objects we lack, in bounded batches, verifying each against
+    // the hash we asked for (`put` re-hashes, so integrity is checked; the order
+    // check catches a peer that returns the wrong object for a slot).
+    let store = ctx.state.store();
+    let mut missing: Vec<Hash> = Vec::new();
+    for h in reachable {
+        if !store.has(&h)? {
+            missing.push(h);
+        }
+    }
+    // Hashes per request, bounded so the request frame stays under MAX_FRAME.
+    const GET_REQUEST_MAX: usize = 8192;
+    let mut fetched = 0usize;
+    let mut idx = 0;
+    while idx < missing.len() {
+        let end = (idx + GET_REQUEST_MAX).min(missing.len());
+        let mut req = vec![TAG_SYNC_GET];
+        for h in &missing[idx..end] {
+            req.extend_from_slice(&h.0);
+        }
+        ch.send(&req)?;
+        let objs = read_ok_payload(&mut ch, node)?;
+        let mut p = &objs[..];
+        let mut got = 0;
+        while !p.is_empty() {
+            let len = u32::from_be_bytes(first_array::<4>(p, "malformed get reply")?) as usize;
+            p = &p[4..];
+            if p.len() < len {
+                return Err(invalid("malformed get reply"));
+            }
+            let (obj, rest) = p.split_at(len);
+            if store.put(obj)? != missing[idx + got] {
+                return Err(invalid("fetched object does not match the requested hash"));
+            }
+            got += 1;
+            p = rest;
+        }
+        if got == 0 {
+            return Err(invalid("peer returned no objects for a non-empty request"));
+        }
+        idx += got;
+        fetched += got;
+    }
+
+    // The tip's full closure is now local — fast-forward-only, mirroring `sync_ref`.
+    if let Some(local) = local_tip {
+        if repo.common_ancestor(local, tip)? != Some(local) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing non-fast-forward fetch of {container}:{branch} \
+                     (local tip {} is not an ancestor of {})",
+                    &local.to_hex()[..12],
+                    &tip.to_hex()[..12]
+                ),
+            ));
+        }
+    }
+    repo.write_ref(branch, tip)?;
+    println!(
+        "fetched {fetched} objects from {node}; {container}:{branch} -> {}",
+        &tip.to_hex()[..12]
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Read a response message; return its payload on success, an error otherwise.
 fn read_ok_payload<S: Read + Write>(ch: &mut NoiseChannel<S>, node: &str) -> io::Result<Vec<u8>> {
     let resp = ch.recv()?;
