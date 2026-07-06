@@ -60,6 +60,12 @@ pub(crate) enum PeerCmd {
         #[arg(default_value = "main")]
         branch: String,
     },
+    /// Fetch a container branch from a peer (pull it over the network)
+    Fetch {
+        node: String,
+        #[arg(default_value = "main")]
+        branch: String,
+    },
 }
 
 #[derive(Subcommand)]

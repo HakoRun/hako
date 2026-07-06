@@ -3,3 +3,14 @@
 # embed via `--features embedded`.
 [alias]
 xtask = "run --package xtask --release --quiet --"
+
+# The CLI runs directly on the OS main thread (see `hako-cli/src/main.rs`).
+# On Windows that thread defaults to a 1 MiB stack — small enough that a
+# debug build's clap parser plus command dispatch can overflow it, which
+# surfaces as every `tests/cli.rs` case dying at `hako init` with
+# STATUS_STACK_OVERFLOW (0xC00000FD). Reserve 16 MiB to match Linux's 8 MiB
+# default with headroom. Scoped to MSVC (the only Windows target we ship),
+# so Unix is untouched — in particular this adds no extra thread, keeping the
+# single-threaded `unshare(CLONE_NEWUSER)` path in the container runtime valid.
+[target.'cfg(target_env = "msvc")']
+rustflags = ["-C", "link-arg=/STACK:16777216"]

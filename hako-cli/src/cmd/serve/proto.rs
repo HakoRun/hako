@@ -19,6 +19,14 @@ pub(crate) const TAG_META_WRITE: u8 = 2;
 pub(crate) const TAG_SYNC_HAVE: u8 = 3;
 pub(crate) const TAG_SYNC_PUT: u8 = 4;
 pub(crate) const TAG_SYNC_REF: u8 = 5;
+/// Pull (fetch). `SyncWant` payload is
+/// `[container_len: u32][container][branch_len: u32][branch]`; the reply is
+/// `[tip commit: 32]` followed by the tip's reachable object hashes (32 bytes
+/// each). `SyncGet` payload is a list of 32-byte hashes; the reply is
+/// `[obj_len: u32][obj]...` for the longest requested prefix that fits under a
+/// batch cap — the client stores those (in order) and re-requests the rest.
+pub(crate) const TAG_SYNC_WANT: u8 = 6;
+pub(crate) const TAG_SYNC_GET: u8 = 7;
 /// Response status (first byte of a response frame).
 pub(crate) const RESP_OK: u8 = 0;
 pub(crate) const RESP_ERR: u8 = 1;

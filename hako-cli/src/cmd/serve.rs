@@ -20,5 +20,5 @@ mod client;
 mod proto;
 mod server;
 
-pub use client::{ping, remote_cat, remote_push, remote_write};
+pub use client::{ping, remote_cat, remote_fetch, remote_push, remote_write};
 pub use server::serve;
