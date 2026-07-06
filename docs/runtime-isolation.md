@@ -24,9 +24,10 @@ namespaces, with:
   bind-mounted at `/workspace` honoring `rw`/`ro`/`none`. Host
   `/etc/resolv.conf` + `/etc/hosts` are bind-mounted **only** when the
   container has network (`apply`); an isolated `run` gets neither.
-- **Network** — isolated by default for `run` (opt in when a workload needs
-  egress); `apply` keeps host networking so setup steps can install
-  dependencies.
+- **Network** — fully isolated for `run` (a `run` workload has no
+  connectivity at all today; opt-in networking is unbuilt — P0-1 in
+  [push-to-deploy.md](push-to-deploy.md)); `apply` keeps host networking so
+  setup steps can install dependencies.
 - **`/sys`** — for `run` (which owns its netns), a **fresh read-only sysfs**
   (`ro,nosuid,nodev,noexec`): no host cgroup/kernel internals exposed, and it
   reflects the container's own empty network. Where the kernel refuses a fresh

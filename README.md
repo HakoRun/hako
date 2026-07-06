@@ -148,8 +148,8 @@ which is reserved: it declares this node's push-to-deploy target (see
 > writes are ephemeral) — similar in posture to rootless Podman. The workload
 > runs under a minimal **PID-1 init** that reaps orphaned processes and forwards
 > `SIGTERM`/`SIGINT`, so `hako stop` shuts it down cleanly; `hako exec` enters
-> all of the container's namespaces. Network is **isolated by default for `run`**
-> (opt in when a workload needs egress); `apply` keeps host networking so setup
+> all of the container's namespaces. Network is **fully isolated for `run`**
+> (opt-in connectivity is on the roadmap); `apply` keeps host networking so setup
 > steps can install dependencies. The workload runs under a **seccomp filter** that
 > blocks dangerous syscalls (module loading, kexec/reboot, mount, kernel keyring,
 > bpf, …), `/sys` is a fresh read-only sysfs, and — where a delegated cgroup v2
