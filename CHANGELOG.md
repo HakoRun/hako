@@ -16,21 +16,44 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches a release.
 - **Node daemon + remote meta-fs (`--features cluster`):** `hako serve` runs a
   node daemon that authenticates peers with a **mutual** Ed25519 handshake (each
   end proves it holds the key the other registered; the server serves only
-  registered peers), then handles requests. Over that authenticated channel you
-  **orchestrate a node by reading and writing its files**:
+  registered peers), then handles requests. Over that channel you **orchestrate
+  a node by reading and writing its files**:
   `cat /peers/<node>/containers/<name>/status` reads a remote container's status,
   and `write /peers/<node>/containers/<name>/ctl "run …"` dispatches a control
   verb (run/commit/branch/tag) to it — its output (e.g. the new instance id) and
   errors come back over the wire. `hako peer ping <name>` checks reachability +
-  identity. `serve` defaults to **loopback**; binding a routable address requires
-  `--allow-remote` (the channel is authenticated but not yet encrypted, so a
-  remote bind must be a deliberate, trusted-network choice).
+  identity. Trust is fail-closed: `serve` defaults to **loopback** (binding a
+  routable address requires `--allow-remote`, intended for a trusted LAN/VPN),
+  remote ref updates are **fast-forward-only**, and the `ctl "run …"` verb —
+  which grants a peer command execution on this node — is refused unless the
+  daemon was started with `--allow-remote-run`.
+- **Encrypted cluster transport:** the peer channel is now a full **Noise IK**
+  session (X25519 / ChaChaPoly / BLAKE2s, via `snow`), with the Noise static
+  keys derived from each node's existing Ed25519 identity. Every message after
+  the handshake is encrypted and authenticated — previously the channel proved
+  peer identity but carried requests in plaintext.
 - **Container replication over the cluster (`--features cluster`):** `hako peer
   push <node> [branch]` replicates a container branch to a peer over the
-  authenticated channel — a content-addressed have/want sync that sends only the
+  encrypted channel — a content-addressed have/want sync that sends only the
   objects the peer is missing (a second push transfers nothing), then points the
   peer's ref at the commit (creating the container there if needed). With remote
   `ctl`, this closes the loop: ship a container to a node, then dispatch `run`.
+  `hako peer fetch <node> [branch]` is the pull half: recovery from a refused
+  (non-fast-forward) push becomes `fetch → merge → push`, git-style.
+- **`hako revert <refspec>`:** roll back by committing an older tree on top of
+  the current tip — the only rollback the fast-forward-only push protocol
+  permits, and history records it. `refspec` is a branch, tag, or commit-hash
+  prefix.
+- **`[deploy]` table in `hako.toml` (parsed; reserved):** declares this node's
+  push-to-deploy target — the container/branch it deploys and the run shape
+  (command, network, ports, volumes, grace period) — per
+  `docs/push-to-deploy.md`. Parsed and validated today; the deploy hook that
+  consumes it lands separately. `[deploy]` is a reserved table name, no longer
+  selectable as an `apply` profile.
+- **hako-core feature gates:** the OCI registry client (`oci`) and the FUSE
+  driver (`fuse`) are now default-on cargo features of the `hako` library.
+  `--no-default-features` leaves the pure version-controlled-filesystem core
+  with no network/TLS/FUSE dependency surface; CI builds each slice.
 - **Container meta-fs:** from the host (`hako`) context, each container is
   addressable as a tree under `/containers/<name>/` — `root/` for its
   filesystem, plus meta nodes: `status` (read a snapshot of branch/HEAD/dirty),
@@ -55,6 +78,32 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches a release.
   `"main"`, matching the seeded default container. This only changes behavior for
   a workspace with no `SESSION` file that had a container explicitly named `main`
   (it would now default to `hako`).
+
+### Fixed
+- `fetch`/`push` between two paths that resolve to the same workspace are
+  refused, and the two workspaces are locked in a fixed global order —
+  previously a self-sync could self-deadlock on the workspace lock.
+- The serve daemon holds the workspace lock across a whole push session, so a
+  concurrent `gc` can no longer collect objects while a peer is mid-push.
+- Three-way merge raises a `FileDirectory` conflict when one side turns a file
+  into a directory (or vice versa) instead of silently merging.
+- FUSE serves file reads by window instead of reloading the whole file per read
+  (large-file reads no longer re-materialize the file each syscall), plus
+  rename/mtime correctness fixes.
+- Host bridge: the `run-host` binary path is forwarded via env (not re-parsed
+  from argv), and non-UTF-8 paths produce an error instead of being mangled.
+- Chunk-store self-heal no longer races a concurrent writer, and ref/object
+  writes fsync for durability.
+
+### Security
+- `hako exec` re-checks that a container's recorded init pid hasn't been
+  recycled before `setns`, so a stale instance record can't enter an unrelated
+  process's namespaces; the exec path also gained seccomp parity with `run`
+  plus proper `/proc` and `/sys` mounts.
+- OCI ingestion hardening: a recursion cap and a whiteout path guard on layer
+  extraction, plus ref/error handling hardening on the wire.
+- The bundle extraction cache verifies the cache directory is private and owned
+  by the current user before trusting its contents (defeats local pre-seeding).
 
 ## [0.1.1] — 2026-06-10
 

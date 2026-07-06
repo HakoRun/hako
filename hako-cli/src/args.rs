@@ -242,8 +242,9 @@ pub(crate) enum Cmd {
         #[arg(long, default_value = "127.0.0.1:7777")]
         addr: String,
         /// Allow binding a routable (non-loopback) address. The cluster channel
-        /// is authenticated but not yet encrypted, so a remote bind must be a
-        /// deliberate choice — use only on a trusted LAN/VPN.
+        /// is encrypted and peer-authenticated (Noise IK), but making this node
+        /// reachable off-host must be a deliberate choice — use only on a
+        /// trusted LAN/VPN.
         #[arg(long)]
         allow_remote: bool,
         /// Allow peers to trigger command execution on this node via
@@ -437,8 +438,8 @@ pub(crate) enum Cmd {
     /// container's branch. Re-running is fast — already-applied steps are
     /// skipped via a hash recorded in `.hako/applied`.
     Apply {
-        /// Overlay this profile from `[profiles.<name>]` in hako.toml on
-        /// top of the base config. Errors if no such profile exists.
+        /// Overlay this profile (a top-level `[<name>]` table in hako.toml)
+        /// on top of the base config. Errors if no such profile exists.
         #[arg(short = 'p', long)]
         profile: Option<String>,
         /// Print what would happen without pulling, executing, or committing.

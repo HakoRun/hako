@@ -34,6 +34,5 @@ pub struct Ctx<'a> {
     pub session: &'a Session,
     pub default_container: &'a str,
     pub workdir: &'a Path,
-    #[allow(dead_code)]
     pub cfg: &'a Config,
 }

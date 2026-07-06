@@ -38,7 +38,10 @@ hako run alpine sh               # run it for real (Linux / WSL2 / Lima)
   command, workspace mode, env, and named profiles; `hako apply` materializes
   it, each setup step becoming a commit.
 - **Distributed** — `fetch` and `push` copy branches between workspaces,
-  transferring only the chunks the remote is missing.
+  transferring only the chunks the remote is missing. With the opt-in cluster
+  build, `hako serve` turns a node into a network peer: replicate containers
+  with `peer push`/`peer fetch` and control remote containers by reading and
+  writing their files, over a Noise-encrypted, mutually-authenticated channel.
 
 ## Install / build
 
@@ -77,14 +80,20 @@ binary, see [BUILD.md](BUILD.md).
 | **Workspace** | `init` |
 | **Files** | `write`, `cat`, `mkdir`, `del`, `cp`, `mv`, `import`, `export` |
 | **Navigation** | `ls`, `pwd`, `cd`, `tree`, `status`, `mount` (FUSE browse) |
-| **Version control** | `commit`, `log`, `branch`, `checkout`, `merge`, `diff`, `tag` |
-| **Containers** | `containers`, `new-container`, `del-container`, `is` |
+| **Version control** | `commit`, `log`, `branch`, `checkout`, `merge`, `revert`, `diff`, `tag` |
+| **Containers** | `containers`, `new-container`, `del-container`, `is`, `as` |
 | **OCI** | `pull` |
 | **Runtime** (Linux / bridged) | `run`, `run-host`, `exec`, `ps`, `logs`, `stop`, `reap` |
 | **Packaging** | `bundle` (container → single self-contained executable) |
 | **Sync** | `fetch`, `push` |
+| **Cluster** (`--features cluster`) | `id`, `peer add\|list\|remove\|ping\|push\|fetch`, `serve` |
 | **Config** | `apply` (reads `hako.toml`) |
 | **Maintenance** | `gc`, `fsck`, `bootstrap` |
+
+Any *unknown* subcommand runs inside the current container's runtime:
+`hako python app.py` is `hako run <current> python app.py` (with the workspace
+mounted at `/workspace`). `hako as <container> <cmd>…` does the same in another
+container without switching to it.
 
 `run-host <path>` runs a Linux executable straight from the host filesystem
 through hako's sandbox (add `--display` for a GUI app); `bundle <container>`
@@ -129,14 +138,18 @@ autocommit = false
 each not-yet-applied setup step, recording a commit per step. Re-running is fast:
 already-applied steps are skipped via a hash recorded in `.hako/applied`.
 
+Any other top-level table (`[prod]`, `[ci]`, …) is a profile — except `[deploy]`,
+which is reserved: it declares this node's push-to-deploy target (see
+[docs/push-to-deploy.md](docs/push-to-deploy.md)) and is never a profile.
+
 > **Isolation.** `hako run` runs the container rootless in user, mount, PID,
 > IPC, UTS, and network namespaces, with a fresh procfs, a private `/tmp`, no
 > host `$HOME`, private mount propagation, and a `pivot_root` rootfs (writable;
 > writes are ephemeral) — similar in posture to rootless Podman. The workload
 > runs under a minimal **PID-1 init** that reaps orphaned processes and forwards
 > `SIGTERM`/`SIGINT`, so `hako stop` shuts it down cleanly; `hako exec` enters
-> all of the container's namespaces. Network is **isolated by default for `run`**
-> (opt in when a workload needs egress); `apply` keeps host networking so setup
+> all of the container's namespaces. Network is **fully isolated for `run`**
+> (opt-in connectivity is on the roadmap); `apply` keeps host networking so setup
 > steps can install dependencies. The workload runs under a **seccomp filter** that
 > blocks dangerous syscalls (module loading, kexec/reboot, mount, kernel keyring,
 > bpf, …), `/sys` is a fresh read-only sysfs, and — where a delegated cgroup v2
@@ -144,6 +157,29 @@ already-applied steps are skipped via a hash recorded in `.hako/applied`.
 > like rootless Podman). It is not yet a hardened multi-tenant sandbox, so prefer
 > trusted images for now. (`hako run` requires a Linux runtime; on Windows/macOS
 > it is bridged into WSL2 / Lima.)
+
+## Cluster (experimental)
+
+Built with `--features cluster`, hako nodes can talk to each other over the
+network. Each node has a stable Ed25519 identity (`hako id`); peers are
+registered explicitly by name, address, and public key; and all traffic runs
+over a Noise-encrypted, mutually-authenticated channel:
+
+```sh
+hako serve                        # on the node: run the daemon (loopback by default)
+hako peer add prod 10.0.0.5:7777 <pubkey>
+hako peer ping prod               # reachability + identity check
+hako peer push prod main          # replicate a branch (only missing chunks travel)
+hako peer fetch prod main         # ...and the pull half
+hako cat /peers/prod/containers/app/status    # read a remote container's status
+hako write /peers/prod/containers/app/ctl "commit -m nightly"   # remote control verb
+```
+
+Trust is deliberately conservative: `serve` binds loopback unless you pass
+`--allow-remote` (intended for a trusted LAN/VPN), remote ref updates are
+fast-forward-only, and peer-triggered command execution requires
+`--allow-remote-run`. Design notes: [docs/distributed.md](docs/distributed.md)
+and [docs/push-to-deploy.md](docs/push-to-deploy.md).
 
 ## Architecture
 
@@ -196,10 +232,17 @@ cargo test --workspace          # run the test suite
 cargo fmt --all                 # format
 cargo fmt --all -- --check      # verify formatting (CI gate)
 cargo clippy --workspace --all-targets -- -D warnings   # lint (CI gate)
+
+# The opt-in cluster surface isn't in the default build — lint/test it too:
+cargo clippy -p hako-cli --all-targets --features cluster -- -D warnings
+cargo test -p hako-cli --features cluster
 ```
 
-CI runs formatting, clippy, and tests on every push — see
-[.github/workflows/ci.yml](.github/workflows/ci.yml).
+CI runs formatting, clippy (including the cluster feature), a hako-core
+feature matrix, tests on Linux + Windows, `cargo-deny`, and a real-runtime
+isolation check on x86_64 + arm64 — see
+[.github/workflows/ci.yml](.github/workflows/ci.yml) and
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
