@@ -161,8 +161,17 @@ pub(crate) fn dispatch_ctl(
             } else {
                 Some(arg.split_whitespace().map(str::to_string).collect())
             };
-            let id = hako_runtime::transform::run_container_detached(&repo, &branch, command, &[])
-                .map_err(super::runtime::runtime_to_io)?;
+            // `ctl "run"` stays network-isolated until the deploy hook lets the
+            // receiving node's `[deploy]` config declare the workload's
+            // networking (P1-1) — a peer must not choose host networking.
+            let id = hako_runtime::transform::run_container_detached(
+                &repo,
+                &branch,
+                command,
+                &[],
+                hako_runtime::Network::Isolated,
+            )
+            .map_err(super::runtime::runtime_to_io)?;
             writeln!(out, "{}", id)?;
             Ok(ExitCode::SUCCESS)
         }

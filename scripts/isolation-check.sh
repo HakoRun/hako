@@ -71,6 +71,18 @@ rm -f "$htmp"
 routelines="$(run 'cat /proc/net/route 2>/dev/null | wc -l')"
 check "network is isolated by default (no host routes)" '[ -n "$routelines" ] && [ "$routelines" -le 1 ]' "$routelines"
 
+# 4b. `run --network host` opts out of the network namespace: the container
+#     shares the host network, so its /proc/net/route shows the host's routes.
+#     Guard on the host actually having routes (it always does in CI) so an
+#     odd runner can't turn this into a false failure.
+hostroutes="$(cat /proc/net/route 2>/dev/null | wc -l)"
+if [ -n "$hostroutes" ] && [ "$hostroutes" -gt 1 ]; then
+  netlines="$("$HAKO" run ${HAKO_RUN_FLAGS:-} --network host "$BRANCH" /bin/sh -c 'cat /proc/net/route 2>/dev/null | wc -l' 2>/dev/null)"
+  check "--network host shares the host network (routes visible)" '[ -n "$netlines" ] && [ "$netlines" -gt 1 ]' "$netlines"
+else
+  printf '  \033[33mSKIP\033[0m  %s\n' "--network host check (host has no routes to observe)"
+fi
+
 # 5. Seccomp — a blocked syscall must fail. `mount` is on the denylist, so a
 #    tmpfs mount (which a userns-root workload could otherwise do) returns EPERM.
 #    With the filter active the applet prints "Operation not permitted".

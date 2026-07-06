@@ -85,6 +85,34 @@ impl VolumeMount {
     }
 }
 
+/// Networking mode for a `run` workload (`hako run --network`).
+///
+/// `Isolated` (the default) unshares an empty network namespace: the workload
+/// has no connectivity and cannot accept a connection. `Host` skips the
+/// network unshare so the workload shares the host's network — it can listen
+/// on and connect from host ports like an ordinary process (weaker isolation;
+/// P0-1 of docs/push-to-deploy.md). Rootless port publishing (`-p` via
+/// pasta/slirp4netns) is a separate, later mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Network {
+    #[default]
+    Isolated,
+    Host,
+}
+
+impl Network {
+    /// Parse the `--network` flag / `network` config value.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "none" => Ok(Network::Isolated),
+            "host" => Ok(Network::Host),
+            other => Err(format!(
+                "unknown network mode '{other}' (expected 'none' or 'host')"
+            )),
+        }
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 pub mod transform {
     //! Stub implementation for non-Linux platforms.
@@ -101,6 +129,7 @@ pub mod transform {
         _repo: &Repo<'_>,
         _branch: &str,
         _volumes: &[crate::VolumeMount],
+        _network: crate::Network,
     ) -> Result<i32, RuntimeError> {
         Err(RuntimeError::UnsupportedPlatform {
             operation: "hako run",
@@ -114,6 +143,7 @@ pub mod transform {
         _branch: &str,
         _command: Vec<String>,
         _volumes: &[crate::VolumeMount],
+        _network: crate::Network,
     ) -> Result<i32, RuntimeError> {
         Err(RuntimeError::UnsupportedPlatform {
             operation: "hako run",
@@ -140,6 +170,7 @@ pub mod transform {
         _branch: &str,
         _command: Option<Vec<String>>,
         _volumes: &[crate::VolumeMount],
+        _network: crate::Network,
     ) -> Result<String, RuntimeError> {
         Err(RuntimeError::UnsupportedPlatform {
             operation: "hako run -d",
@@ -262,5 +293,25 @@ mod volume_tests {
     #[test]
     fn parse_rejects_unknown_mode() {
         assert!(VolumeMount::parse("/h:/c:weird").is_err());
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    #[test]
+    fn parse_modes() {
+        assert_eq!(Network::parse("none").unwrap(), Network::Isolated);
+        assert_eq!(Network::parse("host").unwrap(), Network::Host);
+        assert_eq!(Network::default(), Network::Isolated);
+    }
+
+    #[test]
+    fn parse_rejects_unknown() {
+        // `bridge`/`slirp` are future modes, not silent aliases of anything.
+        assert!(Network::parse("bridge").is_err());
+        assert!(Network::parse("slirp").is_err());
+        assert!(Network::parse("").is_err());
     }
 }

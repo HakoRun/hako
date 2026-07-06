@@ -24,10 +24,14 @@ namespaces, with:
   bind-mounted at `/workspace` honoring `rw`/`ro`/`none`. Host
   `/etc/resolv.conf` + `/etc/hosts` are bind-mounted **only** when the
   container has network (`apply`); an isolated `run` gets neither.
-- **Network** — fully isolated for `run` (a `run` workload has no
-  connectivity at all today; opt-in networking is unbuilt — P0-1 in
-  [push-to-deploy.md](push-to-deploy.md)); `apply` keeps host networking so
-  setup steps can install dependencies.
+- **Network** — isolated by default for `run` (an empty network namespace: no
+  connectivity, nothing can connect in). `run --network host` opts out of the
+  network namespace only — the workload shares the host network and can
+  listen/connect like a host process, with every other isolation layer
+  unchanged (and the host's `resolv.conf`/`hosts` bound in so DNS works).
+  Rootless port publishing (`-p` via pasta/slirp4netns) is the remaining
+  P0-1 work in [push-to-deploy.md](push-to-deploy.md). `apply` keeps host
+  networking so setup steps can install dependencies.
 - **`/sys`** — for `run` (which owns its netns), a **fresh read-only sysfs**
   (`ro,nosuid,nodev,noexec`): no host cgroup/kernel internals exposed, and it
   reflects the container's own empty network. Where the kernel refuses a fresh
@@ -91,8 +95,9 @@ HAKO=target/debug/hako bash scripts/isolation-check.sh
   knob for the seccomp/limits (currently env-var controlled).
 - Ephemeral `run` writes create orphan store objects until `gc`; consider a
   scratch overlay or a dedicated ephemeral chunk area.
-- Opt-in outbound networking for `run` (`pasta`/`slirp4netns`) — scoped as
-  P0-1 in [push-to-deploy.md](push-to-deploy.md).
+- Rootless port publishing for `run` (`-p` via `pasta`/`slirp4netns`) — the
+  remaining half of P0-1 in [push-to-deploy.md](push-to-deploy.md)
+  (`--network none|host` is done).
 
 ---
 

@@ -50,21 +50,24 @@
 //!           fork() ──── parent: waitpid(container_init); return its status
 //!                   └── container_init  (PID 1 of the new PID namespace):
 //!                         setup_bind_mounts / special_mounts (fresh procfs)
-//!                         unshare(CLONE_NEWNET)   (isolated `run`)
+//!                         unshare(CLONE_NEWNET)   (default `run`; skipped for
+//!                                                  `--network host`)
 //!                         pivot_root(".", ".") into the FUSE rootfs
 //!                         execvp(shell or command)
 //! ```
 //!
 //! Isolation for `run`: user + mount + IPC + UTS + PID + network namespaces,
 //! a fresh procfs, private mount propagation, no host `$HOME`, and a private
-//! tmpfs `/tmp`. `apply` keeps host networking (no NEWNET) so setup steps can
-//! install dependencies.
+//! tmpfs `/tmp`. `run --network host` opts out of only the network namespace
+//! (`Network::Host` → no NEWNET, host `/etc/resolv.conf`+`hosts` bound in);
+//! `apply` keeps host networking the same way so setup steps can install
+//! dependencies.
 //!
 //! When the command exits, the FUSE server's `waitpid` returns and it drops the
 //! session, which unmounts the FUSE mount.
 
 use crate::instances;
-use crate::{RuntimeError, VolumeMount};
+use crate::{Network, RuntimeError, VolumeMount};
 use hako::{ChunkStore, FsStore, Hash, Repo};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sched::{setns, unshare, CloneFlags};
@@ -107,6 +110,7 @@ pub fn become_container(
     repo: &Repo<'_>,
     branch: &str,
     volumes: &[VolumeMount],
+    network: Network,
 ) -> Result<i32, RuntimeError> {
     let (store, root) = resolve_branch(repo, branch)?;
     run_outer(
@@ -116,7 +120,7 @@ pub fn become_container(
         false,
         None,
         volumes.to_vec(),
-        true,
+        network == Network::Isolated,
         false,
     )
     .map(|(code, _)| code)
@@ -129,6 +133,7 @@ pub fn run_container(
     branch: &str,
     command: Vec<String>,
     volumes: &[VolumeMount],
+    network: Network,
 ) -> Result<i32, RuntimeError> {
     if command.is_empty() {
         return Err(RuntimeError::Other("command is empty".into()));
@@ -141,7 +146,7 @@ pub fn run_container(
         false,
         None,
         volumes.to_vec(),
-        true,
+        network == Network::Isolated,
         false,
     )
     .map(|(code, _)| code)
@@ -198,6 +203,7 @@ pub fn run_container_detached(
     branch: &str,
     command: Option<Vec<String>>,
     volumes: &[VolumeMount],
+    network: Network,
 ) -> Result<String, RuntimeError> {
     let (store, root) = resolve_branch(repo, branch)?;
     // Instance state lives at the WORKSPACE level (`<ws>/.hako/runtime`), the
@@ -257,7 +263,7 @@ pub fn run_container_detached(
                 true,
                 Some((workdir.clone(), id.clone())),
                 volumes_owned,
-                true,
+                network == Network::Isolated,
                 None,
             ) {
                 Ok(code) => code,
