@@ -21,7 +21,7 @@
 //! uses `containers/` for workspaces, so we call runtime processes
 //! "instances" to avoid collision.
 
-use crate::RuntimeError;
+use crate::{RestartPolicy, RuntimeError, VolumeMount};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,6 +31,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const RUNTIME_DIR: &str = "runtime";
 
 /// Configuration of a spawned instance, written once at spawn time.
+///
+/// Every field added after the original `{container, branch, command,
+/// started_unix}` set is `#[serde(default)]`, so an instance directory written
+/// by an older hako still decodes (the new fields take their defaults). This
+/// keeps a single on-disk schema across the P0-2 supervision work — a running
+/// box's existing instances survive an in-place binary upgrade.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceConfig {
     /// The workspace container this instance belongs to. Distinct from `branch`
@@ -43,6 +49,62 @@ pub struct InstanceConfig {
     pub branch: String,
     pub command: Vec<String>,
     pub started_unix: u64,
+
+    /// The tree root (hex) resolved from `branch` at spawn time. A supervised
+    /// restart re-launches THIS root, never a re-resolution of `branch`, so a
+    /// `revert` after spawn can't silently boot a different tree; it also lets
+    /// `ps` show "branch at X, running Y". `None` for pre-field instance dirs.
+    #[serde(default)]
+    pub pinned_root: Option<String>,
+    /// Restart policy for the supervising process (default `No` = run once).
+    #[serde(default)]
+    pub restart: RestartPolicy,
+    /// Reserved for the boot-reconcile follow-up: if set, `hako serve` re-launches
+    /// this instance (at `pinned_root`) on startup. Persisted now so that lands
+    /// without another schema change; no flag sets it yet.
+    #[serde(default)]
+    pub start_on_boot: bool,
+    /// Network mode token (`none`/`host`) — recorded so a reconcile rebuilds it.
+    #[serde(default)]
+    pub network: String,
+    /// Published ports (`host:container`) — reserved for P0-1 slice 2.
+    #[serde(default)]
+    pub ports: Vec<String>,
+    /// The resolved volume set, so a boot reconcile can re-launch the exact run
+    /// shape (including the implicit `/workspace` mount and its masks). A live
+    /// crash-restart doesn't read this — the supervisor keeps the volumes in
+    /// memory — but the reconcile in a fresh process does.
+    #[serde(default)]
+    pub volumes: Vec<VolumeMount>,
+}
+
+/// The full spawn shape recorded for a detached instance. Bundles the fields
+/// that vary per spawn so `create_unique`/`create` stay single-argument-list
+/// callable and the config is written atomically in one shot.
+#[derive(Debug, Clone, Default)]
+pub struct SpawnSpec {
+    pub container: String,
+    pub branch: String,
+    pub command: Vec<String>,
+    pub pinned_root: Option<String>,
+    pub restart: RestartPolicy,
+    pub start_on_boot: bool,
+    pub network: String,
+    pub ports: Vec<String>,
+    pub volumes: Vec<VolumeMount>,
+}
+
+impl SpawnSpec {
+    /// A minimal spec (no supervision, no pinned root) — the shape the original
+    /// `create(container, branch, command)` callers and tests want.
+    pub fn minimal(container: &str, branch: &str, command: &[String]) -> Self {
+        SpawnSpec {
+            container: container.to_string(),
+            branch: branch.to_string(),
+            command: command.to_vec(),
+            ..Default::default()
+        }
+    }
 }
 
 /// Snapshot of an instance's state at the moment of inspection.
@@ -56,6 +118,9 @@ pub struct Instance {
     /// has a different start time is not ours.
     pub start_time: Option<u64>,
     pub exit_code: Option<i32>,
+    /// How many times the supervisor has respawned the workload (0 unless the
+    /// instance runs under a restart policy).
+    pub restart_count: u64,
 }
 
 impl Instance {
@@ -157,9 +222,15 @@ pub fn create_unique(
     branch: &str,
     command: &[String],
 ) -> Result<String, RuntimeError> {
+    create_unique_full(workdir, &SpawnSpec::minimal(container, branch, command))
+}
+
+/// [`create_unique`] with the full spawn shape (pinned root, restart policy,
+/// network/volumes) recorded in the config. Used by the detached runtime spawn.
+pub fn create_unique_full(workdir: &Path, spec: &SpawnSpec) -> Result<String, RuntimeError> {
     for _ in 0..16 {
         let id = generate_id();
-        match create(workdir, &id, container, branch, command) {
+        match create_full(workdir, &id, spec) {
             Ok(_) => return Ok(id),
             Err(RuntimeError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -179,6 +250,12 @@ pub fn create(
     branch: &str,
     command: &[String],
 ) -> Result<PathBuf, RuntimeError> {
+    create_full(workdir, id, &SpawnSpec::minimal(container, branch, command))
+}
+
+/// [`create`] with the full spawn shape. Writes the complete `InstanceConfig`
+/// atomically in one shot (no partial-config window).
+pub fn create_full(workdir: &Path, id: &str, spec: &SpawnSpec) -> Result<PathBuf, RuntimeError> {
     let dir = instance_dir(workdir, id);
     // create_dir (not create_dir_all on `dir`) so an id collision is a hard error
     // rather than a silent merge that overwrites another instance's config/pid
@@ -186,19 +263,42 @@ pub fn create(
     fs::create_dir_all(runtime_dir(workdir))?;
     fs::create_dir(&dir)?;
     let config = InstanceConfig {
-        container: container.to_string(),
-        branch: branch.to_string(),
-        command: command.to_vec(),
+        container: spec.container.clone(),
+        branch: spec.branch.clone(),
+        command: spec.command.clone(),
         started_unix: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
+        pinned_root: spec.pinned_root.clone(),
+        restart: spec.restart,
+        start_on_boot: spec.start_on_boot,
+        network: spec.network.clone(),
+        ports: spec.ports.clone(),
+        volumes: spec.volumes.clone(),
     };
     let cfg_path = dir.join("config.json");
     let cfg_bytes = serde_json::to_vec_pretty(&config)
         .map_err(|e| RuntimeError::Other(format!("serialize config: {}", e)))?;
     write_atomic(&cfg_path, &cfg_bytes)?;
     Ok(dir)
+}
+
+/// Record the running restart count for a supervised instance (written by the
+/// supervisor after each respawn). Surfaced by `ps`. Best-effort — a missing or
+/// unparseable file reads as zero.
+pub fn write_restart_count(workdir: &Path, id: &str, n: u64) -> Result<(), RuntimeError> {
+    let dir = instance_dir(workdir, id);
+    require_instance_dir(&dir)?;
+    write_atomic(&dir.join("restarts"), n.to_string().as_bytes())
+}
+
+/// Read the recorded restart count (0 if never written).
+pub fn read_restart_count(workdir: &Path, id: &str) -> u64 {
+    fs::read_to_string(instance_dir(workdir, id).join("restarts"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 /// Record the supervising process id alongside its start time. The start
@@ -302,12 +402,14 @@ pub fn get(workdir: &Path, id: &str) -> Result<Instance, RuntimeError> {
         None => (None, None),
     };
     let exit_code = read_exit_code(workdir, id);
+    let restart_count = read_restart_count(workdir, id);
     Ok(Instance {
         id: id.into(),
         config,
         pid,
         start_time,
         exit_code,
+        restart_count,
     })
 }
 
@@ -362,6 +464,46 @@ pub fn remove(workdir: &Path, id: &str, force: bool) -> Result<(), RuntimeError>
 pub fn stop(workdir: &Path, id: &str, force: bool) -> Result<(), RuntimeError> {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
+
+    // A supervised instance (restart policy != no) MUST be stopped via its
+    // supervisor: signalling the container's PID-1 directly would just make the
+    // supervisor respawn it. A missing/legacy config decodes to `restart = No`,
+    // preserving the historical path.
+    let supervised = read_config(workdir, id)
+        .map(|c| c.restart.is_supervised())
+        .unwrap_or(false);
+
+    if supervised {
+        let (spid, sstart) = read_pid_with_starttime(workdir, id)
+            .ok_or_else(|| RuntimeError::Other(format!("instance {} has no supervisor pid", id)))?;
+        if !process_matches(spid, sstart) {
+            return Err(RuntimeError::Other(format!(
+                "instance {} supervisor pid {} no longer matches (exited or recycled)",
+                id, spid
+            )));
+        }
+        if force {
+            // SIGKILL the supervisor FIRST so it can't respawn, then SIGKILL the
+            // container's PID namespace via its PID-1 — killing only the
+            // supervisor would orphan a still-running workload.
+            let _ = kill(Pid::from_raw(spid as i32), Signal::SIGKILL);
+            if let Some((npid, nstart)) = read_nspid_with_starttime(workdir, id) {
+                if process_matches(npid, nstart) {
+                    let _ = kill(Pid::from_raw(npid as i32), Signal::SIGKILL);
+                }
+            }
+        } else {
+            // SIGTERM the supervisor: its handler records "do not respawn" and
+            // forwards SIGTERM to the current PID-1 so the workload drains, then
+            // the supervisor exits.
+            kill(Pid::from_raw(spid as i32), Signal::SIGTERM)
+                .map_err(|e| RuntimeError::Other(format!("kill supervisor {}: {}", spid, e)))?;
+        }
+        return Ok(());
+    }
+
+    // Unsupervised (restart = no) — unchanged: signal the container's PID-1
+    // (nspid), whose init forwards to the workload; fall back to the supervisor.
     let (pid, recorded_start) = read_nspid_with_starttime(workdir, id)
         .or_else(|| read_pid_with_starttime(workdir, id))
         .ok_or_else(|| RuntimeError::Other(format!("instance {} has no pid", id)))?;
@@ -595,6 +737,62 @@ mod tests {
     }
 
     #[test]
+    fn legacy_config_without_supervision_fields_decodes() {
+        // An instance dir written before P0-2 has only the original four keys.
+        // It must still decode, with the new fields taking their defaults — the
+        // single-schema, in-place-upgrade guarantee.
+        let wd = workdir();
+        let id = "old";
+        let dir = instance_dir(wd.path(), id);
+        fs::create_dir_all(&dir).unwrap();
+        let legacy = br#"{"container":"app","branch":"main","command":["sh"],"started_unix":123}"#;
+        fs::write(dir.join("config.json"), legacy).unwrap();
+        let inst = get(wd.path(), id).unwrap();
+        assert_eq!(inst.config.branch, "main");
+        assert_eq!(inst.config.pinned_root, None);
+        assert_eq!(inst.config.restart, RestartPolicy::No);
+        assert!(!inst.config.start_on_boot);
+        assert!(inst.config.volumes.is_empty());
+        assert_eq!(inst.restart_count, 0);
+    }
+
+    #[test]
+    fn full_spawn_spec_roundtrips() {
+        let wd = workdir();
+        let spec = SpawnSpec {
+            container: "app".into(),
+            branch: "main".into(),
+            command: vec!["server".into()],
+            pinned_root: Some("deadbeef".into()),
+            restart: RestartPolicy::OnFailure,
+            start_on_boot: true,
+            network: "host".into(),
+            ports: vec!["8080:80".into()],
+            volumes: vec![VolumeMount::parse("/srv:/data").unwrap()],
+        };
+        let id = create_unique_full(wd.path(), &spec).unwrap();
+        let cfg = read_config(wd.path(), &id).unwrap();
+        assert_eq!(cfg.pinned_root.as_deref(), Some("deadbeef"));
+        assert_eq!(cfg.restart, RestartPolicy::OnFailure);
+        assert!(cfg.start_on_boot);
+        assert_eq!(cfg.network, "host");
+        assert_eq!(cfg.ports, vec!["8080:80".to_string()]);
+        assert_eq!(cfg.volumes.len(), 1);
+        assert_eq!(cfg.volumes[0].container, "/data");
+    }
+
+    #[test]
+    fn restart_count_persists() {
+        let wd = workdir();
+        let id = "rc";
+        create(wd.path(), id, "c", "main", &[]).unwrap();
+        assert_eq!(read_restart_count(wd.path(), id), 0);
+        write_restart_count(wd.path(), id, 3).unwrap();
+        assert_eq!(read_restart_count(wd.path(), id), 3);
+        assert_eq!(get(wd.path(), id).unwrap().restart_count, 3);
+    }
+
+    #[test]
     fn legacy_pid_format_still_decodes() {
         // Older instance dirs may have just "pid\n" without the start_time.
         // Make sure we can still read those.
@@ -619,6 +817,12 @@ mod tests {
                 branch: "branch".into(),
                 command: vec![],
                 started_unix: ts,
+                pinned_root: None,
+                restart: RestartPolicy::No,
+                start_on_boot: false,
+                network: String::new(),
+                ports: vec![],
+                volumes: vec![],
             };
             let bytes = serde_json::to_vec(&cfg).unwrap();
             write_atomic(&instance_dir(wd.path(), id).join("config.json"), &bytes).unwrap();

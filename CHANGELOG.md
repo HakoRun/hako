@@ -7,6 +7,20 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches a release.
 ## [Unreleased]
 
 ### Added
+- **`hako run -d --restart no|on-failure|always`:** a detached workload can now
+  be supervised — the background process re-launches it on exit per policy
+  (`on-failure` = non-zero exits only, `always` = any exit), with bounded
+  exponential backoff (1s→60s, reset after a run stays up ≥60s). This is
+  push-to-deploy P0-2: "deploy = push" needs "stays running." A restart always
+  re-launches the **tree root pinned at spawn**, never a re-resolution of the
+  branch, so a `revert` (or any ref move) after spawn can't slip a different
+  tree under a crash-restart. `hako stop` reaches the supervisor (SIGTERM →
+  drain the workload → no respawn; `--force` SIGKILLs both). `ps`/`ps --json`
+  show the policy, the respawn count, and the pinned root. Unsupervised
+  (`restart = no`, the default) is unchanged. The instance config gained
+  serde-defaulted fields (pinned root, policy, network, volumes, a reserved
+  `start_on_boot`), so a running box's existing instances survive an in-place
+  upgrade and a later boot-reconcile lands without another schema change.
 - **`hako run --network none|host`:** a `run` workload can now opt into the
   host's network (`--network host`) so it can accept and make connections —
   the first slice of workload networking (push-to-deploy P0-1). `none`

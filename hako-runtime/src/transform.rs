@@ -67,7 +67,7 @@
 //! session, which unmounts the FUSE mount.
 
 use crate::instances;
-use crate::{Network, RuntimeError, VolumeMount};
+use crate::{Network, RestartPolicy, RuntimeError, VolumeMount};
 use hako::{ChunkStore, FsStore, Hash, Repo};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sched::{setns, unshare, CloneFlags};
@@ -197,13 +197,21 @@ pub fn run_container_rw(
 /// detached. Returns the instance id immediately; the supervising process
 /// runs in the background.
 ///
-/// State (pid, logs, exit code) is recorded under `<workdir>/runtime/<id>/`.
+/// `restart` picks the supervision model. With `RestartPolicy::No` (the
+/// default) the supervisor runs the container exactly once — unchanged from
+/// before. With a restart policy set, the supervisor loops: it re-launches the
+/// **tree root resolved here, once** (`root`) — never re-resolving `branch` — so
+/// a `revert` after spawn can't slip a different tree under a crash-restart.
+///
+/// State (pid, logs, exit code, restart count) is recorded under
+/// `<workdir>/runtime/<id>/`.
 pub fn run_container_detached(
     repo: &Repo<'_>,
     branch: &str,
     command: Option<Vec<String>>,
     volumes: &[VolumeMount],
     network: Network,
+    restart: RestartPolicy,
 ) -> Result<String, RuntimeError> {
     let (store, root) = resolve_branch(repo, branch)?;
     // Instance state lives at the WORKSPACE level (`<ws>/.hako/runtime`), the
@@ -217,10 +225,24 @@ pub fn run_container_detached(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    // A fresh, collision-checked id: create_unique retries generation if a dir
-    // already exists, so a clash can't silently merge into another instance (#78).
-    let id = instances::create_unique(&workdir, container, branch, &cmd_for_record)?;
+    // Record the full spawn shape (pinned root, restart policy, network,
+    // volumes) so `ps` can show the pinned root and a boot reconcile can rebuild
+    // the run. A fresh, collision-checked id: create_unique_full retries
+    // generation if a dir exists, so a clash can't silently merge (#78).
+    let spec = instances::SpawnSpec {
+        container: container.to_string(),
+        branch: branch.to_string(),
+        command: cmd_for_record,
+        pinned_root: Some(root.to_hex()),
+        restart,
+        start_on_boot: false,
+        network: network.as_str().to_string(),
+        ports: Vec::new(),
+        volumes: volumes.to_vec(),
+    };
+    let id = instances::create_unique_full(&workdir, &spec)?;
     let volumes_owned = volumes.to_vec();
+    let net_isolated = network == Network::Isolated;
 
     // Outer fork: parent returns immediately; child supervises. If the fork
     // itself fails, clean up the partially-created instance directory so a
@@ -236,7 +258,8 @@ pub fn run_container_detached(
         ForkResult::Parent { .. } => Ok(id),
         ForkResult::Child => {
             // Record our pid before we fork again (the supervising process is
-            // the one that holds the FUSE server and waits on the user shell).
+            // the one that holds the FUSE server and waits on the user shell,
+            // or — when supervised — the loop that owns the attempts).
             let pid = std::process::id();
             // Best-effort — if we can't write the pid, we still try to run.
             let _ = instances::write_pid(&workdir, &id, pid);
@@ -256,20 +279,39 @@ pub fn run_container_detached(
             // here shouldn't abort the spawn. (Issue #17.)
             let _ = setsid();
 
-            let exit_code = match run_inner(
-                store,
-                root,
-                command,
-                true,
-                Some((workdir.clone(), id.clone())),
-                volumes_owned,
-                network == Network::Isolated,
-                None,
-            ) {
-                Ok(code) => code,
-                Err(e) => {
-                    eprintln!("hako runtime: detached spawn failed: {}", e);
-                    1
+            let exit_code = if restart.is_supervised() {
+                // Supervised: loop, forking a fresh attempt each time (each
+                // run_inner needs its own user namespace). This process stays in
+                // the host namespaces and owns the restart policy.
+                supervise(
+                    &workdir,
+                    &id,
+                    store,
+                    root,
+                    command,
+                    volumes_owned,
+                    net_isolated,
+                    restart,
+                )
+            } else {
+                // Unsupervised (restart = no): unchanged single-shot path — this
+                // process itself enters the namespaces and becomes the FUSE
+                // supervisor directly (no extra fork level).
+                match run_inner(
+                    store,
+                    root,
+                    command,
+                    true,
+                    Some((workdir.clone(), id.clone())),
+                    volumes_owned,
+                    net_isolated,
+                    None,
+                ) {
+                    Ok(code) => code,
+                    Err(e) => {
+                        eprintln!("hako runtime: detached spawn failed: {}", e);
+                        1
+                    }
                 }
             };
             let _ = instances::write_exit_code(&workdir, &id, exit_code);
@@ -919,6 +961,181 @@ fn apply_seccomp() -> Result<(), RuntimeError> {
     Ok(())
 }
 
+// ============================================================================
+// Supervisor (restart policy)
+// ============================================================================
+
+/// Set by the supervisor's SIGTERM/SIGINT handler; read by the supervise loop to
+/// mean "stop, do not respawn." Only touched by the supervisor process.
+static SUPERVISOR_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Async-signal-safe: just record that a stop was requested. All action (forward
+/// to the container PID-1, break the loop) happens in the loop's normal context,
+/// which polls this flag — so there is no blocking-syscall/signal race.
+extern "C" fn supervisor_stop_handler(_sig: libc::c_int) {
+    SUPERVISOR_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn supervisor_stop_requested() -> bool {
+    SUPERVISOR_STOP.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn set_supervisor_signal_disposition(handler: nix::sys::signal::SigHandler) {
+    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigSet, Signal};
+    let action = SigAction::new(handler, SaFlags::empty(), SigSet::empty());
+    // Safe: supervisor_stop_handler only touches an atomic; SIG_DFL is trivially safe.
+    unsafe {
+        let _ = sigaction(Signal::SIGTERM, &action);
+        let _ = sigaction(Signal::SIGINT, &action);
+    }
+}
+
+/// Supervisor for a restart-enabled detached instance. Runs in the detached
+/// supervisor process (host namespaces); each iteration forks a fresh attempt so
+/// every `run_inner` gets its own user namespace, waits for it, and applies the
+/// restart policy with bounded exponential backoff. Returns the last attempt's
+/// exit code.
+///
+/// `hako stop` reaches THIS process (see `instances::stop`), because signalling
+/// the container's PID-1 directly would just make us respawn it. A SIGTERM sets
+/// `SUPERVISOR_STOP`; the loop then forwards SIGTERM to the current PID-1 so the
+/// workload drains, and exits without respawning.
+#[allow(clippy::too_many_arguments)]
+fn supervise(
+    workdir: &Path,
+    id: &str,
+    store: Arc<dyn ChunkStore + Send + Sync + 'static>,
+    root: Hash,
+    command: Option<Vec<String>>,
+    volumes: Vec<VolumeMount>,
+    net_isolated: bool,
+    policy: RestartPolicy,
+) -> i32 {
+    use std::time::{Duration, Instant};
+    set_supervisor_signal_disposition(nix::sys::signal::SigHandler::Handler(
+        supervisor_stop_handler,
+    ));
+
+    // A run that stays up at least this long is "healthy" — reset backoff so a
+    // long-lived service that finally crashes restarts promptly, while a crash
+    // loop is throttled up to the cap.
+    let min_healthy = Duration::from_secs(60);
+    let max_backoff = Duration::from_secs(60);
+    let mut backoff = Duration::from_secs(1);
+    let mut restarts: u64 = 0;
+    // Assigned by every loop iteration (the parent arm) before any break reads it.
+    let mut last_code;
+
+    loop {
+        let started = Instant::now();
+        match unsafe { fork() } {
+            Err(e) => {
+                eprintln!("hako runtime: supervisor fork failed: {}", e);
+                return 1;
+            }
+            Ok(ForkResult::Child) => {
+                // Don't carry the supervisor's stop handler into the container
+                // process tree; the attempt runs exactly like an unsupervised one.
+                set_supervisor_signal_disposition(nix::sys::signal::SigHandler::SigDfl);
+                let code = run_inner(
+                    store,
+                    root,
+                    command.clone(),
+                    true,
+                    Some((workdir.to_path_buf(), id.to_string())),
+                    volumes.clone(),
+                    net_isolated,
+                    None,
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("hako runtime: {}", e);
+                    1
+                });
+                std::process::exit(code);
+            }
+            Ok(ForkResult::Parent { child }) => {
+                last_code = wait_attempt(child, workdir, id);
+            }
+        }
+
+        if supervisor_stop_requested() || !policy.wants_restart(last_code) {
+            break;
+        }
+        if started.elapsed() >= min_healthy {
+            backoff = Duration::from_secs(1);
+        }
+        // Interruptible so `stop` during backoff exits promptly.
+        if !sleep_interruptible(backoff) {
+            break;
+        }
+        backoff = (backoff * 2).min(max_backoff);
+        restarts += 1;
+        let _ = instances::write_restart_count(workdir, id, restarts);
+    }
+    last_code
+}
+
+/// Wait for one attempt to exit, polling with `WNOHANG` (race-free vs. the stop
+/// signal: no blocking `waitpid` to lose a signal against). On the first poll
+/// after a stop is requested, forward SIGTERM to the container's PID-1 so its
+/// init drains the workload; then keep polling until the attempt actually exits.
+fn wait_attempt(child: Pid, workdir: &Path, id: &str) -> i32 {
+    use nix::sys::wait::WaitPidFlag;
+    use std::time::Duration;
+    let mut forwarded = false;
+    loop {
+        match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => {
+                // Keep trying to forward until we actually reach a live PID-1:
+                // a stop that arrives in the window before the attempt records
+                // its nspid must not be dropped (the workload would then never
+                // get SIGTERM and this poll would block forever).
+                if supervisor_stop_requested() && !forwarded {
+                    forwarded = forward_term_to_pid1(workdir, id);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(status) => return wait_to_exit_code(status),
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(e) => {
+                eprintln!("hako runtime: supervisor waitpid: {}", e);
+                return 1;
+            }
+        }
+    }
+}
+
+/// Forward SIGTERM to the current attempt's container PID-1 (nspid), whose init
+/// forwards it to the workload for a graceful drain. Returns whether it reached a
+/// live PID-1 — `false` if the attempt hasn't recorded its PID-1 yet (still
+/// starting), so the caller retries on the next poll rather than dropping the stop.
+fn forward_term_to_pid1(workdir: &Path, id: &str) -> bool {
+    use nix::sys::signal::{kill, Signal};
+    if let Some((npid, nstart)) = instances::read_nspid_with_starttime(workdir, id) {
+        if instances::process_matches(npid, nstart) {
+            return kill(Pid::from_raw(npid as i32), Signal::SIGTERM).is_ok();
+        }
+    }
+    false
+}
+
+/// Sleep up to `total`, checking the stop flag every 100 ms. Returns `true` if it
+/// slept the whole duration, `false` if a stop was requested (so the caller
+/// breaks instead of respawning).
+fn sleep_interruptible(total: std::time::Duration) -> bool {
+    use std::time::Duration;
+    let slice = Duration::from_millis(100);
+    let mut slept = Duration::ZERO;
+    while slept < total {
+        if supervisor_stop_requested() {
+            return false;
+        }
+        std::thread::sleep(slice.min(total - slept));
+        slept += slice;
+    }
+    !supervisor_stop_requested()
+}
+
 /// The container workload's pid (in the container's PID namespace), for the
 /// signal-forwarding handler below. Set once by `reap_as_init` before installing
 /// the handler; only read from the handler. `0` means "not set".
@@ -994,8 +1211,14 @@ fn detach_stdio() {
 fn redirect_output(workdir: &Path, id: &str) -> Result<(), RuntimeError> {
     use std::os::unix::io::AsRawFd;
     let (stdout_path, stderr_path) = instances::log_paths(workdir, id);
-    let stdout_file = fs::File::create(&stdout_path)?;
-    let stderr_file = fs::File::create(&stderr_path)?;
+    // Append, not truncate: a supervised instance re-enters here on every
+    // restart, and truncating would discard the prior attempts' logs. For a
+    // fresh (unsupervised) instance the files don't exist yet, so append and
+    // create-truncate are equivalent on the first run.
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).append(true);
+    let stdout_file = opts.open(&stdout_path)?;
+    let stderr_file = opts.open(&stderr_path)?;
     // SAFETY: dup2 with valid fd numbers; the kernel ensures atomicity.
     unsafe {
         libc::dup2(stdout_file.as_raw_fd(), libc::STDOUT_FILENO);

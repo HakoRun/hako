@@ -30,6 +30,7 @@ mod cgroup;
 #[cfg(target_os = "linux")]
 pub mod transform;
 
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// A host-to-container bind mount declared via `-v host:container[:ro]`.
@@ -38,7 +39,11 @@ use std::path::PathBuf;
 /// containerized rootfs after the standard mounts but before `pivot_root`,
 /// honoring `readonly`. On non-Linux, the field is accepted but ignored
 /// (the stub returns `UnsupportedPlatform` anyway).
-#[derive(Clone, Debug, Default)]
+///
+/// `Serialize`/`Deserialize` so a supervised instance's volume set can be
+/// recorded in its `InstanceConfig` — the run shape a boot-time reconcile
+/// (P0-2 follow-up) needs to re-launch it exactly.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct VolumeMount {
     pub host: PathBuf,
     pub container: String,
@@ -111,6 +116,75 @@ impl Network {
             )),
         }
     }
+
+    /// The `--network` token this mode round-trips to — recorded in an
+    /// instance's config so a restart/reconcile can rebuild the same mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Network::Isolated => "none",
+            Network::Host => "host",
+        }
+    }
+}
+
+/// Restart policy for a detached instance (`hako run -d --restart …`),
+/// modelled on Docker/systemd: what the supervising process does when the
+/// workload exits.
+///
+/// - `No` (default) — the instance runs once; today's behavior, no supervisor
+///   loop, so `stop`/exit semantics are exactly as before.
+/// - `OnFailure` — respawn only on a non-zero exit (or signal death).
+/// - `Always` — respawn on any exit.
+///
+/// Restarts re-launch the **pinned tree root** resolved at spawn, never a
+/// re-resolution of the branch — so a `revert` (or any ref move) after spawn
+/// cannot silently boot a different tree under a crash-restart. `serde`
+/// kebab-case matches the CLI/`hako.toml` spelling (`on-failure`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartPolicy {
+    #[default]
+    No,
+    OnFailure,
+    Always,
+}
+
+impl RestartPolicy {
+    /// Parse the `--restart` flag / `restart` config value.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "no" => Ok(RestartPolicy::No),
+            "on-failure" => Ok(RestartPolicy::OnFailure),
+            "always" => Ok(RestartPolicy::Always),
+            other => Err(format!(
+                "unknown restart policy '{other}' (expected 'no', 'on-failure', or 'always')"
+            )),
+        }
+    }
+
+    /// The `--restart` token this policy round-trips to.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RestartPolicy::No => "no",
+            RestartPolicy::OnFailure => "on-failure",
+            RestartPolicy::Always => "always",
+        }
+    }
+
+    /// Whether the supervisor should respawn given the last attempt's exit code.
+    /// Pure so the policy table is unit-testable without spawning anything.
+    pub fn wants_restart(self, exit_code: i32) -> bool {
+        match self {
+            RestartPolicy::No => false,
+            RestartPolicy::OnFailure => exit_code != 0,
+            RestartPolicy::Always => true,
+        }
+    }
+
+    /// Whether this policy runs under the supervisor loop at all.
+    pub fn is_supervised(self) -> bool {
+        !matches!(self, RestartPolicy::No)
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -171,6 +245,7 @@ pub mod transform {
         _command: Option<Vec<String>>,
         _volumes: &[crate::VolumeMount],
         _network: crate::Network,
+        _restart: crate::RestartPolicy,
     ) -> Result<String, RuntimeError> {
         Err(RuntimeError::UnsupportedPlatform {
             operation: "hako run -d",
@@ -313,5 +388,74 @@ mod network_tests {
         assert!(Network::parse("bridge").is_err());
         assert!(Network::parse("slirp").is_err());
         assert!(Network::parse("").is_err());
+    }
+
+    #[test]
+    fn as_str_roundtrips() {
+        for m in [Network::Isolated, Network::Host] {
+            assert_eq!(Network::parse(m.as_str()).unwrap(), m);
+        }
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+
+    #[test]
+    fn parse_and_default() {
+        assert_eq!(RestartPolicy::parse("no").unwrap(), RestartPolicy::No);
+        assert_eq!(
+            RestartPolicy::parse("on-failure").unwrap(),
+            RestartPolicy::OnFailure
+        );
+        assert_eq!(
+            RestartPolicy::parse("always").unwrap(),
+            RestartPolicy::Always
+        );
+        assert_eq!(RestartPolicy::default(), RestartPolicy::No);
+        assert!(RestartPolicy::parse("unless-stopped").is_err());
+        assert!(RestartPolicy::parse("").is_err());
+    }
+
+    #[test]
+    fn as_str_roundtrips() {
+        for p in [
+            RestartPolicy::No,
+            RestartPolicy::OnFailure,
+            RestartPolicy::Always,
+        ] {
+            assert_eq!(RestartPolicy::parse(p.as_str()).unwrap(), p);
+        }
+    }
+
+    #[test]
+    fn wants_restart_table() {
+        // No: never respawns, regardless of exit code.
+        assert!(!RestartPolicy::No.wants_restart(0));
+        assert!(!RestartPolicy::No.wants_restart(1));
+        // OnFailure: only on a non-zero exit.
+        assert!(!RestartPolicy::OnFailure.wants_restart(0));
+        assert!(RestartPolicy::OnFailure.wants_restart(1));
+        assert!(RestartPolicy::OnFailure.wants_restart(137)); // SIGKILL-ish
+                                                              // Always: on any exit.
+        assert!(RestartPolicy::Always.wants_restart(0));
+        assert!(RestartPolicy::Always.wants_restart(1));
+    }
+
+    #[test]
+    fn is_supervised() {
+        assert!(!RestartPolicy::No.is_supervised());
+        assert!(RestartPolicy::OnFailure.is_supervised());
+        assert!(RestartPolicy::Always.is_supervised());
+    }
+
+    #[test]
+    fn serde_uses_kebab_case() {
+        // The on-disk InstanceConfig spelling must match the CLI/hako.toml token.
+        let json = serde_json::to_string(&RestartPolicy::OnFailure).unwrap();
+        assert_eq!(json, "\"on-failure\"");
+        let back: RestartPolicy = serde_json::from_str("\"always\"").unwrap();
+        assert_eq!(back, RestartPolicy::Always);
     }
 }

@@ -2,22 +2,23 @@
 
 use super::Ctx;
 use crate::DOT_HAKO;
-use hako_runtime::{Network, VolumeMount};
+use hako_runtime::{Network, RestartPolicy, VolumeMount};
 use std::io::{self, Write};
 use std::process::ExitCode;
 
 /// `hako run`'s flag surface, grouped (the `AppOverrides` pattern) so the
-/// handler stays under clippy's argument cap as run grows flags (P0-1: network;
-/// later: ports, restart policy).
+/// handler stays under clippy's argument cap as run grows flags (network,
+/// restart policy; later ports).
 pub struct RunOpts {
     pub detach: bool,
     pub volumes: Vec<String>,
     pub network: String,
+    pub restart: String,
     pub no_workspace: bool,
     pub display: bool,
 }
 
-/// `hako run [-d] [--network none|host] [--no-workspace] [-v ...] <branch> [cmd...]`.
+/// `hako run [-d] [--network none|host] [--restart …] [--no-workspace] [-v ...] <branch> [cmd...]`.
 ///
 /// Three modes, all dispatched here:
 ///   - foreground shell:    `hako run alpine`
@@ -29,9 +30,16 @@ pub fn run(
     opts: RunOpts,
     command: Vec<String>,
 ) -> io::Result<ExitCode> {
-    // clap's value_parser restricts the flag to none|host, so this can't fail
-    // from the CLI; the error path guards non-CLI callers.
+    // clap's value_parser restricts these, so parse can't fail from the CLI;
+    // the error paths guard non-CLI callers.
     let network = Network::parse(&opts.network).map_err(io::Error::other)?;
+    let restart = RestartPolicy::parse(&opts.restart).map_err(io::Error::other)?;
+    if restart.is_supervised() && !opts.detach {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--restart requires -d (a restart policy only applies to a detached workload)",
+        ));
+    }
     set_display_env(ctx, opts.display);
     let volumes = build_volumes(ctx, &opts.volumes, opts.no_workspace)?;
     let repo = ctx.state.open_container(ctx.default_container)?;
@@ -41,9 +49,10 @@ pub fn run(
         } else {
             Some(command)
         };
-        let id =
-            hako_runtime::transform::run_container_detached(&repo, &branch, cmd, &volumes, network)
-                .map_err(runtime_to_io)?;
+        let id = hako_runtime::transform::run_container_detached(
+            &repo, &branch, cmd, &volumes, network, restart,
+        )
+        .map_err(runtime_to_io)?;
         println!("{}", id);
         Ok(ExitCode::SUCCESS)
     } else if command.is_empty() {
@@ -459,6 +468,11 @@ pub fn ps(ctx: &Ctx<'_>, all: bool, json: bool) -> io::Result<ExitCode> {
                     "pid": i.pid,
                     "exit_code": i.exit_code,
                     "started_unix": i.config.started_unix,
+                    "restart": i.config.restart.as_str(),
+                    "restart_count": i.restart_count,
+                    // The tree pinned at spawn — distinct from the branch tip,
+                    // which may have moved (revert) since the instance started.
+                    "pinned_root": i.config.pinned_root,
                 })
             })
             .collect();
@@ -468,8 +482,24 @@ pub fn ps(ctx: &Ctx<'_>, all: bool, json: bool) -> io::Result<ExitCode> {
 
     // Human table. Size the ID/BRANCH/STATUS columns to the widest value so a
     // long id or branch can't shove the later columns out of alignment (the old
-    // fixed 14/20/10 widths broke on long names).
-    let statuses: Vec<String> = shown.iter().map(|i| i.status()).collect();
+    // fixed 14/20/10 widths broke on long names). A supervised instance shows
+    // its policy and how many times it has respawned.
+    let statuses: Vec<String> = shown
+        .iter()
+        .map(|i| {
+            let base = i.status();
+            if i.config.restart.is_supervised() {
+                format!(
+                    "{} [restart={} ×{}]",
+                    base,
+                    i.config.restart.as_str(),
+                    i.restart_count
+                )
+            } else {
+                base
+            }
+        })
+        .collect();
     let id_w = shown
         .iter()
         .map(|i| i.id.len())
