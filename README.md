@@ -95,6 +95,12 @@ Any *unknown* subcommand runs inside the current container's runtime:
 mounted at `/workspace`). `hako as <container> <cmd>…` does the same in another
 container without switching to it.
 
+`hako run -d` detaches a workload and prints its instance id; `ps`, `logs`,
+`exec`, and `stop` manage it. Add `--restart on-failure|always` to have the
+supervising process re-launch it on exit (bounded backoff) — it re-launches the
+**tree pinned at spawn**, so a later `revert` can't quietly swap the running
+tree. `--network host` gives the workload the host network (default is isolated).
+
 `run-host <path>` runs a Linux executable straight from the host filesystem
 through hako's sandbox (add `--display` for a GUI app); `bundle <container>`
 packages a container plus its command into one runnable file that needs no

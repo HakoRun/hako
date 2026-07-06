@@ -107,6 +107,14 @@ Depends on the `runtime-isolation.md` increment-3 work already scoped.
 
 ### P0-2 — Supervision & restart policy
 
+> **Mostly landed:** `hako run -d --restart no|on-failure|always` ships the
+> supervisor loop (bounded backoff), the **pinned-spawn-root** field (restart
+> re-launches the pinned tree, never a re-resolved branch — the rollback-safety
+> guarantee), stop-via-supervisor, and `ps` surfacing. Remaining: `start_on_boot`
+> reconcile on `hako serve` startup + a shipped systemd unit (the config field is
+> already persisted, so it lands without another schema change), and wiring the
+> policy from `hako.toml` (arrives with the P1-1 deploy hook).
+
 **Problem.** `run -d` records an exit code (`instances.rs`) but has **no restart
 policy and no start-on-boot**. A crashed service stays crashed until a human writes
 a ctl file. "Deploy = push" is not credible without "stays running."

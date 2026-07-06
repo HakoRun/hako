@@ -315,6 +315,13 @@ pub(crate) enum Cmd {
         /// isolation). Rootless port publishing (`-p`) is a planned follow-up.
         #[arg(long, value_parser = ["none", "host"], default_value = "none")]
         network: String,
+        /// Restart policy for a detached (`-d`) workload: `no` (default — run
+        /// once), `on-failure` (respawn on non-zero exit), or `always` (respawn
+        /// on any exit). A supervised instance re-launches the tree pinned at
+        /// spawn, so a later `revert` can't slip a different tree under it.
+        /// Only meaningful with `-d`: a non-`no` policy without `-d` is an error.
+        #[arg(long, value_parser = ["no", "on-failure", "always"], default_value = "no")]
+        restart: String,
         /// Skip the implicit workspace bind-mount at /workspace.
         #[arg(long)]
         no_workspace: bool,
@@ -325,9 +332,9 @@ pub(crate) enum Cmd {
         display: bool,
         /// Command + args to run, passed through verbatim. Most guest flags
         /// pass through, but a first token that collides with one of hako run's
-        /// own flags (`-d`, `-v`, `--network`, `--no-workspace`, `--display`)
-        /// is taken by hako — put `--` before the command to force everything
-        /// through (e.g. `hako run alpine -- top -d`).
+        /// own flags (`-d`, `-v`, `--network`, `--restart`, `--no-workspace`,
+        /// `--display`) is taken by hako — put `--` before the command to force
+        /// everything through (e.g. `hako run alpine -- top -d`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -614,12 +621,16 @@ mod tests {
 
     #[test]
     fn run_network_flag_defaults_parses_and_rejects() {
-        // Default: isolated ("none").
+        // Defaults: isolated network, no restart.
         let cli = Cli::try_parse_from(["hako", "run", "alpine"]).unwrap();
-        let Cmd::Run { network, .. } = cli.cmd else {
+        let Cmd::Run {
+            network, restart, ..
+        } = cli.cmd
+        else {
             panic!("expected Run");
         };
         assert_eq!(network, "none");
+        assert_eq!(restart, "no");
         // Explicit host mode (context flag: before the branch positional).
         let cli =
             Cli::try_parse_from(["hako", "run", "--network", "host", "alpine", "true"]).unwrap();
@@ -633,5 +644,26 @@ mod tests {
         assert_eq!(command, vec!["true"]);
         // Anything else is rejected at parse time.
         assert!(Cli::try_parse_from(["hako", "run", "--network", "bridge", "alpine"]).is_err());
+    }
+
+    #[test]
+    fn run_restart_flag_parses_and_rejects() {
+        let cli =
+            Cli::try_parse_from(["hako", "run", "-d", "--restart", "on-failure", "app"]).unwrap();
+        let Cmd::Run {
+            restart, detach, ..
+        } = cli.cmd
+        else {
+            panic!("expected Run");
+        };
+        assert_eq!(restart, "on-failure");
+        assert!(detach);
+        // `always`/`no` are the other accepted spellings.
+        assert!(Cli::try_parse_from(["hako", "run", "-d", "--restart", "always", "app"]).is_ok());
+        // Docker's `unless-stopped` is not (yet) a hako policy — reject it.
+        assert!(
+            Cli::try_parse_from(["hako", "run", "-d", "--restart", "unless-stopped", "app"])
+                .is_err()
+        );
     }
 }

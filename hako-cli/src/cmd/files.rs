@@ -161,15 +161,17 @@ pub(crate) fn dispatch_ctl(
             } else {
                 Some(arg.split_whitespace().map(str::to_string).collect())
             };
-            // `ctl "run"` stays network-isolated until the deploy hook lets the
-            // receiving node's `[deploy]` config declare the workload's
-            // networking (P1-1) — a peer must not choose host networking.
+            // `ctl "run"` stays network-isolated and unsupervised until the
+            // deploy hook lets the receiving node's `[deploy]` config declare the
+            // workload's networking and restart policy (P1-1) — a peer must not
+            // choose host networking or a self-restarting workload.
             let id = hako_runtime::transform::run_container_detached(
                 &repo,
                 &branch,
                 command,
                 &[],
                 hako_runtime::Network::Isolated,
+                hako_runtime::RestartPolicy::No,
             )
             .map_err(super::runtime::runtime_to_io)?;
             writeln!(out, "{}", id)?;
