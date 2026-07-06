@@ -77,7 +77,8 @@ check "network is isolated by default (no host routes)" '[ -n "$routelines" ] &&
 #     odd runner can't turn this into a false failure.
 hostroutes="$(cat /proc/net/route 2>/dev/null | wc -l)"
 if [ -n "$hostroutes" ] && [ "$hostroutes" -gt 1 ]; then
-  netlines="$("$HAKO" run ${HAKO_RUN_FLAGS:-} --network host "$BRANCH" /bin/sh -c 'cat /proc/net/route 2>/dev/null | wc -l' 2>/dev/null)"
+  # Reuse the run() helper (absolute /bin/sh lesson) with the flag injected.
+  netlines="$(HAKO_RUN_FLAGS="${HAKO_RUN_FLAGS:-} --network host" run 'cat /proc/net/route 2>/dev/null | wc -l')"
   check "--network host shares the host network (routes visible)" '[ -n "$netlines" ] && [ "$netlines" -gt 1 ]' "$netlines"
 else
   printf '  \033[33mSKIP\033[0m  %s\n' "--network host check (host has no routes to observe)"
