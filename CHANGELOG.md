@@ -6,6 +6,16 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches a release.
 
 ## [Unreleased]
 
+### Changed
+- **Detached workloads (`hako run -d`) are now launched by fork + exec**, not a
+  bare fork: the spawn creates the instance state, then re-execs the hako binary
+  (a hidden `__run-detached <id>`) which reconstructs the run from the instance's
+  persisted config and supervises the pinned root. Behavior is unchanged (`run
+  -d` still returns the id immediately; ps/logs/stop/restart/revert-safety all
+  hold), but the supervisor now shares no address space, locks, or fds with its
+  launcher — the prerequisite for a concurrent `serve` daemon (push-to-deploy
+  P0-3), and the same primitive a boot-time reconcile will reuse.
+
 ### Added
 - **`hako run -d --restart no|on-failure|always`:** a detached workload can now
   be supervised — the background process re-launches it on exit per policy
