@@ -67,6 +67,20 @@ pub fn run(
     }
 }
 
+/// `hako __run-detached <id>` — the internal re-exec target for a detached
+/// supervisor. Opens the instance's OWN container (from its persisted config,
+/// not the session default) and hands off to the runtime, which double-forks so
+/// the supervisor detaches and this process's caller returns at once. Not a
+/// user command (hidden in `--help`).
+pub fn run_detached_internal(ctx: &Ctx<'_>, id: String) -> io::Result<ExitCode> {
+    let runtime_root = ctx.workdir.join(DOT_HAKO);
+    let config = hako_runtime::instances::read_config(&runtime_root, &id).map_err(runtime_to_io)?;
+    let repo = ctx.state.open_container(&config.container)?;
+    hako_runtime::transform::run_detached_supervisor(&repo, &runtime_root, &id)
+        .map_err(runtime_to_io)?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Opt display passthrough on for the runtime call about to be made. The
 /// runtime reads `HAKO_DISPLAY`; setting it here (before the in-process fork
 /// in `hako_runtime::transform`) propagates it to the container. Honors the

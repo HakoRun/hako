@@ -193,15 +193,22 @@ pub fn run_container_rw(
     )
 }
 
+/// Env var that tells a re-exec'd hako binary NOT to treat itself as a
+/// self-extracting bundle (the CLI's `HAKO_BUNDLE_LAUNCHED` guard). Set on the
+/// `__run-detached` subprocess so a bundled hako re-execs the *supervisor*, not
+/// its baked payload. Kept in sync with `hako-cli`'s bundle guard by name.
+const BUNDLE_GUARD_ENV: &str = "HAKO_BUNDLE_LAUNCHED";
+
 /// Spawn `command` (or the user's shell) inside the container at `branch`,
 /// detached. Returns the instance id immediately; the supervising process
 /// runs in the background.
 ///
-/// `restart` picks the supervision model. With `RestartPolicy::No` (the
-/// default) the supervisor runs the container exactly once — unchanged from
-/// before. With a restart policy set, the supervisor loops: it re-launches the
-/// **tree root resolved here, once** (`root`) — never re-resolving `branch` — so
-/// a `revert` after spawn can't slip a different tree under a crash-restart.
+/// The supervisor is launched by **fork + exec** (re-exec `hako __run-detached
+/// <id>`), not a bare fork: the child shares no address space, locks, or fds
+/// with us, so this is safe to call from a multithreaded daemon (the P0-3
+/// `serve` requirement) as well as the single-threaded CLI. The run shape is
+/// handed over through the instance's persisted config, so the subprocess
+/// re-launches the **root pinned here** (never re-resolving `branch`).
 ///
 /// State (pid, logs, exit code, restart count) is recorded under
 /// `<workdir>/runtime/<id>/`.
@@ -213,11 +220,14 @@ pub fn run_container_detached(
     network: Network,
     restart: RestartPolicy,
 ) -> Result<String, RuntimeError> {
-    let (store, root) = resolve_branch(repo, branch)?;
+    // Resolve + pin the branch's root NOW (before the re-exec), so a concurrent
+    // ref move can't change what the supervisor launches and validation errors
+    // surface to the caller synchronously.
+    let root = resolve_root(repo, branch)?;
     // Instance state lives at the WORKSPACE level (`<ws>/.hako/runtime`), the
     // same place the CLI's ps/exec/stop look — NOT under the per-container dir.
     let workdir = hako_dir(repo)?;
-    let cmd_for_record = command.clone().unwrap_or_default();
+    let cmd_for_record = command.unwrap_or_default();
     // The container this instance belongs to is the basename of the repo's dir
     // (`<ws>/.hako/containers/<name>`) — what the `proc/` surface groups by.
     let container = repo
@@ -226,9 +236,9 @@ pub fn run_container_detached(
         .and_then(|n| n.to_str())
         .unwrap_or_default();
     // Record the full spawn shape (pinned root, restart policy, network,
-    // volumes) so `ps` can show the pinned root and a boot reconcile can rebuild
-    // the run. A fresh, collision-checked id: create_unique_full retries
-    // generation if a dir exists, so a clash can't silently merge (#78).
+    // volumes): it is BOTH what `ps` shows AND the handover to the subprocess.
+    // A fresh, collision-checked id: create_unique_full retries generation if a
+    // dir exists, so a clash can't silently merge (#78).
     let spec = instances::SpawnSpec {
         container: container.to_string(),
         branch: branch.to_string(),
@@ -241,83 +251,135 @@ pub fn run_container_detached(
         volumes: volumes.to_vec(),
     };
     let id = instances::create_unique_full(&workdir, &spec)?;
-    let volumes_owned = volumes.to_vec();
-    let net_isolated = network == Network::Isolated;
 
-    // Outer fork: parent returns immediately; child supervises. If the fork
-    // itself fails, clean up the partially-created instance directory so a
-    // failed spawn doesn't leak state visible to `hako ps -a`.
-    let fork_result = match unsafe { fork() } {
-        Ok(r) => r,
+    // The workspace root is the parent of `<ws>/.hako`; pass it as `-w` so the
+    // subprocess resolves the same workspace without cwd guesswork.
+    let ws_root = workdir.parent().ok_or_else(|| {
+        io_other(format!(
+            "cannot locate workspace root from {}",
+            workdir.display()
+        ))
+    })?;
+    let exe = std::env::current_exe()
+        .map_err(|e| io_other(format!("locate hako binary for detached spawn: {}", e)))?;
+
+    // Re-exec the detached supervisor and wait: the subprocess double-forks and
+    // its short-lived intermediate exits immediately, so this wait returns at
+    // once (the real supervisor is reparented to init). stdio → /dev/null so a
+    // `id=$(hako run -d …)` command substitution doesn't block on our pipes.
+    let spawn_result = std::process::Command::new(&exe)
+        .env(BUNDLE_GUARD_ENV, "1")
+        .arg("-w")
+        .arg(ws_root)
+        .arg("__run-detached")
+        .arg(&id)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match spawn_result.and_then(|mut child| child.wait()) {
+        Ok(_) => Ok(id),
         Err(e) => {
+            // Launch failed — don't leak a config-only instance in `ps -a`.
             let _ = instances::remove(&workdir, &id, true);
-            return Err(io_other(format!("fork: {}", e)));
-        }
-    };
-    match fork_result {
-        ForkResult::Parent { .. } => Ok(id),
-        ForkResult::Child => {
-            // Record our pid before we fork again (the supervising process is
-            // the one that holds the FUSE server and waits on the user shell,
-            // or — when supervised — the loop that owns the attempts).
-            let pid = std::process::id();
-            // Best-effort — if we can't write the pid, we still try to run.
-            let _ = instances::write_pid(&workdir, &id, pid);
-
-            // Fully detach from the parent's stdio. Otherwise the supervisor (and
-            // the command_setup/container_init it forks) keep the parent's
-            // inherited stdout/stderr open, so `id=$(hako run -d ...)` blocks
-            // until the workload exits. The workload's own stdout/stderr are
-            // captured to the instance log files by `redirect_output`.
-            detach_stdio();
-
-            // Become a session leader NOW — before run_inner's inner fork
-            // spawns the FUSE server and the command/workload subtree — so the
-            // *entire* detached tree leaves the launching shell's session. Done
-            // after detach_stdio (stdio already points at /dev/null, so losing
-            // the controlling terminal is harmless). Best-effort: a failure
-            // here shouldn't abort the spawn. (Issue #17.)
-            let _ = setsid();
-
-            let exit_code = if restart.is_supervised() {
-                // Supervised: loop, forking a fresh attempt each time (each
-                // run_inner needs its own user namespace). This process stays in
-                // the host namespaces and owns the restart policy.
-                supervise(
-                    &workdir,
-                    &id,
-                    store,
-                    root,
-                    command,
-                    volumes_owned,
-                    net_isolated,
-                    restart,
-                )
-            } else {
-                // Unsupervised (restart = no): unchanged single-shot path — this
-                // process itself enters the namespaces and becomes the FUSE
-                // supervisor directly (no extra fork level).
-                match run_inner(
-                    store,
-                    root,
-                    command,
-                    true,
-                    Some((workdir.clone(), id.clone())),
-                    volumes_owned,
-                    net_isolated,
-                    None,
-                ) {
-                    Ok(code) => code,
-                    Err(e) => {
-                        eprintln!("hako runtime: detached spawn failed: {}", e);
-                        1
-                    }
-                }
-            };
-            let _ = instances::write_exit_code(&workdir, &id, exit_code);
-            std::process::exit(exit_code);
+            Err(io_other(format!("launch detached supervisor: {}", e)))
         }
     }
+}
+
+/// The re-exec'd detached supervisor entry (`hako __run-detached <id>`). Called
+/// once by the subprocess. **Double-forks** so that (a) the launching
+/// `Command::wait` reaps a short-lived intermediate and returns immediately, and
+/// (b) the real supervisor is reparented to init — fully detached from whoever
+/// ran `hako run -d` (a shell or the `serve` daemon). Never returns in the
+/// supervisor; the intermediate exits 0.
+pub fn run_detached_supervisor(
+    repo: &Repo<'_>,
+    workdir: &Path,
+    id: &str,
+) -> Result<(), RuntimeError> {
+    match unsafe { fork() }.map_err(|e| io_other(format!("detach fork: {}", e)))? {
+        // Intermediate: exit at once so the launching Command::wait returns and
+        // the child below is reparented to init.
+        ForkResult::Parent { .. } => std::process::exit(0),
+        ForkResult::Child => {
+            // Leave the launcher's session/controlling terminal, then release
+            // its stdio (Command already pointed ours at /dev/null; this is
+            // belt-and-suspenders for a manual invocation).
+            let _ = setsid();
+            detach_stdio();
+            let code = run_detached_from_config(repo, workdir, id).unwrap_or_else(|e| {
+                eprintln!("hako runtime: detached supervisor: {}", e);
+                1
+            });
+            std::process::exit(code);
+        }
+    }
+}
+
+/// Run the supervisor body for an already-created instance, reconstructing the
+/// run shape (pinned root, command, volumes, network, restart) from its
+/// persisted config. Records this process as the supervisor pid, runs the
+/// restart loop (or a single attempt for `restart = no`), records the final
+/// exit code, and returns it. Shared by the re-exec path and (later) a
+/// boot-time reconcile.
+fn run_detached_from_config(
+    repo: &Repo<'_>,
+    workdir: &Path,
+    id: &str,
+) -> Result<i32, RuntimeError> {
+    let config = instances::read_config(workdir, id)?;
+    let root = config
+        .pinned_root
+        .as_deref()
+        .and_then(Hash::from_hex)
+        .ok_or_else(|| io_other(format!("instance {} has no pinned root to launch", id)))?;
+    let store = open_store(repo)?;
+    let command = if config.command.is_empty() {
+        None
+    } else {
+        Some(config.command.clone())
+    };
+    let volumes = config.volumes.clone();
+    let net_isolated = Network::parse(&config.network).unwrap_or_default() == Network::Isolated;
+    let restart = config.restart;
+
+    // We ARE the supervisor process — record our pid for ps/exec/stop liveness.
+    let _ = instances::write_pid(workdir, id, std::process::id());
+
+    let exit_code = if restart.is_supervised() {
+        supervise(
+            workdir,
+            id,
+            store,
+            root,
+            command,
+            volumes,
+            net_isolated,
+            restart,
+        )
+    } else {
+        // Unsupervised (restart = no): single-shot — this process enters the
+        // namespaces and becomes the FUSE supervisor directly.
+        match run_inner(
+            store,
+            root,
+            command,
+            true,
+            Some((workdir.to_path_buf(), id.to_string())),
+            volumes,
+            net_isolated,
+            None,
+        ) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("hako runtime: detached run failed: {}", e);
+                1
+            }
+        }
+    };
+    let _ = instances::write_exit_code(workdir, id, exit_code);
+    Ok(exit_code)
 }
 
 /// Run `command` inside the namespaces of an already-running instance.
@@ -471,27 +533,32 @@ fn hako_dir(repo: &Repo<'_>) -> Result<PathBuf, RuntimeError> {
         })
 }
 
+/// Resolve `branch` → commit → tree root (no store opened). Used where only the
+/// root is needed (e.g. pinning a detached spawn before re-exec).
+fn resolve_root(repo: &Repo<'_>, branch: &str) -> Result<Hash, RuntimeError> {
+    let commit_hash = repo
+        .read_ref(branch)?
+        .ok_or_else(|| RuntimeError::BranchNotFound(branch.into()))?;
+    Ok(repo.load_commit(&commit_hash)?.tree)
+}
+
 fn resolve_branch(
     repo: &Repo<'_>,
     branch: &str,
 ) -> Result<(Arc<dyn ChunkStore + Send + Sync + 'static>, Hash), RuntimeError> {
-    // Resolve branch → commit → tree.
-    let commit_hash = repo
-        .read_ref(branch)?
-        .ok_or_else(|| RuntimeError::BranchNotFound(branch.into()))?;
-    let commit = repo.load_commit(&commit_hash)?;
-    let tree_root = commit.tree;
+    // FUSE needs a `'static` store it can own across threads (see `open_store`).
+    Ok((open_store(repo)?, resolve_root(repo, branch)?))
+}
 
-    // FUSE needs a `'static` store it can own across threads, so open a fresh
-    // FsStore at the objects directory. The chunk store is SHARED at the
-    // workspace level (`<ws>/.hako/objects`), NOT under the per-container dir —
-    // `repo.root()` is `<ws>/.hako/containers/<name>`, so the `.hako` dir is two
-    // levels up. (cmd::mount uses `<workdir>/.hako/objects` for the same reason;
-    // pointing at `repo.root()/objects` yields an empty store and an empty
-    // rootfs.)
+/// Open the workspace's SHARED content store as a `'static` `FsStore` the FUSE
+/// server can own. Shared at `<ws>/.hako/objects` (two levels above the
+/// per-container `repo.root()`), not under the container dir — pointing at
+/// `repo.root()/objects` yields an empty store and an empty rootfs.
+fn open_store(
+    repo: &Repo<'_>,
+) -> Result<Arc<dyn ChunkStore + Send + Sync + 'static>, RuntimeError> {
     let objs_path = hako_dir(repo)?.join(hako::state::OBJECTS);
-    let store: Arc<dyn ChunkStore + Send + Sync + 'static> = Arc::new(FsStore::new(objs_path)?);
-    Ok((store, tree_root))
+    Ok(Arc::new(FsStore::new(objs_path)?))
 }
 
 /// Isolation setup shared by every runtime entry point: enter the user + mount +

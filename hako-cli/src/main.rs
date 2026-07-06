@@ -421,6 +421,7 @@ fn run() -> io::Result<ExitCode> {
             display,
             command,
         } => cmd::runtime::run_host(&ctx, in_container, display, command),
+        Cmd::RunDetached { id } => cmd::runtime::run_detached_internal(&ctx, id),
         Cmd::Bundle {
             container,
             output,

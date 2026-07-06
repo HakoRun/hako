@@ -144,6 +144,13 @@ a ctl file. "Deploy = push" is not credible without "stays running."
 
 ### P0-3 — Concurrent daemon
 
+> **Prerequisite landed:** the fork-**without**-exec detached spawn (the unsafe-
+> from-a-threaded-daemon part) is now fork + **exec** — `run -d` re-execs a
+> hidden `hako __run-detached <id>` that supervises the pinned root, sharing no
+> address space/locks/fds with its launcher. Remaining for this item: making the
+> `serve` accept loop itself concurrent (thread per connection + a bound) and the
+> in-process serialization of ref-mutating work.
+
 **Problem.** `serve` is a **serial accept loop** (`serve/server.rs::serve`):
 `handle_peer` runs inline until the peer disconnects, so one connected peer
 monopolizes the node and a stalled one blocks all others (up to the 30 s

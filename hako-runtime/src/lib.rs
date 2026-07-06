@@ -254,6 +254,17 @@ pub mod transform {
         })
     }
 
+    pub fn run_detached_supervisor(
+        _repo: &Repo<'_>,
+        _workdir: &Path,
+        _id: &str,
+    ) -> Result<(), RuntimeError> {
+        Err(RuntimeError::UnsupportedPlatform {
+            operation: "hako __run-detached",
+            hint: "The detached supervisor runs on the Linux runtime host.",
+        })
+    }
+
     pub fn exec_in_instance(
         _workdir: &Path,
         _id: &str,

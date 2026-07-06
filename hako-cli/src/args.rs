@@ -481,6 +481,14 @@ pub(crate) enum Cmd {
         no_autocommit: bool,
     },
 
+    /// Internal: the re-exec'd detached supervisor for instance `<id>`. Not for
+    /// direct use — `hako run -d` (and remote `ctl "run"`) launch this via
+    /// fork+exec so the supervisor shares no address space/locks/fds with the
+    /// launcher (safe from the multithreaded `serve` daemon). It reconstructs the
+    /// run from the instance's persisted config and supervises the pinned root.
+    #[command(name = "__run-detached", hide = true)]
+    RunDetached { id: String },
+
     /// Catch-all: any unknown subcommand becomes "run this command inside
     /// the current container's runtime." So `hako python script.py` (when
     /// the current container has python) is equivalent to
@@ -546,11 +554,14 @@ impl Cmd {
             | Cmd::Logs { .. }
             | Cmd::Stop { .. } => false,
             // Long-running: holding the lock would block every other CLI
-            // invocation for the lifetime of the container/mount.
+            // invocation for the lifetime of the container/mount. RunDetached is
+            // the detached supervisor itself — it lives as long as the workload,
+            // so it must never hold the workspace lock.
             Cmd::Mount { .. }
             | Cmd::Run { .. }
             | Cmd::RunHost { .. }
             | Cmd::Exec { .. }
+            | Cmd::RunDetached { .. }
             | Cmd::External(_) => false,
             // Branch / tag list mode (no name) is read-only.
             Cmd::Branch { name: None, .. } => false,
@@ -644,6 +655,19 @@ mod tests {
         assert_eq!(command, vec!["true"]);
         // Anything else is rejected at parse time.
         assert!(Cli::try_parse_from(["hako", "run", "--network", "bridge", "alpine"]).is_err());
+    }
+
+    #[test]
+    fn run_detached_internal_parses_and_never_locks() {
+        // The re-exec'd supervisor is a hidden internal command; it must parse
+        // as `__run-detached <id>` and MUST NOT hold the workspace lock (it lives
+        // as long as the workload, so holding it would deadlock the workspace).
+        let cli = Cli::try_parse_from(["hako", "__run-detached", "abc123"]).unwrap();
+        let Cmd::RunDetached { id } = &cli.cmd else {
+            panic!("expected RunDetached");
+        };
+        assert_eq!(id, "abc123");
+        assert!(!cli.cmd.holds_workspace_lock());
     }
 
     #[test]
