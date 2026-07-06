@@ -7,6 +7,17 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches a release.
 ## [Unreleased]
 
 ### Added
+- **`hako run --network none|host`:** a `run` workload can now opt into the
+  host's network (`--network host`) so it can accept and make connections —
+  the first slice of workload networking (push-to-deploy P0-1). `none`
+  remains the default (fully isolated network namespace). Under `host` the
+  process-isolation layers (namespaces, seccomp, cgroups) are unchanged, and
+  the container takes the same shared-netns paths `apply` uses: host
+  `resolv.conf`/`hosts` are bound in (DNS works) and `/sys` is a read-only
+  bind of the host's sysfs rather than a fresh one — see
+  `docs/runtime-isolation.md` before using `host` for untrusted workloads.
+  The isolation CI check now asserts both modes. Rootless port publishing
+  (`-p` via pasta/slirp4netns) is a follow-up.
 - **Cluster foundations (opt-in `--features cluster`):** each node has a stable
   Ed25519 identity (`hako id`; secret seed at `.hako/identity`, 0600), and a
   static peer registry — `hako peer add|list|remove` over `.hako/peers.toml`

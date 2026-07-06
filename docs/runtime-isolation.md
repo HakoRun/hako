@@ -24,15 +24,24 @@ namespaces, with:
   bind-mounted at `/workspace` honoring `rw`/`ro`/`none`. Host
   `/etc/resolv.conf` + `/etc/hosts` are bind-mounted **only** when the
   container has network (`apply`); an isolated `run` gets neither.
-- **Network** — fully isolated for `run` (a `run` workload has no
-  connectivity at all today; opt-in networking is unbuilt — P0-1 in
-  [push-to-deploy.md](push-to-deploy.md)); `apply` keeps host networking so
-  setup steps can install dependencies.
-- **`/sys`** — for `run` (which owns its netns), a **fresh read-only sysfs**
-  (`ro,nosuid,nodev,noexec`): no host cgroup/kernel internals exposed, and it
-  reflects the container's own empty network. Where the kernel refuses a fresh
-  sysfs (shared-netns cases like `apply`), a host bind with a best-effort
-  read-only remount of the top mount is used instead.
+- **Network** — isolated by default for `run` (an empty network namespace: no
+  connectivity, nothing can connect in). `run --network host` skips the
+  network namespace — the workload shares the host network and can
+  listen/connect like a host process. The process-isolation layers
+  (user/mount/PID/IPC/UTS namespaces, seccomp, cgroups) are unchanged, but
+  host mode is not "network only": the host's `resolv.conf`/`hosts` are
+  bound in (so DNS works), and `/sys` becomes a read-only bind of the
+  **host's** sysfs instead of a fresh one (see the `/sys` bullet) — host
+  cgroup/kernel topology is readable. Weigh that before using `host` for
+  untrusted workloads. Rootless port publishing (`-p` via pasta/slirp4netns)
+  is the remaining P0-1 work in [push-to-deploy.md](push-to-deploy.md).
+  `apply` keeps host networking so setup steps can install dependencies.
+- **`/sys`** — for an isolated-network `run` (which owns its netns), a
+  **fresh read-only sysfs** (`ro,nosuid,nodev,noexec`): no host cgroup/kernel
+  internals exposed, and it reflects the container's own empty network. In
+  shared-netns cases (`apply`, `run --network host`) the kernel refuses a
+  fresh sysfs, so a host bind with a best-effort read-only remount of the
+  top mount is used instead — read-only, but the host's contents.
 - **Seccomp** — the workload (only — PID 1 stays unfiltered so it can reap)
   gets a seccomp-BPF denylist installed immediately before `exec`, returning
   `EPERM` for syscalls a container never legitimately needs: module loading,
@@ -91,8 +100,9 @@ HAKO=target/debug/hako bash scripts/isolation-check.sh
   knob for the seccomp/limits (currently env-var controlled).
 - Ephemeral `run` writes create orphan store objects until `gc`; consider a
   scratch overlay or a dedicated ephemeral chunk area.
-- Opt-in outbound networking for `run` (`pasta`/`slirp4netns`) — scoped as
-  P0-1 in [push-to-deploy.md](push-to-deploy.md).
+- Rootless port publishing for `run` (`-p` via `pasta`/`slirp4netns`) — the
+  remaining half of P0-1 in [push-to-deploy.md](push-to-deploy.md)
+  (`--network none|host` is done).
 
 ---
 

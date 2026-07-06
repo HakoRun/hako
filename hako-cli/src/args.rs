@@ -309,6 +309,12 @@ pub(crate) enum Cmd {
         /// Bind-mount HOST:CONTAINER[:ro]. Repeatable.
         #[arg(short = 'v', long = "volume")]
         volumes: Vec<String>,
+        /// Networking: `none` (default — fully isolated, the workload has no
+        /// connectivity) or `host` (share the host network: the workload can
+        /// listen on and connect from host ports, at the cost of network
+        /// isolation). Rootless port publishing (`-p`) is a planned follow-up.
+        #[arg(long, value_parser = ["none", "host"], default_value = "none")]
+        network: String,
         /// Skip the implicit workspace bind-mount at /workspace.
         #[arg(long)]
         no_workspace: bool,
@@ -319,9 +325,9 @@ pub(crate) enum Cmd {
         display: bool,
         /// Command + args to run, passed through verbatim. Most guest flags
         /// pass through, but a first token that collides with one of hako run's
-        /// own flags (`-d`, `-v`, `--no-workspace`, `--display`) is taken by
-        /// hako — put `--` before the command to force everything through
-        /// (e.g. `hako run alpine -- top -d`).
+        /// own flags (`-d`, `-v`, `--network`, `--no-workspace`, `--display`)
+        /// is taken by hako — put `--` before the command to force everything
+        /// through (e.g. `hako run alpine -- top -d`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -604,5 +610,28 @@ mod tests {
         }
         .needs_linux_runtime());
         assert!(!Cmd::Ls { path: None }.needs_linux_runtime());
+    }
+
+    #[test]
+    fn run_network_flag_defaults_parses_and_rejects() {
+        // Default: isolated ("none").
+        let cli = Cli::try_parse_from(["hako", "run", "alpine"]).unwrap();
+        let Cmd::Run { network, .. } = cli.cmd else {
+            panic!("expected Run");
+        };
+        assert_eq!(network, "none");
+        // Explicit host mode (context flag: before the branch positional).
+        let cli =
+            Cli::try_parse_from(["hako", "run", "--network", "host", "alpine", "true"]).unwrap();
+        let Cmd::Run {
+            network, command, ..
+        } = cli.cmd
+        else {
+            panic!("expected Run");
+        };
+        assert_eq!(network, "host");
+        assert_eq!(command, vec!["true"]);
+        // Anything else is rejected at parse time.
+        assert!(Cli::try_parse_from(["hako", "run", "--network", "bridge", "alpine"]).is_err());
     }
 }

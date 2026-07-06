@@ -77,6 +77,12 @@ Ordered by leverage. P0 items are the difference between "clever demo" and
 
 ### P0-1 — Workload networking (the #1 blocker)
 
+> **Partially landed:** `run --network none|host` shipped in PR #101 (issue #98) — `host`
+> unblocks the acceptance test's `curl`. Remaining: `-p` port publishing and
+> the rootless `pasta`/`slirp4netns` mode, plus the deploy hook consuming the
+> receiver-side `network`/`ports` keys (the `[deploy]` parse already carries
+> them).
+
 **Problem.** `run` unshares `CLONE_NEWNET` with an empty network namespace and no
 port publishing (`hako-runtime/src/transform.rs`, the `run_command_setup` /
 `container_init` path). A deployed web service **cannot accept a single TCP

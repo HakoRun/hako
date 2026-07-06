@@ -2,11 +2,22 @@
 
 use super::Ctx;
 use crate::DOT_HAKO;
-use hako_runtime::VolumeMount;
+use hako_runtime::{Network, VolumeMount};
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-/// `hako run [-d] [--no-workspace] [-v ...] <branch> [cmd...]`.
+/// `hako run`'s flag surface, grouped (the `AppOverrides` pattern) so the
+/// handler stays under clippy's argument cap as run grows flags (P0-1: network;
+/// later: ports, restart policy).
+pub struct RunOpts {
+    pub detach: bool,
+    pub volumes: Vec<String>,
+    pub network: String,
+    pub no_workspace: bool,
+    pub display: bool,
+}
+
+/// `hako run [-d] [--network none|host] [--no-workspace] [-v ...] <branch> [cmd...]`.
 ///
 /// Three modes, all dispatched here:
 ///   - foreground shell:    `hako run alpine`
@@ -15,32 +26,34 @@ use std::process::ExitCode;
 pub fn run(
     ctx: &Ctx<'_>,
     branch: String,
-    detach: bool,
-    volumes: Vec<String>,
-    no_workspace: bool,
-    display: bool,
+    opts: RunOpts,
     command: Vec<String>,
 ) -> io::Result<ExitCode> {
-    set_display_env(ctx, display);
-    let volumes = build_volumes(ctx, &volumes, no_workspace)?;
+    // clap's value_parser restricts the flag to none|host, so this can't fail
+    // from the CLI; the error path guards non-CLI callers.
+    let network = Network::parse(&opts.network).map_err(io::Error::other)?;
+    set_display_env(ctx, opts.display);
+    let volumes = build_volumes(ctx, &opts.volumes, opts.no_workspace)?;
     let repo = ctx.state.open_container(ctx.default_container)?;
-    if detach {
+    if opts.detach {
         let cmd = if command.is_empty() {
             None
         } else {
             Some(command)
         };
-        let id = hako_runtime::transform::run_container_detached(&repo, &branch, cmd, &volumes)
-            .map_err(runtime_to_io)?;
+        let id =
+            hako_runtime::transform::run_container_detached(&repo, &branch, cmd, &volumes, network)
+                .map_err(runtime_to_io)?;
         println!("{}", id);
         Ok(ExitCode::SUCCESS)
     } else if command.is_empty() {
-        let code = hako_runtime::transform::become_container(&repo, &branch, &volumes)
+        let code = hako_runtime::transform::become_container(&repo, &branch, &volumes, network)
             .map_err(runtime_to_io)?;
         Ok(exit_code_from(code))
     } else {
-        let code = hako_runtime::transform::run_container(&repo, &branch, command, &volumes)
-            .map_err(runtime_to_io)?;
+        let code =
+            hako_runtime::transform::run_container(&repo, &branch, command, &volumes, network)
+                .map_err(runtime_to_io)?;
         Ok(exit_code_from(code))
     }
 }
@@ -140,8 +153,14 @@ fn run_host_on_host(ctx: &Ctx<'_>, path: &str, command: Vec<String>) -> io::Resu
     let branch = repo
         .current_branch()?
         .ok_or_else(|| io::Error::other("current container has no current branch"))?;
-    let code = hako_runtime::transform::run_container(&repo, &branch, command, &volumes)
-        .map_err(runtime_to_io)?;
+    let code = hako_runtime::transform::run_container(
+        &repo,
+        &branch,
+        command,
+        &volumes,
+        Network::Isolated,
+    )
+    .map_err(runtime_to_io)?;
     Ok(exit_code_from(code))
 }
 
@@ -172,8 +191,14 @@ fn run_host_in_container(
         path,
         container
     );
-    let code = hako_runtime::transform::run_container(&repo, &branch, command, &volumes)
-        .map_err(runtime_to_io)?;
+    let code = hako_runtime::transform::run_container(
+        &repo,
+        &branch,
+        command,
+        &volumes,
+        Network::Isolated,
+    )
+    .map_err(runtime_to_io)?;
     Ok(exit_code_from(code))
 }
 
@@ -370,8 +395,9 @@ pub fn external(ctx: &Ctx<'_>, args: Vec<String>) -> io::Result<ExitCode> {
     let branch = repo
         .current_branch()?
         .ok_or_else(|| io::Error::other("current container has no current branch"))?;
-    let code = hako_runtime::transform::run_container(&repo, &branch, args, &volumes)
-        .map_err(runtime_to_io)?;
+    let code =
+        hako_runtime::transform::run_container(&repo, &branch, args, &volumes, Network::Isolated)
+            .map_err(runtime_to_io)?;
     Ok(exit_code_from(code))
 }
 
