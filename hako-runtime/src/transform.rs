@@ -1011,14 +1011,16 @@ fn supervise(
     net_isolated: bool,
     policy: RestartPolicy,
 ) -> i32 {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     set_supervisor_signal_disposition(nix::sys::signal::SigHandler::Handler(
         supervisor_stop_handler,
     ));
 
-    // A run that stays up at least this long is "healthy" — reset backoff so a
-    // long-lived service that finally crashes restarts promptly, while a crash
-    // loop is throttled up to the cap.
+    // A workload that stays up at least this long is "healthy" — reset backoff so
+    // a long-lived service that finally crashes restarts promptly, while a crash
+    // loop is throttled up to the cap. "Up" is measured from when the workload's
+    // PID-1 appears (see `wait_attempt`), NOT from the fork, so slow FUSE-mount /
+    // namespace setup doesn't count toward the healthy window.
     let min_healthy = Duration::from_secs(60);
     let max_backoff = Duration::from_secs(60);
     let mut backoff = Duration::from_secs(1);
@@ -1027,7 +1029,6 @@ fn supervise(
     let mut last_code;
 
     loop {
-        let started = Instant::now();
         match unsafe { fork() } {
             Err(e) => {
                 eprintln!("hako runtime: supervisor fork failed: {}", e);
@@ -1054,15 +1055,16 @@ fn supervise(
                 std::process::exit(code);
             }
             Ok(ForkResult::Parent { child }) => {
-                last_code = wait_attempt(child, workdir, id);
+                let (code, healthy) = wait_attempt(child, workdir, id, min_healthy);
+                last_code = code;
+                if healthy {
+                    backoff = Duration::from_secs(1);
+                }
             }
         }
 
         if supervisor_stop_requested() || !policy.wants_restart(last_code) {
             break;
-        }
-        if started.elapsed() >= min_healthy {
-            backoff = Duration::from_secs(1);
         }
         // Interruptible so `stop` during backoff exits promptly.
         if !sleep_interruptible(backoff) {
@@ -1076,16 +1078,35 @@ fn supervise(
 }
 
 /// Wait for one attempt to exit, polling with `WNOHANG` (race-free vs. the stop
-/// signal: no blocking `waitpid` to lose a signal against). On the first poll
-/// after a stop is requested, forward SIGTERM to the container's PID-1 so its
+/// signal: no blocking `waitpid` to lose a signal against). Returns
+/// `(exit_code, healthy)`, where `healthy` is whether the workload's PID-1 stayed
+/// up at least `min_healthy` — used to reset the restart backoff. On the first
+/// poll after a stop is requested, forward SIGTERM to the container's PID-1 so its
 /// init drains the workload; then keep polling until the attempt actually exits.
-fn wait_attempt(child: Pid, workdir: &Path, id: &str) -> i32 {
+fn wait_attempt(
+    child: Pid,
+    workdir: &Path,
+    id: &str,
+    min_healthy: std::time::Duration,
+) -> (i32, bool) {
     use nix::sys::wait::WaitPidFlag;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+    // The PID-1 the PREVIOUS attempt recorded is still on disk until this attempt
+    // overwrites it. Treat the workload as "up" only once nspid CHANGES to this
+    // attempt's value, so the healthy clock starts at the workload — not at the
+    // fork, which would fold FUSE-mount / namespace setup into the uptime.
+    let prev_nspid = instances::read_nspid_with_starttime(workdir, id);
+    let mut run_start: Option<Instant> = None;
     let mut forwarded = false;
     loop {
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
+                if run_start.is_none() {
+                    let cur = instances::read_nspid_with_starttime(workdir, id);
+                    if cur.is_some() && cur != prev_nspid {
+                        run_start = Some(Instant::now());
+                    }
+                }
                 // Keep trying to forward until we actually reach a live PID-1:
                 // a stop that arrives in the window before the attempt records
                 // its nspid must not be dropped (the workload would then never
@@ -1095,11 +1116,14 @@ fn wait_attempt(child: Pid, workdir: &Path, id: &str) -> i32 {
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Ok(status) => return wait_to_exit_code(status),
+            Ok(status) => {
+                let healthy = run_start.is_some_and(|s| s.elapsed() >= min_healthy);
+                return (wait_to_exit_code(status), healthy);
+            }
             Err(nix::errno::Errno::EINTR) => {}
             Err(e) => {
                 eprintln!("hako runtime: supervisor waitpid: {}", e);
-                return 1;
+                return (1, false);
             }
         }
     }

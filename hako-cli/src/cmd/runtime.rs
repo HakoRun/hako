@@ -549,14 +549,20 @@ pub fn logs(ctx: &Ctx<'_>, id: String, follow: bool) -> io::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Poll until the instance exits. We check exit_code rather than
-    // process liveness so that an instance whose process is gone but
-    // hasn't yet recorded its exit is still followed to completion.
+    // Poll until the instance is truly done: not running AND an exit code
+    // recorded. Checking both matters two ways — a workload whose process is gone
+    // but hasn't recorded its exit yet is still followed to completion, and a
+    // SUPERVISED instance (whose supervisor stays alive across restarts, so
+    // is_running() holds while a per-attempt exit_code is on disk) keeps being
+    // followed across each restart instead of stopping after the first attempt.
     loop {
         let drained_out = drain_from(&stdout_path, &mut stdout_pos, &mut io::stdout())?;
         let drained_err = drain_from(&stderr_path, &mut stderr_pos, &mut io::stderr())?;
         let inst = hako_runtime::instances::get(&runtime_root, &id);
-        let done = matches!(&inst, Ok(i) if i.exit_code.is_some()) || inst.is_err();
+        let done = match &inst {
+            Ok(i) => !i.is_running() && i.exit_code.is_some(),
+            Err(_) => true,
+        };
         if done && !drained_out && !drained_err {
             // No more output coming; bail.
             return Ok(ExitCode::SUCCESS);

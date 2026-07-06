@@ -402,7 +402,13 @@ pub fn get(workdir: &Path, id: &str) -> Result<Instance, RuntimeError> {
         None => (None, None),
     };
     let exit_code = read_exit_code(workdir, id);
-    let restart_count = read_restart_count(workdir, id);
+    // Only supervised instances ever write a `restarts` file; skip the read (and
+    // its guaranteed NotFound) for the common unsupervised case.
+    let restart_count = if config.restart.is_supervised() {
+        read_restart_count(workdir, id)
+    } else {
+        0
+    };
     Ok(Instance {
         id: id.into(),
         config,
@@ -485,12 +491,27 @@ pub fn stop(workdir: &Path, id: &str, force: bool) -> Result<(), RuntimeError> {
         if force {
             // SIGKILL the supervisor FIRST so it can't respawn, then SIGKILL the
             // container's PID namespace via its PID-1 — killing only the
-            // supervisor would orphan a still-running workload.
+            // supervisor would orphan a still-running workload. The supervisor
+            // may have just forked an attempt that hasn't recorded its PID-1 yet
+            // (the respawn setup window), so poll briefly for a live PID-1 rather
+            // than reading once: in steady state it's already recorded and this
+            // returns on the first read; during a respawn it catches the container
+            // as it comes up; during backoff nothing is running and it just times
+            // out. Without this, a --force landing in the setup window leaks a
+            // live container + FUSE mount that nothing supervises.
             let _ = kill(Pid::from_raw(spid as i32), Signal::SIGKILL);
-            if let Some((npid, nstart)) = read_nspid_with_starttime(workdir, id) {
-                if process_matches(npid, nstart) {
-                    let _ = kill(Pid::from_raw(npid as i32), Signal::SIGKILL);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                if let Some((npid, nstart)) = read_nspid_with_starttime(workdir, id) {
+                    if process_matches(npid, nstart) {
+                        let _ = kill(Pid::from_raw(npid as i32), Signal::SIGKILL);
+                        break;
+                    }
                 }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
         } else {
             // SIGTERM the supervisor: its handler records "do not respawn" and
@@ -783,13 +804,29 @@ mod tests {
 
     #[test]
     fn restart_count_persists() {
+        // Only a supervised instance carries a restart count; `get()` reads it
+        // only for those (unsupervised is always 0, no file read).
         let wd = workdir();
-        let id = "rc";
+        let spec = SpawnSpec {
+            restart: RestartPolicy::Always,
+            ..SpawnSpec::minimal("c", "main", &[])
+        };
+        let id = create_unique_full(wd.path(), &spec).unwrap();
+        assert_eq!(read_restart_count(wd.path(), &id), 0);
+        write_restart_count(wd.path(), &id, 3).unwrap();
+        assert_eq!(read_restart_count(wd.path(), &id), 3);
+        assert_eq!(get(wd.path(), &id).unwrap().restart_count, 3);
+    }
+
+    #[test]
+    fn unsupervised_get_reports_zero_restart_count() {
+        // An unsupervised instance reports 0 even if a stray `restarts` file
+        // exists — get() skips the read for restart = no.
+        let wd = workdir();
+        let id = "unsup";
         create(wd.path(), id, "c", "main", &[]).unwrap();
-        assert_eq!(read_restart_count(wd.path(), id), 0);
-        write_restart_count(wd.path(), id, 3).unwrap();
-        assert_eq!(read_restart_count(wd.path(), id), 3);
-        assert_eq!(get(wd.path(), id).unwrap().restart_count, 3);
+        write_restart_count(wd.path(), id, 9).unwrap();
+        assert_eq!(get(wd.path(), id).unwrap().restart_count, 0);
     }
 
     #[test]

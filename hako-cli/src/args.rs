@@ -319,7 +319,7 @@ pub(crate) enum Cmd {
         /// once), `on-failure` (respawn on non-zero exit), or `always` (respawn
         /// on any exit). A supervised instance re-launches the tree pinned at
         /// spawn, so a later `revert` can't slip a different tree under it.
-        /// Ignored without `-d`.
+        /// Only meaningful with `-d`: a non-`no` policy without `-d` is an error.
         #[arg(long, value_parser = ["no", "on-failure", "always"], default_value = "no")]
         restart: String,
         /// Skip the implicit workspace bind-mount at /workspace.
