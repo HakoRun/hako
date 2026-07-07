@@ -59,6 +59,7 @@ pub fn serve(
     addr: &str,
     allow_remote: bool,
     allow_remote_run: bool,
+    allow_deploy: bool,
 ) -> io::Result<ExitCode> {
     let id = identity::load_or_create(ctx)?;
     let exposes_remote = check_bind_safety(addr, allow_remote)?;
@@ -79,6 +80,23 @@ pub fn serve(
             "serve: warning: remote `ctl run` is enabled; any registered peer can \
              execute commands in a container on this node."
         );
+    }
+    // Push-to-deploy is on only when BOTH the operator opted in (`--allow-deploy`)
+    // AND a `[deploy]` target is configured. Either alone is inert.
+    let deploy_on = allow_deploy && ctx.cfg.deploy.is_some();
+    if allow_deploy {
+        match &ctx.cfg.deploy {
+            Some(d) => crate::diag!(
+                "serve: push-to-deploy enabled for {}:{} (a push that advances it \
+                 (re)launches the workload here)",
+                d.container,
+                d.branch
+            ),
+            None => crate::diag!(
+                "serve: --allow-deploy set but no [deploy] table in hako.toml; \
+                 push-to-deploy is inert"
+            ),
+        }
     }
     // One handler thread per connection so a slow or stalled peer can't block the
     // others (previously the serial accept loop let one connected peer monopolize
@@ -104,7 +122,7 @@ pub fn serve(
                         // poison-tolerant (see `lock_daemon`).
                         let outcome =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                handle_peer(stream, &id, ctx, allow_remote_run)
+                                handle_peer(stream, &id, ctx, allow_remote_run, deploy_on)
                             }));
                         match outcome {
                             Ok(Ok(())) => {}
@@ -167,6 +185,7 @@ fn handle_peer(
     id: &identity::Identity,
     ctx: &Ctx<'_>,
     allow_remote_run: bool,
+    deploy_on: bool,
 ) -> io::Result<()> {
     set_io_timeouts(&stream)?;
     // Authorize the initiator's Noise (X25519) static against the registry, which
@@ -212,7 +231,7 @@ fn handle_peer(
         if session_lock.is_none() && matches!(tag, TAG_SYNC_HAVE | TAG_SYNC_PUT | TAG_SYNC_REF) {
             session_lock = Some(lock_daemon(ctx)?);
         }
-        let result: io::Result<Vec<u8>> = match tag {
+        let mut result: io::Result<Vec<u8>> = match tag {
             TAG_META_READ => std::str::from_utf8(payload)
                 .map_err(|_| invalid("request path is not UTF-8"))
                 .and_then(|path| meta_read(ctx, path)),
@@ -231,6 +250,20 @@ fn handle_peer(
         // held idle until the peer disconnects (#71, liveness).
         if matches!(tag, TAG_SYNC_REF) {
             session_lock = None;
+            // Push-to-deploy (P1-1): with the mutation lock dropped (spawning a
+            // container must not hold it, #78) and the ref durable, if this
+            // successful advance matches the node's deploy target, reconcile the
+            // workload and append the deploy log to the push response.
+            if deploy_on {
+                if let (Ok(bytes), Some(deploy)) = (&mut result, &ctx.cfg.deploy) {
+                    if let Ok((container, branch)) = parse_ref_target(payload) {
+                        if super::deploy::matches(deploy, container, branch) {
+                            let log = super::deploy::reconcile(ctx, deploy);
+                            bytes.extend_from_slice(log.as_bytes());
+                        }
+                    }
+                }
+            }
         }
         let resp = match &result {
             Ok(bytes) => {
@@ -425,6 +458,14 @@ fn sync_put(ctx: &Ctx<'_>, mut payload: &[u8]) -> io::Result<Vec<u8>> {
         payload = rest;
     }
     Ok(Vec::new())
+}
+
+/// Extract the `(container, branch)` a SYNC_REF payload targets, for the
+/// push-to-deploy match. (The commit tail is `sync_ref`'s concern.)
+fn parse_ref_target(payload: &[u8]) -> io::Result<(&str, &str)> {
+    let (container, rest) = take_lenprefixed_str(payload)?;
+    let (branch, _) = take_lenprefixed_str(rest)?;
+    Ok((container, branch))
 }
 
 /// Data plane: point a container's branch at a (now-present) commit, creating
@@ -802,7 +843,7 @@ mod tests {
         std::thread::scope(|s| {
             let server = s.spawn(|| {
                 let (stream, _) = listener.accept().unwrap();
-                handle_peer(stream, &a_id, &a_ctx, false)
+                handle_peer(stream, &a_id, &a_ctx, false, false)
             });
             let rc = remote_push(&b_ctx, "server", "main");
             assert!(rc.is_ok(), "push failed: {rc:?}");
@@ -854,7 +895,7 @@ mod tests {
                 // A fetch is two requests (WANT + GET), so one accept serves the
                 // whole connection until the client disconnects.
                 let (stream, _) = listener.accept().unwrap();
-                handle_peer(stream, &a_id, &a_ctx, false)
+                handle_peer(stream, &a_id, &a_ctx, false, false)
             });
             let rc = remote_fetch(&b_ctx, "server", "main");
             assert!(rc.is_ok(), "fetch failed: {rc:?}");
@@ -894,7 +935,7 @@ mod tests {
         std::thread::scope(|s| {
             let server = s.spawn(|| {
                 let (stream, _) = listener.accept().unwrap();
-                handle_peer(stream, &a_id, &a_ctx, false)
+                handle_peer(stream, &a_id, &a_ctx, false, false)
             });
             // Drive the client side directly so we can assert the RETURNED BYTES,
             // not merely that the round-trip completed: read the server's own
@@ -944,7 +985,7 @@ mod tests {
             // Server started WITHOUT --allow-remote-run (the false arg).
             let server = s.spawn(|| {
                 let (stream, _) = listener.accept().unwrap();
-                handle_peer(stream, &a_id, &a_ctx, false)
+                handle_peer(stream, &a_id, &a_ctx, false, false)
             });
             let rc = remote_write(&b_ctx, "server/containers/hako/ctl", b"run echo hi");
             let err = rc.expect_err("remote `ctl run` must be refused when the gate is off");
@@ -984,7 +1025,7 @@ mod tests {
         std::thread::scope(|s| {
             let server = s.spawn(|| {
                 let (stream, _) = listener.accept().unwrap();
-                handle_peer(stream, &a_id, &a_ctx, false)
+                handle_peer(stream, &a_id, &a_ctx, false, false)
             });
             let peer = peers::lookup(&b_ctx, "server")
                 .unwrap()

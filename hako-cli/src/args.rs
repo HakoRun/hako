@@ -254,6 +254,13 @@ pub(crate) enum Cmd {
         /// (commit/branch/tag) and replication stay available without it.
         #[arg(long)]
         allow_remote_run: bool,
+        /// Enable push-to-deploy: when a push advances the branch named in this
+        /// node's `[deploy]` table (hako.toml), (re)launch the workload here with
+        /// the receiver-declared run shape. Off by default. Needs a `[deploy]`
+        /// table to do anything. The command that runs is yours, not the pusher's
+        /// — a push supplies the filesystem, `[deploy].run` supplies what runs.
+        #[arg(long)]
+        allow_deploy: bool,
     },
 
     // ------------------------------------------------------------ Mount
