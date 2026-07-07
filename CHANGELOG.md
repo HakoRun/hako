@@ -6,6 +6,24 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches a release.
 
 ## [Unreleased]
 
+### Added
+- **Push-to-deploy (`hako serve --allow-deploy`, `--features cluster`):** a node
+  with a `[deploy]` table in its `hako.toml` reconciles a running workload when a
+  push advances the tracked branch — it stops the old instance (graceful, then
+  SIGKILL after `grace_secs`) and starts the new one at the just-pushed tree,
+  supervised (`restart = always`) so it stays up. You declare the **entrypoint**
+  receiver-side (`[deploy].run`); the pusher supplies the **filesystem** it runs
+  against — so `--allow-deploy` is a code-execution grant (for an interpreted
+  runtime the pushed tree is the code), like `--allow-remote-run`; enable it only
+  for peers you'd let run code on the host. The deploy log rides back in the push response,
+  so `hako peer push` prints a Heroku-style summary
+  (`deploy app:main / stopping … / started …`). Off by default; needs both
+  `--allow-deploy` and a `[deploy]` table. A restart re-launches the pinned tree,
+  so `hako revert` + re-push rolls a deploy back. Config-only nodes are now
+  first-class: a `hako.toml` that is *just* a `[deploy]` table no longer requires
+  an `image`. Follow-ups: health-gate + auto-rollback, and `-p` port publishing
+  (a `network = "host"` deploy serves on host ports meanwhile).
+
 ### Changed
 - **The `hako serve` daemon is now concurrent (`--features cluster`):** one
   handler thread per connection (bounded by a semaphore, so a peer flood can't

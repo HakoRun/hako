@@ -182,9 +182,18 @@ notes already flag this). Ref-mutating work must serialize; reads must not.
 
 ### P1-1 — The deploy hook (a remote that runs)
 
-> **Partially landed:** the `[deploy]` table is parsed as a reserved node-local
-> table in `config.rs` (the "reserve `[deploy]` as a real table" note below).
-> The hook itself — reconciling on ref advance — is not built.
+> **Landed (core).** `hako serve --allow-deploy` reconciles on a `[deploy]`-
+> matched ref advance: stop the old instance (graceful, then SIGKILL after
+> `grace_secs`), start the new at the just-pushed tree, supervised
+> (`restart = always`); the run shape (`run`/network/volumes) is receiver-
+> declared, and the deploy log rides back in the push response
+> (`serve/deploy.rs`). Gated on `--allow-deploy` **and** a `[deploy]` table. A
+> `[deploy]`-only `hako.toml` no longer requires an `image`. **Remaining:** the
+> health-gate + auto-rollback (item 4 below), `-p` port publishing (a
+> `network = "host"` deploy serves on host ports meanwhile), and reconcile
+> collapse-to-latest (a single global deploy mutex serializes for now). Note: a
+> deploy target's branch should be **created by the first push** (a fresh prod
+> node has no divergent history), not pre-seeded locally.
 
 **Problem.** Today you can `push` and remotely `run`, but nothing ties a ref
 advance to the running workload.

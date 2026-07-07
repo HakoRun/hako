@@ -277,7 +277,8 @@ fn run() -> io::Result<ExitCode> {
             addr,
             allow_remote,
             allow_remote_run,
-        } => cmd::serve::serve(&ctx, &addr, allow_remote, allow_remote_run),
+            allow_deploy,
+        } => cmd::serve::serve(&ctx, &addr, allow_remote, allow_remote_run, allow_deploy),
         Cmd::NewContainer { name } => {
             state.create_container(&name)?;
             println!("created container {}", name);

@@ -188,6 +188,25 @@ fast-forward-only, and peer-triggered command execution requires
 `--allow-remote-run`. Design notes: [docs/distributed.md](docs/distributed.md)
 and [docs/push-to-deploy.md](docs/push-to-deploy.md).
 
+**Push-to-deploy.** A node with a `[deploy]` table and `hako serve
+--allow-deploy` reacts to a push that advances the tracked branch by
+reconciling the workload — stop the old instance, start the new one at the
+just-pushed tree, kept up with `restart = always`. You declare the *entrypoint*
+on the receiver (`[deploy].run`); the pusher supplies the *filesystem* it runs
+against — so `--allow-deploy` is a code-execution grant (for an interpreted
+runtime the pushed tree is the code), on par with `--allow-remote-run`. Enable
+it only for peers you'd let run code on the host. `hako peer push` prints the
+deploy log; `hako revert` + re-push rolls back.
+
+```toml
+# on the deploy node's hako.toml
+[deploy]
+container = "app"
+branch    = "main"
+run       = "python -m myapp"
+network   = "host"       # serve on host ports (rootless -p publishing is WIP)
+```
+
 ## Architecture
 
 A Cargo workspace of four crates:

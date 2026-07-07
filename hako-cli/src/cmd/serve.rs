@@ -17,6 +17,7 @@
 
 mod channel;
 mod client;
+mod deploy;
 mod proto;
 mod server;
 

@@ -114,6 +114,11 @@ pub struct DeployConfig {
     pub container: String,
     /// Branch to watch and (re)launch on advance.
     pub branch: String,
+    /// Command the deployed workload runs. Receiver-declared (never from the
+    /// pushed tree) — the push supplies the filesystem, this supplies what runs
+    /// on it. `None` launches the container's default shell (rarely what a
+    /// service wants; set `run` for a real deploy).
+    pub run: Option<RunSpec>,
     /// Graceful-stop drain + health-gate window, seconds.
     pub grace_secs: u64,
     /// Networking for the workload (matches `run --network`); `None` = isolated.
@@ -130,6 +135,17 @@ pub enum RunSpec {
     Shell(String),
     /// `run = ["python", "-m", "myapp"]` — direct exec, no shell.
     Exec(Vec<String>),
+}
+
+impl RunSpec {
+    /// The argv to exec. A shell string becomes `["/bin/sh", "-c", cmd]`; an
+    /// exec-form array is passed through verbatim.
+    pub fn argv(&self) -> Vec<String> {
+        match self {
+            RunSpec::Shell(cmd) => vec!["/bin/sh".into(), "-c".into(), cmd.clone()],
+            RunSpec::Exec(v) => v.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -203,11 +219,22 @@ impl Config {
         // `[deploy]` is node-local, not profile-overlaid — resolve it before the
         // profile merge consumes `raw`.
         let deploy = raw.deploy.take().map(DeployRaw::resolve).transpose()?;
-        let app = raw.resolve(profile)?;
-        let default_container = app.name.clone();
+        // A file that configures no local app — e.g. a deploy-only node whose
+        // hako.toml is just a `[deploy]` table — has no image to require. Only
+        // resolve (and demand an image) when the file actually describes an app,
+        // or a profile was explicitly requested.
+        let app = if profile.is_some() || raw.has_app_content() {
+            Some(raw.resolve(profile)?)
+        } else {
+            None
+        };
+        let default_container = app
+            .as_ref()
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| Self::default().default_container);
         Ok(Self {
             default_container,
-            app: Some(app),
+            app,
             deploy,
         })
     }
@@ -268,6 +295,7 @@ struct ProfileRaw {
 struct DeployRaw {
     container: Option<String>,
     branch: Option<String>,
+    run: Option<RunRaw>,
     grace_secs: Option<u64>,
     network: Option<String>,
     #[serde(default)]
@@ -293,12 +321,29 @@ impl DeployRaw {
                 .branch
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| required("branch"))?,
+            run: self.run.map(RunSpec::from).map(validate_run).transpose()?,
             grace_secs: self.grace_secs.unwrap_or(10),
             network: self.network,
             ports: self.ports,
             volumes: self.volumes,
         })
     }
+}
+
+/// Reject a `[deploy].run` that would exec nothing (`run = ""` or `run = []`),
+/// which under `restart = always` would spin an instant-exit respawn loop.
+fn validate_run(run: RunSpec) -> io::Result<RunSpec> {
+    let empty = match &run {
+        RunSpec::Shell(s) => s.trim().is_empty(),
+        RunSpec::Exec(v) => v.is_empty() || v[0].trim().is_empty(),
+    };
+    if empty {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hako.toml [deploy]: `run` must not be empty",
+        ));
+    }
+    Ok(run)
 }
 
 /// `run` accepts either a single shell string or an exec-form array.
@@ -341,6 +386,26 @@ impl From<WorkspaceRaw> for WorkspaceMode {
 // ============================================================================
 
 impl AppRaw {
+    /// Whether this file describes a local app (so an `image` is expected).
+    /// False only for a file with NO app fields at all — an empty file or a
+    /// node-local `[deploy]`-only config. Any app field being set means the user
+    /// intended an app, so resolution proceeds and a missing `image` still errors
+    /// (rather than silently dropping the partial config). `[deploy]` and profiles
+    /// are excluded on purpose: they aren't base-app content.
+    fn has_app_content(&self) -> bool {
+        self.image.is_some()
+            || self.name.is_some()
+            || !self.setup.is_empty()
+            || self.run.is_some()
+            || self.bin.is_some()
+            || self.user.is_some()
+            || !self.env.is_empty()
+            || !self.env_pass.is_empty()
+            || self.autocommit.is_some()
+            || self.workspace.is_some()
+            || self.display.is_some()
+    }
+
     fn resolve(self, profile_name: Option<&str>) -> io::Result<AppConfig> {
         // Look up the named profile, if any. Unknown names error explicitly
         // — better than silently falling through to base config and leaving
@@ -562,6 +627,26 @@ ports = ["8080:80"]
         assert_eq!(d.ports, vec!["8080:80"]);
         assert!(d.volumes.is_empty());
         assert!(d.network.is_none());
+        assert!(d.run.is_none()); // absent → falls back to the container shell
+    }
+
+    #[test]
+    fn deploy_run_command_parses_both_forms() {
+        let shell =
+            parse_deploy("[deploy]\ncontainer=\"app\"\nbranch=\"main\"\nrun=\"python -m app\"\n")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            shell.run.unwrap().argv(),
+            vec!["/bin/sh", "-c", "python -m app"]
+        );
+
+        let exec = parse_deploy(
+            "[deploy]\ncontainer=\"app\"\nbranch=\"main\"\nrun=[\"python\",\"-m\",\"app\"]\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(exec.run.unwrap().argv(), vec!["python", "-m", "app"]);
     }
 
     #[test]
@@ -768,6 +853,55 @@ user  = "bob"
         let c = Config::load(d.path()).unwrap();
         assert_eq!(c.default_container, "hako");
         assert!(c.app.is_none());
+    }
+
+    #[test]
+    fn deploy_only_hako_toml_needs_no_image() {
+        // A push-to-deploy receiver's hako.toml is just a `[deploy]` table — it
+        // configures no local app, so `image` must not be required.
+        let d = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            d.path().join("hako.toml"),
+            "[deploy]\ncontainer=\"app\"\nbranch=\"main\"\nrun=\"serve\"\n",
+        )
+        .unwrap();
+        let c = Config::load(d.path()).unwrap();
+        assert!(
+            c.app.is_none(),
+            "deploy-only file must not synthesize an app"
+        );
+        assert_eq!(c.default_container, "hako");
+        let deploy = c.deploy.expect("deploy table present");
+        assert_eq!(deploy.container, "app");
+        assert_eq!(deploy.run.unwrap().argv(), vec!["/bin/sh", "-c", "serve"]);
+    }
+
+    #[test]
+    fn app_fields_without_image_still_error() {
+        // A file that expresses app intent through ANY app field but omits
+        // `image` is a user mistake — surface it, don't silently drop the config.
+        for body in [
+            "run = \"echo hi\"\n",
+            "name = \"myproj\"\n",
+            "env = { FOO = \"bar\" }\n",
+            "user = \"bob\"\n",
+        ] {
+            let d = tempfile::TempDir::new().unwrap();
+            std::fs::write(d.path().join("hako.toml"), body).unwrap();
+            let err = Config::load(d.path()).expect_err(body);
+            assert!(err.to_string().contains("image"), "for {body:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn deploy_run_must_not_be_empty() {
+        // `run = ""` / `run = []` would exec nothing and, under restart=always,
+        // spin an instant-exit respawn loop — reject at parse time.
+        for run in ["run = \"\"", "run = \"   \"", "run = []"] {
+            let toml = format!("[deploy]\ncontainer=\"app\"\nbranch=\"main\"\n{run}\n");
+            let err = parse_deploy(&toml).unwrap_err();
+            assert!(err.to_string().contains("run"), "for {run:?}: {err}");
+        }
     }
 
     #[test]
