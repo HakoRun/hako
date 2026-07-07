@@ -24,6 +24,18 @@ use std::time::{Duration, Instant};
 /// deploys are infrequent and a node has a single `[deploy]` target.
 static DEPLOY_LOCK: Mutex<()> = Mutex::new(());
 
+/// The health-gate always watches at least this long, even if `grace_secs` is
+/// smaller. A crash's `restart_count` bump only lands ~1s+ after the crash (the
+/// supervisor's restart backoff starts at 1s), so a shorter window would report
+/// a crash-looping deploy as "healthy" before the first respawn could register.
+const MIN_HEALTH_SECS: u64 = 3;
+
+/// How long to health-gate a just-started deploy: `grace_secs`, floored so crash
+/// detection is reliable (see `MIN_HEALTH_SECS`).
+fn health_window(grace_secs: u64) -> u64 {
+    grace_secs.max(MIN_HEALTH_SECS)
+}
+
 /// Whether an advance of `(container, branch)` is this node's deploy target.
 pub fn matches(deploy: &DeployConfig, container: &str, branch: &str) -> bool {
     deploy.container == container && deploy.branch == branch
@@ -142,16 +154,16 @@ pub fn reconcile(ctx: &Ctx<'_>, deploy: &DeployConfig, prev: Option<Hash>) -> St
     };
 
     // Health-gate: a boot failure shows up as the supervisor respawning the
-    // workload (restart_count > 0) within grace_secs; a healthy first attempt
-    // survives the whole window.
-    if health_gate(&runtime_root, &new_id, deploy.grace_secs) {
-        let _ = write!(log, "\n  healthy ({}s, no restarts)", deploy.grace_secs);
+    // workload (restart_count > 0) within the window; a healthy first attempt
+    // survives it.
+    let window = health_window(deploy.grace_secs);
+    if health_gate(&runtime_root, &new_id, window) {
+        let _ = write!(log, "\n  healthy ({window}s, no restarts)");
         return log;
     }
     let _ = write!(
         log,
-        "\n  UNHEALTHY: crash-looped within {}s — rolling back",
-        deploy.grace_secs
+        "\n  UNHEALTHY: crash-looped within {window}s — rolling back"
     );
     // Stop the crash-looping new instance before launching the rollback.
     let _ = instances::stop(&runtime_root, &new_id, true);
@@ -197,12 +209,12 @@ pub fn reconcile(ctx: &Ctx<'_>, deploy: &DeployConfig, prev: Option<Hash>) -> St
     log
 }
 
-/// Watch a just-started supervised instance for `grace_secs`. Returns `true` if
-/// its first attempt stayed up the whole window (healthy); `false` as soon as the
-/// supervisor has respawned it (a crash → `restart_count > 0`) or it vanished — a
-/// boot failure, detected early so the rollback fires promptly.
-fn health_gate(runtime_root: &Path, id: &str, grace_secs: u64) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(grace_secs);
+/// Watch a just-started supervised instance for `window` seconds. Returns `true`
+/// if its first attempt stayed up the whole window (healthy); `false` as soon as
+/// the supervisor has respawned it (a crash → `restart_count > 0`) or it vanished
+/// — a boot failure, detected early so the rollback fires promptly.
+fn health_gate(runtime_root: &Path, id: &str, window: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(window);
     loop {
         match instances::get(runtime_root, id) {
             Ok(inst) if inst.restart_count > 0 => return false,
@@ -254,5 +266,16 @@ mod tests {
         assert!(matches(&d, "app", "main"));
         assert!(!matches(&d, "app", "dev")); // wrong branch
         assert!(!matches(&d, "other", "main")); // wrong container
+    }
+
+    #[test]
+    fn health_window_is_floored() {
+        // A too-short grace_secs would let the gate pass before a crash's
+        // restart_count could register (~1s after the crash), silently accepting
+        // a broken deploy. The window is floored so detection stays reliable.
+        assert_eq!(health_window(0), MIN_HEALTH_SECS);
+        assert_eq!(health_window(1), MIN_HEALTH_SECS);
+        assert_eq!(health_window(MIN_HEALTH_SECS), MIN_HEALTH_SECS);
+        assert_eq!(health_window(30), 30); // a larger value is respected
     }
 }
