@@ -321,13 +321,29 @@ impl DeployRaw {
                 .branch
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| required("branch"))?,
-            run: self.run.map(RunSpec::from),
+            run: self.run.map(RunSpec::from).map(validate_run).transpose()?,
             grace_secs: self.grace_secs.unwrap_or(10),
             network: self.network,
             ports: self.ports,
             volumes: self.volumes,
         })
     }
+}
+
+/// Reject a `[deploy].run` that would exec nothing (`run = ""` or `run = []`),
+/// which under `restart = always` would spin an instant-exit respawn loop.
+fn validate_run(run: RunSpec) -> io::Result<RunSpec> {
+    let empty = match &run {
+        RunSpec::Shell(s) => s.trim().is_empty(),
+        RunSpec::Exec(v) => v.is_empty() || v[0].trim().is_empty(),
+    };
+    if empty {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hako.toml [deploy]: `run` must not be empty",
+        ));
+    }
+    Ok(run)
 }
 
 /// `run` accepts either a single shell string or an exec-form array.
@@ -371,9 +387,23 @@ impl From<WorkspaceRaw> for WorkspaceMode {
 
 impl AppRaw {
     /// Whether this file describes a local app (so an `image` is expected).
-    /// False for an empty file or a node-local `[deploy]`-only config.
+    /// False only for a file with NO app fields at all — an empty file or a
+    /// node-local `[deploy]`-only config. Any app field being set means the user
+    /// intended an app, so resolution proceeds and a missing `image` still errors
+    /// (rather than silently dropping the partial config). `[deploy]` and profiles
+    /// are excluded on purpose: they aren't base-app content.
     fn has_app_content(&self) -> bool {
-        self.image.is_some() || self.run.is_some() || !self.setup.is_empty() || self.bin.is_some()
+        self.image.is_some()
+            || self.name.is_some()
+            || !self.setup.is_empty()
+            || self.run.is_some()
+            || self.bin.is_some()
+            || self.user.is_some()
+            || !self.env.is_empty()
+            || !self.env_pass.is_empty()
+            || self.autocommit.is_some()
+            || self.workspace.is_some()
+            || self.display.is_some()
     }
 
     fn resolve(self, profile_name: Option<&str>) -> io::Result<AppConfig> {
@@ -848,12 +878,30 @@ user  = "bob"
 
     #[test]
     fn app_fields_without_image_still_error() {
-        // A file that clearly means to configure an app (has `run`) but omits
-        // `image` is a user mistake — surface it, don't silently drop the app.
-        let d = tempfile::TempDir::new().unwrap();
-        std::fs::write(d.path().join("hako.toml"), "run = \"echo hi\"\n").unwrap();
-        let err = Config::load(d.path()).unwrap_err();
-        assert!(err.to_string().contains("image"), "got: {err}");
+        // A file that expresses app intent through ANY app field but omits
+        // `image` is a user mistake — surface it, don't silently drop the config.
+        for body in [
+            "run = \"echo hi\"\n",
+            "name = \"myproj\"\n",
+            "env = { FOO = \"bar\" }\n",
+            "user = \"bob\"\n",
+        ] {
+            let d = tempfile::TempDir::new().unwrap();
+            std::fs::write(d.path().join("hako.toml"), body).unwrap();
+            let err = Config::load(d.path()).expect_err(body);
+            assert!(err.to_string().contains("image"), "for {body:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn deploy_run_must_not_be_empty() {
+        // `run = ""` / `run = []` would exec nothing and, under restart=always,
+        // spin an instant-exit respawn loop — reject at parse time.
+        for run in ["run = \"\"", "run = \"   \"", "run = []"] {
+            let toml = format!("[deploy]\ncontainer=\"app\"\nbranch=\"main\"\n{run}\n");
+            let err = parse_deploy(&toml).unwrap_err();
+            assert!(err.to_string().contains("run"), "for {run:?}: {err}");
+        }
     }
 
     #[test]

@@ -256,9 +256,13 @@ pub(crate) enum Cmd {
         allow_remote_run: bool,
         /// Enable push-to-deploy: when a push advances the branch named in this
         /// node's `[deploy]` table (hako.toml), (re)launch the workload here with
-        /// the receiver-declared run shape. Off by default. Needs a `[deploy]`
-        /// table to do anything. The command that runs is yours, not the pusher's
-        /// — a push supplies the filesystem, `[deploy].run` supplies what runs.
+        /// the receiver-declared run shape. Off by default; needs a `[deploy]`
+        /// table. SECURITY: this is a code-execution grant, like
+        /// `--allow-remote-run`. You choose the entrypoint (`[deploy].run`), but
+        /// any registered peer that can push the deploy branch supplies the
+        /// filesystem it runs against — which, for an interpreted runtime
+        /// (`run = "python -m app"`), IS the code. Enable only for peers you'd
+        /// let run code on this host.
         #[arg(long)]
         allow_deploy: bool,
     },

@@ -191,9 +191,11 @@ and [docs/push-to-deploy.md](docs/push-to-deploy.md).
 **Push-to-deploy.** A node with a `[deploy]` table and `hako serve
 --allow-deploy` reacts to a push that advances the tracked branch by
 reconciling the workload — stop the old instance, start the new one at the
-just-pushed tree, kept up with `restart = always`. The command that runs is
-declared on the receiver (`[deploy].run`), never in the pushed tree, so a push
-supplies the filesystem but not the code path. `hako peer push` prints the
+just-pushed tree, kept up with `restart = always`. You declare the *entrypoint*
+on the receiver (`[deploy].run`); the pusher supplies the *filesystem* it runs
+against — so `--allow-deploy` is a code-execution grant (for an interpreted
+runtime the pushed tree is the code), on par with `--allow-remote-run`. Enable
+it only for peers you'd let run code on the host. `hako peer push` prints the
 deploy log; `hako revert` + re-push rolls back.
 
 ```toml

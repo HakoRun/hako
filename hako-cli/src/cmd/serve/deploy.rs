@@ -76,14 +76,38 @@ pub fn reconcile(ctx: &Ctx<'_>, deploy: &DeployConfig) -> String {
             return log;
         }
     };
-    let command = deploy.run.as_ref().map(|r| r.argv());
-    let volumes: Vec<VolumeMount> = deploy
-        .volumes
-        .iter()
-        .filter_map(|v| VolumeMount::parse(v).ok())
-        .collect();
+    // A deploy with no `run` command has nothing meaningful to launch — starting
+    // the container's default shell under restart=always would just spin an
+    // instant-exit respawn loop. Stop the old workload (done above) and report it,
+    // rather than boot a busy-loop.
+    let command = match deploy.run.as_ref() {
+        Some(r) => r.argv(),
+        None => {
+            let _ = write!(
+                log,
+                "\n  not started: [deploy] has no `run` command (set one to launch a service)"
+            );
+            return log;
+        }
+    };
+    // Surface bad specs instead of silently dropping them: a typo'd volume or
+    // network would otherwise quietly bring the workload up wrong (no mount, or
+    // no connectivity — and with ports unpublished, `host` is the only way to
+    // serve, so a downgrade to isolated makes the service unreachable).
+    let mut volumes: Vec<VolumeMount> = Vec::new();
+    for v in &deploy.volumes {
+        match VolumeMount::parse(v) {
+            Ok(m) => volumes.push(m),
+            Err(e) => {
+                let _ = write!(log, "\n  WARNING skipping bad volume {v:?}: {e}");
+            }
+        }
+    }
     let network = match deploy.network.as_deref() {
-        Some(s) => Network::parse(s).unwrap_or(Network::Isolated),
+        Some(s) => Network::parse(s).unwrap_or_else(|e| {
+            let _ = write!(log, "\n  WARNING {e}; falling back to isolated network");
+            Network::Isolated
+        }),
         None => Network::Isolated,
     };
     // Port publishing (`-p`) isn't wired yet (push-to-deploy P0-1 slice 2); a
@@ -98,7 +122,7 @@ pub fn reconcile(ctx: &Ctx<'_>, deploy: &DeployConfig) -> String {
     match hako_runtime::transform::run_container_detached(
         &repo,
         &deploy.branch,
-        command,
+        Some(command),
         &volumes,
         network,
         RestartPolicy::Always,
