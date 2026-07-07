@@ -147,17 +147,27 @@ fn not_in_container(name: &str, pid: u32) -> io::Error {
     )
 }
 
-/// `ls /containers/<name>/proc[/<pid>]`.
+/// `ls /containers/<name>/proc[/<pid>]` — writes the listing to stdout.
 #[cfg(target_os = "linux")]
 pub fn ls(ctx: &Ctx<'_>, name: &str, subpath: &str) -> io::Result<ExitCode> {
+    let out = ls_bytes(ctx, name, subpath)?;
+    io::stdout().write_all(&out)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The listing `ls` would print — shared with the serve daemon, which captures
+/// it for the wire (reading a proc DIRECTORY over `/peers/`).
+#[cfg(target_os = "linux")]
+pub fn ls_bytes(ctx: &Ctx<'_>, name: &str, subpath: &str) -> io::Result<Vec<u8>> {
     let _ = ctx.state.open_container(name)?; // validate the container exists
     let sub = subpath.trim_matches('/');
+    let mut out = Vec::new();
     if sub.is_empty() {
         // The proc directory: one entry per live process (full enumeration).
         for pid in container_pids(ctx, name)? {
-            println!("{}/", pid);
+            writeln!(out, "{}/", pid)?;
         }
-        return Ok(ExitCode::SUCCESS);
+        return Ok(out);
     }
     // A specific process directory: list its files (O(1) membership check).
     let pid: u32 = sub
@@ -170,15 +180,25 @@ pub fn ls(ctx: &Ctx<'_>, name: &str, subpath: &str) -> io::Result<ExitCode> {
         return Err(not_in_container(name, pid));
     }
     for f in PROC_FILES {
-        println!("{}", f);
+        writeln!(out, "{}", f)?;
     }
-    println!("{}", PROC_CTL);
+    writeln!(out, "{}", PROC_CTL)?;
+    Ok(out)
+}
+
+/// `cat /containers/<name>/proc/<pid>/<file>` — writes the file to stdout.
+#[cfg(target_os = "linux")]
+pub fn cat(ctx: &Ctx<'_>, name: &str, subpath: &str) -> io::Result<ExitCode> {
+    let bytes = cat_bytes(ctx, name, subpath)?;
+    io::stdout().write_all(&bytes)?;
     Ok(ExitCode::SUCCESS)
 }
 
-/// `cat /containers/<name>/proc/<pid>/<file>`.
+/// The bytes `cat` would print — shared with the serve daemon, which captures
+/// them for the wire (`cat /peers/<node>/containers/<name>/proc/<pid>/<file>`)
+/// instead of writing to stdout.
 #[cfg(target_os = "linux")]
-pub fn cat(ctx: &Ctx<'_>, name: &str, subpath: &str) -> io::Result<ExitCode> {
+pub fn cat_bytes(ctx: &Ctx<'_>, name: &str, subpath: &str) -> io::Result<Vec<u8>> {
     let _ = ctx.state.open_container(name)?; // validate the container exists
     let sub = subpath.trim_matches('/');
     if sub.is_empty() {
@@ -240,8 +260,7 @@ pub fn cat(ctx: &Ctx<'_>, name: &str, subpath: &str) -> io::Result<ExitCode> {
     if pid_ns_inode(pid) != Some(ns_before) {
         return Err(not_in_container(name, pid));
     }
-    io::stdout().write_all(&bytes)?;
-    Ok(ExitCode::SUCCESS)
+    Ok(bytes)
 }
 
 /// `write /containers/<name>/proc/<pid>/ctl "<signal>"` — signal a process in
@@ -317,7 +336,17 @@ pub fn ls(_ctx: &Ctx<'_>, _name: &str, _subpath: &str) -> io::Result<ExitCode> {
 }
 
 #[cfg(not(target_os = "linux"))]
+pub fn ls_bytes(_ctx: &Ctx<'_>, _name: &str, _subpath: &str) -> io::Result<Vec<u8>> {
+    Err(proc_needs_runtime())
+}
+
+#[cfg(not(target_os = "linux"))]
 pub fn cat(_ctx: &Ctx<'_>, _name: &str, _subpath: &str) -> io::Result<ExitCode> {
+    Err(proc_needs_runtime())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn cat_bytes(_ctx: &Ctx<'_>, _name: &str, _subpath: &str) -> io::Result<Vec<u8>> {
     Err(proc_needs_runtime())
 }
 

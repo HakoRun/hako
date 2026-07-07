@@ -179,6 +179,8 @@ hako peer ping prod               # reachability + identity check
 hako peer push prod main          # replicate a branch (only missing chunks travel)
 hako peer fetch prod main         # ...and the pull half
 hako cat /peers/prod/containers/app/status    # read a remote container's status
+hako cat /peers/prod/containers/app/proc      # list the workload's live processes
+hako cat /peers/prod/containers/app/proc/1/status   # …and inspect one
 hako write /peers/prod/containers/app/ctl "commit -m nightly"   # remote control verb
 ```
 

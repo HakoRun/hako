@@ -305,15 +305,46 @@ fn handle_peer(
 /// Serve a meta-fs read. For now: a container's `status` readout (the bytes
 /// `cat /containers/<name>/status` would print locally).
 fn meta_read(ctx: &Ctx<'_>, path: &str) -> io::Result<Vec<u8>> {
+    use crate::cmd::proc_meta;
     use hako::RouteTarget;
     match RouteTarget::parse(path) {
         RouteTarget::Container { name, path: sub } if sub.is_empty() || sub == "status" => {
             let repo = ctx.state.open_container(&name)?;
             crate::helpers::render_container_status(&repo, &name)
         }
+        // A container's live process tree: `proc/` and `proc/<pid>` are
+        // directories (list them), `proc/<pid>/<file>` is a file (read it). The
+        // read is host-`/proc` scoped to the container's PID namespace — host
+        // processes and `mem` are never exposed (see `proc_meta`). Served to any
+        // registered peer, like `status`; per-peer scoping comes with P2-1.
+        RouteTarget::Container { name, path: sub } if proc_meta::proc_subpath(&sub).is_some() => {
+            let procsub = proc_meta::proc_subpath(&sub).unwrap();
+            if procsub.contains('/') {
+                // `cmdline` carries a process's args, which routinely hold
+                // secrets (tokens, passwords). Withhold it over the wire until
+                // per-peer capabilities (P2-1) can scope who may read it — the
+                // rest of proc (pids, status, comm) stays available. Locally
+                // (`hako cat /containers/…/proc/<pid>/cmdline`) it is unaffected.
+                let file = procsub
+                    .trim_matches('/')
+                    .split_once('/')
+                    .map(|(_, f)| f)
+                    .unwrap_or("");
+                if file == "cmdline" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "proc/<pid>/cmdline is not served remotely (it can leak secrets \
+                         in process args); per-peer scoping for it lands with P2-1",
+                    ));
+                }
+                proc_meta::cat_bytes(ctx, &name, procsub)
+            } else {
+                proc_meta::ls_bytes(ctx, &name, procsub)
+            }
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            format!("cannot serve {path} remotely yet (only container status)"),
+            format!("cannot serve {path} remotely yet (container status and proc/ only)"),
         )),
     }
 }
@@ -846,6 +877,23 @@ mod tests {
             workdir,
             cfg,
         }
+    }
+
+    #[test]
+    fn meta_read_withholds_proc_cmdline_but_not_other_proc_files() {
+        use hako::{Config, Session};
+        let (dir, state, _id) = setup_node();
+        let (sess, cfg) = (Session::default(), Config::default());
+        let c = ctx(&state, &sess, &cfg, "hako", dir.path());
+        // cmdline is refused up front (before any pid lookup) — its args can
+        // hold secrets, so it isn't served remotely until P2-1 capabilities.
+        let err = meta_read(&c, "/containers/hako/proc/1/cmdline").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        // A different proc file is NOT refused for the same reason — it gets to
+        // the pid lookup (which, with nothing running here, fails as NotFound).
+        // The point is it's not the cmdline PermissionDenied.
+        let other = meta_read(&c, "/containers/hako/proc/1/status").unwrap_err();
+        assert_ne!(other.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]
