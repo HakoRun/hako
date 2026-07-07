@@ -279,6 +279,15 @@ Then `hako push prod main` rolls prod back FF-safely, and history records it.
 
 ### P1-3 — Remote stop / proc / logs (the deploy-loop sliver)
 
+> **Partially landed:** the **observe** half — remote `proc/` reads — ships:
+> `meta_read` now serves `proc/` (list pids) and `proc/<pid>/{status,comm,cmdline}`
+> (`proc_meta::{ls_bytes,cat_bytes}`, reused by both the CLI and the daemon), so
+> `hako cat /peers/<node>/containers/<name>/proc/…` works. Read-only, PID-ns
+> scoped (no host procs, no `mem`), served to any registered peer like `status`.
+> **Remaining (ship with P2-1 capabilities — the secret-leak risk below):** remote
+> `proc/<pid>/ctl` stop/signal (`meta_write` widening), and instance logs as a
+> bounded tail window over the control plane.
+
 **Problem.** You can remotely *start* but not *stop* or *observe*. `meta_read`
 serves only `status`; `meta_write` only container `ctl`; the stop path is
 instance-addressed and local-only; you can't even find a remote pid. Logs live at

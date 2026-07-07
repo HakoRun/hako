@@ -305,15 +305,29 @@ fn handle_peer(
 /// Serve a meta-fs read. For now: a container's `status` readout (the bytes
 /// `cat /containers/<name>/status` would print locally).
 fn meta_read(ctx: &Ctx<'_>, path: &str) -> io::Result<Vec<u8>> {
+    use crate::cmd::proc_meta;
     use hako::RouteTarget;
     match RouteTarget::parse(path) {
         RouteTarget::Container { name, path: sub } if sub.is_empty() || sub == "status" => {
             let repo = ctx.state.open_container(&name)?;
             crate::helpers::render_container_status(&repo, &name)
         }
+        // A container's live process tree: `proc/` and `proc/<pid>` are
+        // directories (list them), `proc/<pid>/<file>` is a file (read it). The
+        // read is host-`/proc` scoped to the container's PID namespace — host
+        // processes and `mem` are never exposed (see `proc_meta`). Served to any
+        // registered peer, like `status`; per-peer scoping comes with P2-1.
+        RouteTarget::Container { name, path: sub } if proc_meta::proc_subpath(&sub).is_some() => {
+            let procsub = proc_meta::proc_subpath(&sub).unwrap();
+            if procsub.contains('/') {
+                proc_meta::cat_bytes(ctx, &name, procsub)
+            } else {
+                proc_meta::ls_bytes(ctx, &name, procsub)
+            }
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            format!("cannot serve {path} remotely yet (only container status)"),
+            format!("cannot serve {path} remotely yet (container status and proc/ only)"),
         )),
     }
 }
