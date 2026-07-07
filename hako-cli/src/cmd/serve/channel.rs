@@ -132,15 +132,17 @@ impl<S: Read + Write> NoiseChannel<S> {
 // ---------------------------------------------------------------------------
 
 /// Server (Noise IK responder). Reads the initiator's first message — which
-/// carries its static key encrypted to us — hands that key to `authorized` (a
-/// registered peer?), replies, and upgrades to the encrypted transport. The
-/// static passed to `authorized` is the peer's **X25519** key; the registry
-/// stores Ed25519, so the caller compares against the converted form.
-pub(crate) fn handshake_as_server<S: Read + Write>(
+/// carries its static key encrypted to us — hands that key to `authorize`,
+/// replies, and upgrades to the encrypted transport. The static passed to
+/// `authorize` is the peer's **X25519** key; the registry stores Ed25519, so the
+/// caller compares against the converted form. `authorize` returns `Some(info)`
+/// for a registered peer (e.g. its capability `Role`) or `None` to reject; the
+/// info is handed back so the caller can gate the connection by it.
+pub(crate) fn handshake_as_server<S: Read + Write, T>(
     mut stream: S,
     id: &identity::Identity,
-    authorized: impl Fn(&[u8; 32]) -> bool,
-) -> io::Result<NoiseChannel<S>> {
+    authorize: impl Fn(&[u8; 32]) -> Option<T>,
+) -> io::Result<(NoiseChannel<S>, T)> {
     // `snow::Builder` borrows the secret, so keep it in a local until `build_*`
     // copies it into the handshake state.
     let params = NOISE_PARAMS.parse().map_err(noise_err)?;
@@ -159,16 +161,16 @@ pub(crate) fn handshake_as_server<S: Read + Write>(
         .get_remote_static()
         .and_then(|s| s.try_into().ok())
         .ok_or_else(|| invalid("handshake: missing client static"))?;
-    if !authorized(&rs) {
+    let Some(info) = authorize(&rs) else {
         return Err(denied("client is not a registered peer"));
-    }
+    };
 
     // msg2 (responder → initiator): e, ee, se.
     let n = hs.write_message(&[], &mut buf).map_err(noise_err)?;
     write_frame(&mut stream, &buf[..n])?;
 
     let transport = hs.into_transport_mode().map_err(noise_err)?;
-    Ok(NoiseChannel { stream, transport })
+    Ok((NoiseChannel { stream, transport }, info))
 }
 
 /// Client (Noise IK initiator). `expected` is the server's registered Ed25519
@@ -253,7 +255,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || -> io::Result<Vec<u8>> {
             let (s, _) = listener.accept().unwrap();
-            let mut ch = handshake_as_server(s, &server_id, move |x| *x == client_x)?;
+            let (mut ch, ()) =
+                handshake_as_server(s, &server_id, move |x| (*x == client_x).then_some(()))?;
             let greeting = ch.recv()?; // decrypt the client's first message
             ch.send(b"pong")?; // reply over the same encrypted channel
             Ok(greeting)
@@ -284,7 +287,7 @@ mod tests {
         // rejects it, and hangs up without completing the handshake.
         let server = std::thread::spawn(move || {
             let (s, _) = listener.accept().unwrap();
-            handshake_as_server(s, &server_id, |_| false).map(|_| ())
+            handshake_as_server(s, &server_id, |_: &[u8; 32]| None::<()>).map(|_| ())
         });
         let stream = TcpStream::connect(addr).unwrap();
         let client_result = handshake_as_client(stream, &client_id, &server_vk);
@@ -308,7 +311,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (s, _) = listener.accept().unwrap();
-            handshake_as_server(s, &server_id, move |x| *x == client_x).unwrap()
+            handshake_as_server(s, &server_id, move |x| (*x == client_x).then_some(()))
+                .unwrap()
+                .0
         });
         let stream = TcpStream::connect(addr).unwrap();
         let mut client_ch = handshake_as_client(stream, &client_id, &server_vk).unwrap();
@@ -358,7 +363,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (s, _) = listener.accept().unwrap();
-            handshake_as_server(s, &server_id, move |x| *x == client_x).unwrap()
+            handshake_as_server(s, &server_id, move |x| (*x == client_x).then_some(()))
+                .unwrap()
+                .0
         });
         let stream = TcpStream::connect(addr).unwrap();
         let mut client_ch = handshake_as_client(stream, &client_id, &server_vk).unwrap();
@@ -402,7 +409,8 @@ mod tests {
 
         let (s, c) = UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || -> io::Result<Vec<u8>> {
-            let mut ch = handshake_as_server(s, &server_id, move |x| *x == client_x)?;
+            let (mut ch, ()) =
+                handshake_as_server(s, &server_id, move |x| (*x == client_x).then_some(()))?;
             let greeting = ch.recv()?;
             ch.send(b"pong")?;
             Ok(greeting)

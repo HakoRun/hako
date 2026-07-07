@@ -83,9 +83,12 @@ network — this is the most underestimated piece, git's hardest problem):
   evolves static → mDNS → DHT; do not build the DHT first).
 - **Mutual auth + encryption** via a Noise IK handshake (built — see "Current
   posture" below).
-- **Per-peer capability** — read-only telemetry vs. `ctl`-control vs. data-sync.
-  A `ctl`-capable peer can run code on you; this is a real trust grant and needs
-  a real (not sketched) capability + revocation model.
+- **Per-peer capability (built — P2-1).** Each peer has a `role` in `peers.toml`:
+  `read` (telemetry: status/proc/fetch) < `sync` (+ push/replicate + VC ctl) <
+  `deploy` (+ run code). The handshake learns the connecting peer's role and the
+  daemon gates every request by it; revocation is editing `peers.toml`. A
+  `deploy`-capable peer can run code on you — a real trust grant, now explicit
+  per peer rather than node-wide.
 - **Bootstrapping** (how two nodes first trust each other — out-of-band key
   exchange vs. TOFU) is a genuine security+UX problem, not an afterthought.
 

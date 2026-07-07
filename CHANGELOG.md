@@ -7,6 +7,18 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches a release.
 ## [Unreleased]
 
 ### Added
+- **Per-peer capabilities (`--features cluster`):** each peer in `peers.toml` now
+  carries a `role` — `read` (observe: status/proc/fetch), `sync` (default; also
+  push/replicate + the version-control `ctl` verbs), or `deploy` (also run code:
+  `ctl run` and the push-to-deploy hook). `hako peer add … --role <r>` sets it;
+  the Noise handshake learns the connecting peer's role and the daemon gates
+  every request by it, so you can register a read-only monitor, a replication
+  peer, and a deploy peer instead of all-or-nothing trust. `deploy` operations
+  still ALSO require the node's `--allow-remote-run`/`--allow-deploy` master
+  switch. **Migration:** a peer with no `role` decodes to `sync` (the prior
+  push/replicate behaviour); but `ctl run` and deploy-on-push now need the pusher
+  to hold `deploy`, so grant it explicitly (`--role deploy`) where you relied on
+  `--allow-remote-run` alone.
 - **Remote process inspection (`--features cluster`):** the daemon now serves a
   container's live process tree over the control plane, so
   `hako cat /peers/<node>/containers/<name>/proc` lists the running pids and

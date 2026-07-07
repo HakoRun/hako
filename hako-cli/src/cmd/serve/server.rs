@@ -188,13 +188,11 @@ fn handle_peer(
     deploy_on: bool,
 ) -> io::Result<()> {
     set_io_timeouts(&stream)?;
-    // Authorize the initiator's Noise (X25519) static against the registry, which
-    // stores Ed25519 — compare against the converted form.
-    let mut ch = handshake_as_server(stream, id, |x| {
-        peers::registered_x25519(ctx)
-            .map(|ks| ks.contains(x))
-            .unwrap_or(false)
-    })?;
+    // Authorize the initiator's Noise (X25519) static against the registry (which
+    // stores Ed25519 — compared as the converted form) AND learn its capability
+    // role in one step: the handshake rejects an unregistered peer and hands back
+    // the registered peer's `Role`, which gates every request below.
+    let (mut ch, role) = handshake_as_server(stream, id, |x| peers::role_for_x25519(ctx, x))?;
     // A push (SYNC_HAVE -> PUT... -> REF) holds the daemon mutation lock (in-process
     // mutex + workspace flock, see `lock_daemon`) across the whole unit, so a
     // concurrent `gc` can't sweep objects between the HAVE that vouches they are
@@ -214,6 +212,29 @@ fn handle_peer(
         let Some((&tag, payload)) = req.split_first() else {
             return Ok(());
         };
+        // Capability gate (P2-1): reject the request up front — before any work or
+        // locking — if the peer's role is too low. Reads (status/proc/fetch) need
+        // `read`; pushes/ref-moves and ctl need `sync`; `ctl run` additionally
+        // needs `deploy` (checked in `meta_write`). A denial isn't a protocol
+        // violation, so the connection stays open for what the peer IS allowed.
+        let needed = match tag {
+            TAG_META_READ | TAG_SYNC_WANT | TAG_SYNC_GET => peers::Role::Read,
+            TAG_SYNC_HAVE | TAG_SYNC_PUT | TAG_SYNC_REF | TAG_META_WRITE => peers::Role::Sync,
+            _ => peers::Role::Read, // unknown tag → dispatched to an error below
+        };
+        if !role.allows(needed) {
+            let mut r = vec![RESP_ERR];
+            r.extend_from_slice(
+                format!(
+                    "peer role '{}' lacks the '{}' capability for this request",
+                    role.as_str(),
+                    needed.as_str()
+                )
+                .as_bytes(),
+            );
+            ch.send(&r)?;
+            continue;
+        }
         // While a push session holds the mutation lock, only that push's own
         // frames (HAVE/PUT/REF) are legal. Any other frame is a protocol
         // violation — and a `META_WRITE` ctl verb here would re-enter
@@ -241,7 +262,7 @@ fn handle_peer(
             TAG_META_READ => std::str::from_utf8(payload)
                 .map_err(|_| invalid("request path is not UTF-8"))
                 .and_then(|path| meta_read(ctx, path)),
-            TAG_META_WRITE => meta_write(ctx, payload, allow_remote_run),
+            TAG_META_WRITE => meta_write(ctx, payload, allow_remote_run, role),
             TAG_SYNC_HAVE => sync_have(ctx, payload),
             TAG_SYNC_PUT => sync_put(ctx, payload),
             TAG_SYNC_REF => sync_ref(ctx, payload).map(|u| {
@@ -263,8 +284,10 @@ fn handle_peer(
             // Push-to-deploy (P1-1): with the mutation lock dropped (spawning a
             // container must not hold it, #78) and the ref durable, if this update
             // actually ADVANCED the node's deploy target, reconcile the workload
-            // and append the deploy log to the push response.
-            if deploy_on && ref_advanced {
+            // and append the deploy log to the push response. The deploy hook runs
+            // code, so it needs the pusher to hold the `deploy` capability (P2-1),
+            // on top of the node's `--allow-deploy` master switch (`deploy_on`).
+            if deploy_on && ref_advanced && role.allows(peers::Role::Deploy) {
                 if let (Ok(bytes), Some(deploy)) = (&mut result, &ctx.cfg.deploy) {
                     if let Ok((container, branch)) = parse_ref_target(payload) {
                         if super::deploy::matches(deploy, container, branch) {
@@ -381,7 +404,12 @@ fn lock_daemon(ctx: &Ctx<'_>) -> io::Result<DaemonLock> {
 /// Serve a meta-fs write. Payload is `[path_len: u32 BE][path][body]`. For now:
 /// a container `ctl` verb (run/commit/branch/tag), dispatched on this node with
 /// its output captured and returned.
-fn meta_write(ctx: &Ctx<'_>, payload: &[u8], allow_remote_run: bool) -> io::Result<Vec<u8>> {
+fn meta_write(
+    ctx: &Ctx<'_>,
+    payload: &[u8],
+    allow_remote_run: bool,
+    role: peers::Role,
+) -> io::Result<Vec<u8>> {
     use hako::RouteTarget;
     let plen = u32::from_be_bytes(first_array::<4>(payload, "malformed write request")?) as usize;
     let rest = &payload[4..];
@@ -393,21 +421,30 @@ fn meta_write(ctx: &Ctx<'_>, payload: &[u8], allow_remote_run: bool) -> io::Resu
     let body = &rest[plen..];
     match RouteTarget::parse(path) {
         RouteTarget::Container { name, path: sub } if sub == "ctl" => {
-            // Gate remote command execution. The `run` verb spawns an arbitrary
-            // command in a container on THIS node, so it is refused unless the
-            // operator opted in with `hako serve --allow-remote-run` — otherwise a
-            // registered peer would get code execution here by default (issue #40).
-            // The other ctl verbs (commit/branch/tag) only touch this node's own
-            // version-control state and stay available.
+            // Gate remote command execution two ways. The `run` verb spawns an
+            // arbitrary command in a container on THIS node, so it needs BOTH the
+            // node's `--allow-remote-run` master switch AND the peer's `deploy`
+            // capability (P2-1) — otherwise a registered peer would get code
+            // execution here (issue #40). The other ctl verbs (commit/branch/tag)
+            // only touch this node's own version-control state and need just
+            // `sync` (already checked by the caller's role gate).
             let verb = std::str::from_utf8(body)
                 .ok()
                 .and_then(|s| s.split_whitespace().next())
                 .unwrap_or("");
-            if verb == "run" && !allow_remote_run {
-                return Err(denied(
-                    "remote `ctl run` is disabled on this node; \
-                     start it with `hako serve --allow-remote-run` to permit it",
-                ));
+            if verb == "run" {
+                if !allow_remote_run {
+                    return Err(denied(
+                        "remote `ctl run` is disabled on this node; \
+                         start it with `hako serve --allow-remote-run` to permit it",
+                    ));
+                }
+                if !role.allows(peers::Role::Deploy) {
+                    return Err(denied(
+                        "remote `ctl run` needs the `deploy` capability; \
+                         grant it with `hako peer add … --role deploy`",
+                    ));
+                }
             }
             // Serialize ref-mutating verbs (commit/branch/tag) against local
             // commands and other daemon threads with the daemon mutation lock, but
@@ -835,15 +872,38 @@ mod tests {
             p
         };
 
-        // `run` is refused when remote-run is disabled (the default), before any
-        // spawn is attempted.
-        let err = meta_write(&ctx, &enc("/containers/hako/ctl", "run echo hi"), false).unwrap_err();
+        // `run` is refused when the node's remote-run master switch is off, even
+        // for a peer that HAS the deploy capability — before any spawn.
+        let err = meta_write(
+            &ctx,
+            &enc("/containers/hako/ctl", "run echo hi"),
+            false,
+            peers::Role::Deploy,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
 
-        // A non-`run` verb is not gated — it only touches this node's local VC
-        // state (a clean tree yields "nothing to commit", still a non-error
-        // dispatch, so the request itself is served).
-        assert!(meta_write(&ctx, &enc("/containers/hako/ctl", "commit msg"), false).is_ok());
+        // ...and refused when the switch is ON but the peer lacks `deploy`.
+        let err = meta_write(
+            &ctx,
+            &enc("/containers/hako/ctl", "run echo hi"),
+            true,
+            peers::Role::Sync,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("deploy"));
+
+        // A non-`run` verb is not gated by run's switch/capability — it only
+        // touches this node's local VC state (a clean tree yields "nothing to
+        // commit", still a non-error dispatch, so the request itself is served).
+        assert!(meta_write(
+            &ctx,
+            &enc("/containers/hako/ctl", "commit msg"),
+            false,
+            peers::Role::Sync
+        )
+        .is_ok());
     }
 
     // ---------------------------------------------------------------------
@@ -925,8 +985,22 @@ mod tests {
 
         // Mutual registration: server authorizes the client's key; client knows
         // the server's address + key.
-        peers::add(&a_ctx, "client".into(), "unused".into(), b_id.node_id()).unwrap();
-        peers::add(&b_ctx, "server".into(), addr, a_id.node_id()).unwrap();
+        peers::add(
+            &a_ctx,
+            "client".into(),
+            "unused".into(),
+            b_id.node_id(),
+            peers::Role::Sync,
+        )
+        .unwrap();
+        peers::add(
+            &b_ctx,
+            "server".into(),
+            addr,
+            a_id.node_id(),
+            peers::Role::Sync,
+        )
+        .unwrap();
 
         std::thread::scope(|s| {
             let server = s.spawn(|| {
@@ -975,8 +1049,22 @@ mod tests {
         let (b_sess, b_cfg) = (Session::default(), Config::default());
         let b_ctx = ctx(&b_state, &b_sess, &b_cfg, "app", b_dir.path());
 
-        peers::add(&a_ctx, "client".into(), "unused".into(), b_id.node_id()).unwrap();
-        peers::add(&b_ctx, "server".into(), addr, a_id.node_id()).unwrap();
+        peers::add(
+            &a_ctx,
+            "client".into(),
+            "unused".into(),
+            b_id.node_id(),
+            peers::Role::Sync,
+        )
+        .unwrap();
+        peers::add(
+            &b_ctx,
+            "server".into(),
+            addr,
+            a_id.node_id(),
+            peers::Role::Sync,
+        )
+        .unwrap();
 
         std::thread::scope(|s| {
             let server = s.spawn(|| {
@@ -1017,8 +1105,22 @@ mod tests {
         let (b_sess, b_cfg) = (Session::default(), Config::default());
         let b_ctx = ctx(&b_state, &b_sess, &b_cfg, "hako", b_dir.path());
 
-        peers::add(&a_ctx, "client".into(), "unused".into(), b_id.node_id()).unwrap();
-        peers::add(&b_ctx, "server".into(), addr, a_id.node_id()).unwrap();
+        peers::add(
+            &a_ctx,
+            "client".into(),
+            "unused".into(),
+            b_id.node_id(),
+            peers::Role::Sync,
+        )
+        .unwrap();
+        peers::add(
+            &b_ctx,
+            "server".into(),
+            addr,
+            a_id.node_id(),
+            peers::Role::Sync,
+        )
+        .unwrap();
 
         std::thread::scope(|s| {
             let server = s.spawn(|| {
@@ -1066,8 +1168,22 @@ mod tests {
         let (b_sess, b_cfg) = (Session::default(), Config::default());
         let b_ctx = ctx(&b_state, &b_sess, &b_cfg, "hako", b_dir.path());
 
-        peers::add(&a_ctx, "client".into(), "unused".into(), b_id.node_id()).unwrap();
-        peers::add(&b_ctx, "server".into(), addr, a_id.node_id()).unwrap();
+        peers::add(
+            &a_ctx,
+            "client".into(),
+            "unused".into(),
+            b_id.node_id(),
+            peers::Role::Sync,
+        )
+        .unwrap();
+        peers::add(
+            &b_ctx,
+            "server".into(),
+            addr,
+            a_id.node_id(),
+            peers::Role::Sync,
+        )
+        .unwrap();
 
         std::thread::scope(|s| {
             // Server started WITHOUT --allow-remote-run (the false arg).
@@ -1107,8 +1223,22 @@ mod tests {
         let (b_sess, b_cfg) = (Session::default(), Config::default());
         let b_ctx = ctx(&b_state, &b_sess, &b_cfg, "hako", b_dir.path());
 
-        peers::add(&a_ctx, "client".into(), "unused".into(), b_id.node_id()).unwrap();
-        peers::add(&b_ctx, "server".into(), addr, a_id.node_id()).unwrap();
+        peers::add(
+            &a_ctx,
+            "client".into(),
+            "unused".into(),
+            b_id.node_id(),
+            peers::Role::Sync,
+        )
+        .unwrap();
+        peers::add(
+            &b_ctx,
+            "server".into(),
+            addr,
+            a_id.node_id(),
+            peers::Role::Sync,
+        )
+        .unwrap();
 
         std::thread::scope(|s| {
             let server = s.spawn(|| {
@@ -1139,6 +1269,78 @@ mod tests {
                 resp.first().copied(),
                 Some(RESP_ERR),
                 "interleaving a ctl write into a push must be refused"
+            );
+            drop(ch);
+            server.join().unwrap().expect("server handled the peer");
+        });
+    }
+
+    #[test]
+    fn read_role_peer_can_observe_but_not_push() {
+        use hako::{Config, Session};
+
+        // The server registers the client with the READ capability: it may read
+        // (status), but a push (SYNC_HAVE) must be refused with a capability error
+        // — the P2-1 per-peer gate, end to end through the real handshake.
+        let (a_dir, a_state, a_id) = setup_node(); // server
+        let (b_dir, b_state, b_id) = setup_node(); // client
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let (a_sess, a_cfg) = (Session::default(), Config::default());
+        let a_ctx = ctx(&a_state, &a_sess, &a_cfg, "hako", a_dir.path());
+        let (b_sess, b_cfg) = (Session::default(), Config::default());
+        let b_ctx = ctx(&b_state, &b_sess, &b_cfg, "hako", b_dir.path());
+
+        peers::add(
+            &a_ctx,
+            "client".into(),
+            "unused".into(),
+            b_id.node_id(),
+            peers::Role::Read, // read-only
+        )
+        .unwrap();
+        peers::add(
+            &b_ctx,
+            "server".into(),
+            addr,
+            a_id.node_id(),
+            peers::Role::Sync,
+        )
+        .unwrap();
+
+        std::thread::scope(|s| {
+            let server = s.spawn(|| {
+                let (stream, _) = listener.accept().unwrap();
+                handle_peer(stream, &a_id, &a_ctx, false, false)
+            });
+            let peer = peers::lookup(&b_ctx, "server")
+                .unwrap()
+                .expect("registered");
+            let mut ch = connect_and_handshake(&b_ctx, &peer).unwrap();
+
+            // A read (status) is allowed for the read role.
+            let mut req = vec![TAG_META_READ];
+            req.extend_from_slice(b"/containers/hako/status");
+            ch.send(&req).unwrap();
+            assert_eq!(
+                ch.recv().unwrap().first().copied(),
+                Some(RESP_OK),
+                "a read-role peer may read status"
+            );
+
+            // A push (SYNC_HAVE) is refused — the read role lacks `sync`.
+            ch.send(&[TAG_SYNC_HAVE]).unwrap();
+            let resp = ch.recv().unwrap();
+            assert_eq!(
+                resp.first().copied(),
+                Some(RESP_ERR),
+                "a read-role peer must not be able to push"
+            );
+            assert!(
+                String::from_utf8_lossy(&resp[1..]).contains("sync"),
+                "the refusal should name the missing capability"
             );
             drop(ch);
             server.join().unwrap().expect("server handled the peer");
