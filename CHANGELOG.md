@@ -21,8 +21,17 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches a release.
   `--allow-deploy` and a `[deploy]` table. A restart re-launches the pinned tree,
   so `hako revert` + re-push rolls a deploy back. Config-only nodes are now
   first-class: a `hako.toml` that is *just* a `[deploy]` table no longer requires
-  an `image`. Follow-ups: health-gate + auto-rollback, and `-p` port publishing
-  (a `network = "host"` deploy serves on host ports meanwhile).
+  an `image`.
+  - **Health-gate + auto-rollback.** After starting the new workload the daemon
+    watches it for `grace_secs`; if it crash-loops (the supervisor respawns it
+    within the window), the deploy **rolls the running workload back to the
+    previous commit's tree** — the last-known-good, still in the store — while the
+    ref stays at the new tip for the operator to fix-forward or `revert`. So a
+    push of a tree that won't boot keeps the service serving the old version
+    instead of thrashing. The deploy log reports `healthy` or
+    `UNHEALTHY … rolled back to <commit>`.
+  - Follow-up: `-p` port publishing (a `network = "host"` deploy serves on host
+    ports meanwhile).
 
 ### Changed
 - **The `hako serve` daemon is now concurrent (`--features cluster`):** one

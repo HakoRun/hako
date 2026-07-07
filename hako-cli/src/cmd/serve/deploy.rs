@@ -11,9 +11,10 @@
 
 use crate::cmd::Ctx;
 use crate::DOT_HAKO;
-use hako::DeployConfig;
+use hako::{DeployConfig, Hash};
 use hako_runtime::{instances, Network, RestartPolicy, VolumeMount};
 use std::fmt::Write as _;
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -29,10 +30,12 @@ pub fn matches(deploy: &DeployConfig, container: &str, branch: &str) -> bool {
 }
 
 /// Reconcile the workload for a deploy target whose branch just advanced: stop
-/// the old instance(s), then start a new one at the branch's new tip. Returns a
+/// the old instance(s), start a new one at the branch's new tip, and health-gate
+/// it — if the new tree fails to boot (crash-loops within `grace_secs`), roll
+/// back to `prev`'s tree (the last-known-good, still in the store). Returns a
 /// human-readable log (appended to the push response). Never panics — every
 /// failure is reported in the log, so a botched deploy still answers the pusher.
-pub fn reconcile(ctx: &Ctx<'_>, deploy: &DeployConfig) -> String {
+pub fn reconcile(ctx: &Ctx<'_>, deploy: &DeployConfig, prev: Option<Hash>) -> String {
     // Serialize against a concurrent reconcile to the same node.
     let _guard = DEPLOY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let runtime_root = ctx.workdir.join(DOT_HAKO);
@@ -119,22 +122,99 @@ pub fn reconcile(ctx: &Ctx<'_>, deploy: &DeployConfig) -> String {
         );
     }
 
-    match hako_runtime::transform::run_container_detached(
+    // Start the new workload at the branch's new tip.
+    let new_id = match hako_runtime::transform::run_container_detached(
         &repo,
         &deploy.branch,
-        Some(command),
+        Some(command.clone()),
         &volumes,
         network,
         RestartPolicy::Always,
     ) {
         Ok(id) => {
             let _ = write!(log, "\n  started {} (restart=always)", short(&id));
+            id
         }
         Err(e) => {
             let _ = write!(log, "\n  FAILED to start: {e}");
+            return log;
+        }
+    };
+
+    // Health-gate: a boot failure shows up as the supervisor respawning the
+    // workload (restart_count > 0) within grace_secs; a healthy first attempt
+    // survives the whole window.
+    if health_gate(&runtime_root, &new_id, deploy.grace_secs) {
+        let _ = write!(log, "\n  healthy ({}s, no restarts)", deploy.grace_secs);
+        return log;
+    }
+    let _ = write!(
+        log,
+        "\n  UNHEALTHY: crash-looped within {}s — rolling back",
+        deploy.grace_secs
+    );
+    // Stop the crash-looping new instance before launching the rollback.
+    let _ = instances::stop(&runtime_root, &new_id, true);
+    let _ = instances::remove(&runtime_root, &new_id, true);
+
+    // Roll the RUNNING workload back to the previous commit's tree (still in the
+    // store, immutable). The ref stays at the new (broken) tip — the operator
+    // fixes forward or `hako revert`s it — but the service keeps serving the
+    // last-known-good. Nothing to roll back to on a first deploy.
+    let Some(prev) = prev else {
+        let _ = write!(
+            log,
+            "\n  no previous version to roll back to — left stopped"
+        );
+        return log;
+    };
+    match repo.load_commit(&prev) {
+        Ok(commit) => match hako_runtime::transform::run_container_detached_at(
+            &repo,
+            &deploy.branch,
+            commit.tree,
+            Some(command),
+            &volumes,
+            network,
+            RestartPolicy::Always,
+        ) {
+            Ok(rid) => {
+                let _ = write!(
+                    log,
+                    "\n  rolled back to {} — started {}",
+                    &prev.to_hex()[..12],
+                    short(&rid)
+                );
+            }
+            Err(e) => {
+                let _ = write!(log, "\n  ROLLBACK FAILED to start previous tree: {e}");
+            }
+        },
+        Err(e) => {
+            let _ = write!(log, "\n  ROLLBACK FAILED to load previous commit: {e}");
         }
     }
     log
+}
+
+/// Watch a just-started supervised instance for `grace_secs`. Returns `true` if
+/// its first attempt stayed up the whole window (healthy); `false` as soon as the
+/// supervisor has respawned it (a crash → `restart_count > 0`) or it vanished — a
+/// boot failure, detected early so the rollback fires promptly.
+fn health_gate(runtime_root: &Path, id: &str, grace_secs: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(grace_secs);
+    loop {
+        match instances::get(runtime_root, id) {
+            Ok(inst) if inst.restart_count > 0 => return false,
+            Ok(inst) if !inst.is_running() && inst.exit_code.is_some() => return false,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+        if Instant::now() >= deadline {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 fn short(id: &str) -> &str {

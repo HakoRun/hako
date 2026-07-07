@@ -254,6 +254,23 @@ pub mod transform {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_container_detached_at(
+        _repo: &Repo<'_>,
+        _branch: &str,
+        _root: Hash,
+        _command: Option<Vec<String>>,
+        _volumes: &[crate::VolumeMount],
+        _network: crate::Network,
+        _restart: crate::RestartPolicy,
+    ) -> Result<String, RuntimeError> {
+        Err(RuntimeError::UnsupportedPlatform {
+            operation: "hako run -d",
+            hint: "Container transformation requires Linux. \
+                   On macOS/Windows, run hako inside a Linux VM.",
+        })
+    }
+
     pub fn run_detached_supervisor(
         _repo: &Repo<'_>,
         _workdir: &Path,

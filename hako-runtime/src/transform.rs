@@ -224,6 +224,24 @@ pub fn run_container_detached(
     // ref move can't change what the supervisor launches and validation errors
     // surface to the caller synchronously.
     let root = resolve_root(repo, branch)?;
+    run_container_detached_at(repo, branch, root, command, volumes, network, restart)
+}
+
+/// Like [`run_container_detached`], but pins an **explicit tree root** instead of
+/// resolving `branch`'s current tip. `branch` is still recorded (so `ps`/`proc`
+/// group the instance correctly), but the workload — and every restart — runs
+/// `root`. This is how a push-to-deploy health-gate rolls back: re-launch the
+/// previous commit's tree (still in the store, immutable) while the ref stays put.
+#[allow(clippy::too_many_arguments)]
+pub fn run_container_detached_at(
+    repo: &Repo<'_>,
+    branch: &str,
+    root: Hash,
+    command: Option<Vec<String>>,
+    volumes: &[VolumeMount],
+    network: Network,
+    restart: RestartPolicy,
+) -> Result<String, RuntimeError> {
     // Instance state lives at the WORKSPACE level (`<ws>/.hako/runtime`), the
     // same place the CLI's ps/exec/stop look — NOT under the per-container dir.
     let workdir = hako_dir(repo)?;
