@@ -320,6 +320,23 @@ fn meta_read(ctx: &Ctx<'_>, path: &str) -> io::Result<Vec<u8>> {
         RouteTarget::Container { name, path: sub } if proc_meta::proc_subpath(&sub).is_some() => {
             let procsub = proc_meta::proc_subpath(&sub).unwrap();
             if procsub.contains('/') {
+                // `cmdline` carries a process's args, which routinely hold
+                // secrets (tokens, passwords). Withhold it over the wire until
+                // per-peer capabilities (P2-1) can scope who may read it — the
+                // rest of proc (pids, status, comm) stays available. Locally
+                // (`hako cat /containers/…/proc/<pid>/cmdline`) it is unaffected.
+                let file = procsub
+                    .trim_matches('/')
+                    .split_once('/')
+                    .map(|(_, f)| f)
+                    .unwrap_or("");
+                if file == "cmdline" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "proc/<pid>/cmdline is not served remotely (it can leak secrets \
+                         in process args); per-peer scoping for it lands with P2-1",
+                    ));
+                }
                 proc_meta::cat_bytes(ctx, &name, procsub)
             } else {
                 proc_meta::ls_bytes(ctx, &name, procsub)
@@ -860,6 +877,23 @@ mod tests {
             workdir,
             cfg,
         }
+    }
+
+    #[test]
+    fn meta_read_withholds_proc_cmdline_but_not_other_proc_files() {
+        use hako::{Config, Session};
+        let (dir, state, _id) = setup_node();
+        let (sess, cfg) = (Session::default(), Config::default());
+        let c = ctx(&state, &sess, &cfg, "hako", dir.path());
+        // cmdline is refused up front (before any pid lookup) — its args can
+        // hold secrets, so it isn't served remotely until P2-1 capabilities.
+        let err = meta_read(&c, "/containers/hako/proc/1/cmdline").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        // A different proc file is NOT refused for the same reason — it gets to
+        // the pid lookup (which, with nothing running here, fails as NotFound).
+        // The point is it's not the cmdline PermissionDenied.
+        let other = meta_read(&c, "/containers/hako/proc/1/status").unwrap_err();
+        assert_ne!(other.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]

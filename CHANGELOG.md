@@ -10,11 +10,13 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches a release.
 - **Remote process inspection (`--features cluster`):** the daemon now serves a
   container's live process tree over the control plane, so
   `hako cat /peers/<node>/containers/<name>/proc` lists the running pids and
-  `…/proc/<pid>/{status,comm,cmdline}` reads them — the deploy operator's first
-  question ("what's running on prod?"), answered remotely. Read-only and scoped
-  to the container's PID namespace (host processes and `proc/<pid>/mem` are never
-  exposed), served to any registered peer like `status`; per-peer scoping and the
-  remote stop/signal + log-tail verbs come with the P2-1 capability work.
+  `…/proc/<pid>/{status,comm}` reads them — the deploy operator's first question
+  ("what's running on prod?"), answered remotely. Read-only and scoped to the
+  container's PID namespace (host processes and `proc/<pid>/mem` are never
+  exposed), served to any registered peer like `status`. `proc/<pid>/cmdline` is
+  **withheld remotely** (its args can hold secrets) until per-peer capabilities
+  can scope it; it still works locally. Per-peer scoping and the remote
+  stop/signal + log-tail verbs come with the P2-1 capability work.
 - **Push-to-deploy (`hako serve --allow-deploy`, `--features cluster`):** a node
   with a `[deploy]` table in its `hako.toml` reconciles a running workload when a
   push advances the tracked branch — it stops the old instance (graceful, then
