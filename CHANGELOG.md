@@ -25,10 +25,18 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches a release.
   `…/proc/<pid>/{status,comm}` reads them — the deploy operator's first question
   ("what's running on prod?"), answered remotely. Read-only and scoped to the
   container's PID namespace (host processes and `proc/<pid>/mem` are never
-  exposed), served to any registered peer like `status`. `proc/<pid>/cmdline` is
-  **withheld remotely** (its args can hold secrets) until per-peer capabilities
-  can scope it; it still works locally. Per-peer scoping and the remote
-  stop/signal + log-tail verbs come with the P2-1 capability work.
+  exposed), served to any registered peer like `status`.
+- **Remote process control (`--features cluster`):** the control plane now also
+  accepts a signal written to a remote container's process —
+  `hako write /peers/<node>/containers/<name>/proc/<pid>/ctl "stop"` (or `kill`,
+  `int`, `hup`, a raw number) reaches across and signals it, the write-side
+  counterpart to the `proc/` reads above. It is peer-triggered runtime control of
+  code on the target, so it takes the same two gates as `ctl run`: the node's
+  `--allow-remote-run` switch AND the peer's `deploy` capability; the signal is
+  bounded to the container's PID namespace (re-verified immediately before
+  sending). `proc/<pid>/cmdline`, previously withheld remotely, is now served to
+  `deploy` peers (already trusted to run code here, for whom a workload's args are
+  no new exposure) and still withheld from `read`/`sync` peers.
 - **Push-to-deploy (`hako serve --allow-deploy`, `--features cluster`):** a node
   with a `[deploy]` table in its `hako.toml` reconciles a running workload when a
   push advances the tracked branch — it stops the old instance (graceful, then
