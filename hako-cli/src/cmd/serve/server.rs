@@ -261,7 +261,7 @@ fn handle_peer(
         let mut result: io::Result<Vec<u8>> = match tag {
             TAG_META_READ => std::str::from_utf8(payload)
                 .map_err(|_| invalid("request path is not UTF-8"))
-                .and_then(|path| meta_read(ctx, path)),
+                .and_then(|path| meta_read(ctx, path, role)),
             TAG_META_WRITE => meta_write(ctx, payload, allow_remote_run, role),
             TAG_SYNC_HAVE => sync_have(ctx, payload),
             TAG_SYNC_PUT => sync_put(ctx, payload),
@@ -327,7 +327,7 @@ fn handle_peer(
 
 /// Serve a meta-fs read. For now: a container's `status` readout (the bytes
 /// `cat /containers/<name>/status` would print locally).
-fn meta_read(ctx: &Ctx<'_>, path: &str) -> io::Result<Vec<u8>> {
+fn meta_read(ctx: &Ctx<'_>, path: &str, role: peers::Role) -> io::Result<Vec<u8>> {
     use crate::cmd::proc_meta;
     use hako::RouteTarget;
     match RouteTarget::parse(path) {
@@ -339,25 +339,26 @@ fn meta_read(ctx: &Ctx<'_>, path: &str) -> io::Result<Vec<u8>> {
         // directories (list them), `proc/<pid>/<file>` is a file (read it). The
         // read is host-`/proc` scoped to the container's PID namespace — host
         // processes and `mem` are never exposed (see `proc_meta`). Served to any
-        // registered peer, like `status`; per-peer scoping comes with P2-1.
+        // registered peer with `read`, like `status`.
         RouteTarget::Container { name, path: sub } if proc_meta::proc_subpath(&sub).is_some() => {
             let procsub = proc_meta::proc_subpath(&sub).unwrap();
             if procsub.contains('/') {
                 // `cmdline` carries a process's args, which routinely hold
-                // secrets (tokens, passwords). Withhold it over the wire until
-                // per-peer capabilities (P2-1) can scope who may read it — the
-                // rest of proc (pids, status, comm) stays available. Locally
+                // secrets (tokens, passwords), so it is scoped to `deploy` peers
+                // — a peer already trusted to run code here, for whom a workload's
+                // args are no new exposure. `read`/`sync` peers get the rest of
+                // proc (pids, status, comm) but not this. Locally
                 // (`hako cat /containers/…/proc/<pid>/cmdline`) it is unaffected.
                 let file = procsub
                     .trim_matches('/')
                     .split_once('/')
                     .map(|(_, f)| f)
                     .unwrap_or("");
-                if file == "cmdline" {
+                if file == "cmdline" && !role.allows(peers::Role::Deploy) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
-                        "proc/<pid>/cmdline is not served remotely (it can leak secrets \
-                         in process args); per-peer scoping for it lands with P2-1",
+                        "proc/<pid>/cmdline is not served to this peer (it can leak secrets \
+                         in process args); grant `--role deploy` to a peer trusted with it",
                     ));
                 }
                 proc_meta::cat_bytes(ctx, &name, procsub)
@@ -461,9 +462,35 @@ fn meta_write(
             }
             Ok(buf)
         }
+        // `proc/<pid>/ctl "stop|kill|…"` — signal a container process (Plan 9's
+        // `/proc/n/ctl`). This is peer-triggered runtime control of code on THIS
+        // node, the same trust surface as `ctl run`, so it takes the same two
+        // gates: the node's `--allow-remote-run` master switch AND the peer's
+        // `deploy` capability. Signaling touches no refs and `proc_meta::write`
+        // re-verifies the pid is still in the container's PID namespace right
+        // before signaling, so — like `run` — it needs no daemon mutation lock.
+        RouteTarget::Container { name, path: sub }
+            if crate::cmd::proc_meta::proc_subpath(&sub).is_some() =>
+        {
+            if !allow_remote_run {
+                return Err(denied(
+                    "remote process control is disabled on this node; \
+                     start it with `hako serve --allow-remote-run` to permit it",
+                ));
+            }
+            if !role.allows(peers::Role::Deploy) {
+                return Err(denied(
+                    "remote process control needs the `deploy` capability; \
+                     grant it with `hako peer add … --role deploy`",
+                ));
+            }
+            let procsub = crate::cmd::proc_meta::proc_subpath(&sub).unwrap();
+            crate::cmd::proc_meta::write(ctx, &name, procsub, body)?;
+            Ok(Vec::new()) // a signal produces no output, like the local ctl write
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            format!("cannot write {path} remotely yet (only container ctl)"),
+            format!("cannot write {path} remotely yet (container ctl or proc/<pid>/ctl)"),
         )),
     }
 }
@@ -906,6 +933,49 @@ mod tests {
         .is_ok());
     }
 
+    #[test]
+    fn meta_write_gates_remote_proc_control() {
+        use hako::{Config, Session, State};
+
+        let d = tempfile::tempdir().unwrap();
+        let state = State::init(&d.path().join(crate::DOT_HAKO)).unwrap();
+        let session = Session::default();
+        let cfg = Config::default();
+        let ctx = Ctx {
+            state: &state,
+            session: &session,
+            default_container: "hako",
+            workdir: d.path(),
+            cfg: &cfg,
+        };
+        let enc = |path: &str, body: &str| {
+            let mut p = Vec::new();
+            p.extend_from_slice(&(path.len() as u32).to_be_bytes());
+            p.extend_from_slice(path.as_bytes());
+            p.extend_from_slice(body.as_bytes());
+            p
+        };
+        let ctl = "/containers/hako/proc/1/ctl";
+
+        // Signaling is peer-triggered runtime control — refused when the node's
+        // remote-run master switch is off, even for a `deploy` peer, before any
+        // pid lookup.
+        let err = meta_write(&ctx, &enc(ctl, "stop"), false, peers::Role::Deploy).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("disabled"));
+
+        // ...and refused when the switch is ON but the peer lacks `deploy`.
+        let err = meta_write(&ctx, &enc(ctl, "stop"), true, peers::Role::Sync).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("deploy"));
+
+        // Switch ON + `deploy` clears the gate: the request reaches
+        // `proc_meta::write`, which (nothing running here) fails at the pid
+        // lookup — a NotFound, not the gate's PermissionDenied.
+        let err = meta_write(&ctx, &enc(ctl, "stop"), true, peers::Role::Deploy).unwrap_err();
+        assert_ne!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
     // ---------------------------------------------------------------------
     // Two-node integration: real loopback TCP through the full handshake +
     // wire protocol (docs/distributed.md flagged this as the missing coverage
@@ -940,19 +1010,26 @@ mod tests {
     }
 
     #[test]
-    fn meta_read_withholds_proc_cmdline_but_not_other_proc_files() {
+    fn meta_read_scopes_proc_cmdline_to_deploy_peers() {
         use hako::{Config, Session};
         let (dir, state, _id) = setup_node();
         let (sess, cfg) = (Session::default(), Config::default());
         let c = ctx(&state, &sess, &cfg, "hako", dir.path());
-        // cmdline is refused up front (before any pid lookup) — its args can
-        // hold secrets, so it isn't served remotely until P2-1 capabilities.
-        let err = meta_read(&c, "/containers/hako/proc/1/cmdline").unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-        // A different proc file is NOT refused for the same reason — it gets to
-        // the pid lookup (which, with nothing running here, fails as NotFound).
-        // The point is it's not the cmdline PermissionDenied.
-        let other = meta_read(&c, "/containers/hako/proc/1/status").unwrap_err();
+        // cmdline is refused up front (before any pid lookup) for a peer below
+        // `deploy` — its args can hold secrets.
+        for role in [peers::Role::Read, peers::Role::Sync] {
+            let err = meta_read(&c, "/containers/hako/proc/1/cmdline", role).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        }
+        // A `deploy` peer (already trusted to run code here) is NOT refused for
+        // that reason — cmdline gets to the pid lookup (which, with nothing
+        // running here, fails as NotFound, or Unsupported off-Linux).
+        let allowed =
+            meta_read(&c, "/containers/hako/proc/1/cmdline", peers::Role::Deploy).unwrap_err();
+        assert_ne!(allowed.kind(), io::ErrorKind::PermissionDenied);
+        // A different proc file is served to any `read` peer — it too reaches the
+        // pid lookup rather than the cmdline PermissionDenied.
+        let other = meta_read(&c, "/containers/hako/proc/1/status", peers::Role::Read).unwrap_err();
         assert_ne!(other.kind(), io::ErrorKind::PermissionDenied);
     }
 

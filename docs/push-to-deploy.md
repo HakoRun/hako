@@ -279,15 +279,18 @@ Then `hako push prod main` rolls prod back FF-safely, and history records it.
 
 ### P1-3 — Remote stop / proc / logs (the deploy-loop sliver)
 
-> **Partially landed:** the **observe** half — remote `proc/` reads — ships:
-> `meta_read` now serves `proc/` (list pids) and `proc/<pid>/{status,comm}`
+> **Largely landed:** the **observe** half — remote `proc/` reads — ships:
+> `meta_read` serves `proc/` (list pids) and `proc/<pid>/{status,comm}`
 > (`proc_meta::{ls_bytes,cat_bytes}`, reused by both the CLI and the daemon), so
 > `hako cat /peers/<node>/containers/<name>/proc/…` works. Read-only, PID-ns
-> scoped (no host procs, no `mem`), served to any registered peer like `status`.
-> `cmdline` is withheld remotely (secrets-in-args) until P2-1 can scope it.
-> **Remaining (ship with P2-1 capabilities — the secret-leak risk below):** remote
-> `proc/<pid>/ctl` stop/signal (`meta_write` widening), and instance logs as a
-> bounded tail window over the control plane.
+> scoped (no host procs, no `mem`), served to any registered peer with `read`.
+> The **control** half also ships now that P2-1 gates it: `meta_write` accepts
+> `proc/<pid>/ctl` (`hako write …/proc/<pid>/ctl "stop"` signals a remote
+> process), behind the same two gates as `ctl run` — `--allow-remote-run` + the
+> peer's `deploy`. And `cmdline`, previously withheld, is now served to `deploy`
+> peers (withheld from `read`/`sync`). **Remaining:** instance logs as a bounded
+> tail window over the control plane (`hako logs` content lives at host paths,
+> outside the `/containers/<name>/…` namespace — a separate slice).
 
 **Problem.** You can remotely *start* but not *stop* or *observe*. `meta_read`
 serves only `status`; `meta_write` only container `ctl`; the stop path is
@@ -297,9 +300,10 @@ host paths (`instances::log_paths`), addressed by `hako logs <id>` — **not in 
 looks first.
 
 **Change.** Complete the *minimal* remote namespace:
-- Widen `meta_read` to serve `proc/` (reuse `proc_meta::cat`/`ls` after the
+- ✅ Widen `meta_read` to serve `proc/` (reuse `proc_meta::cat`/`ls` after the
   `out: &mut dyn Write` refactor `dispatch_ctl` already took).
-- Widen `meta_write` to `proc/<pid>/ctl` (remote stop/signal).
+- ✅ Widen `meta_write` to `proc/<pid>/ctl` (remote stop/signal), gated by
+  `--allow-remote-run` + `deploy`.
 - Serve instance logs over the control plane as a **bounded tail window** — log
   content exceeds `MAX_FRAME` (1 MiB); never stream a whole log in one frame.
 
@@ -309,7 +313,9 @@ for its own sake, or a FUSE `/peers/` mount (see Traps).
 **Touchpoints.** `serve/server.rs` (`meta_read`/`meta_write` match arms),
 `cmd/proc_meta.rs`, `cmd/runtime.rs` (`logs`).
 
-**Risk.** proc cmdlines can leak secrets; ship this *with* P2-1 capabilities.
+**Risk.** proc cmdlines can leak secrets — shipped *with* P2-1 capabilities: the
+remote signal and the `cmdline` read are both `deploy`-gated, so a `read`/`sync`
+peer sees neither.
 
 ### P2-1 — Per-peer capabilities & ref-mutation gating
 
@@ -328,8 +334,9 @@ for its own sake, or a FUSE `/peers/` mount (see Traps).
 > (a peer that may touch `app` but not `db`) + **deploy targets holding refs
 > passively** (only a `deploy` peer moves the tracked branch; a `sync` peer's
 > ref-move/`ctl commit` writes a box-local branch instead) + **revocation UX**
-> beyond editing the file. Those also unlock relaxing the remote `cmdline`
-> withhold and the remote stop/log verbs (P1-3 remainder).
+> beyond editing the file. (Roles already unlocked the P1-3 remote stop/signal
+> verb and the `deploy`-scoped `cmdline` read — both now `deploy`-gated; only the
+> bounded log-tail window is left there.)
 
 **Problem.** Trust is flat: any registered peer can push objects, move refs (FF),
 **commit/branch/tag on your node ungated** (only `run` is gated, node-wide via

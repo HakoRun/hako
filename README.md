@@ -182,14 +182,15 @@ hako cat /peers/prod/containers/app/status    # read a remote container's status
 hako cat /peers/prod/containers/app/proc      # list the workload's live processes
 hako cat /peers/prod/containers/app/proc/1/status   # …and inspect one
 hako write /peers/prod/containers/app/ctl "commit -m nightly"   # remote control verb
+hako write /peers/prod/containers/app/proc/1/ctl "stop"   # signal a remote process
 ```
 
 Trust is deliberately conservative: each peer holds a **capability** (`read` <
 `sync` < `deploy`, per `--role`), the daemon gates every request by it, `serve`
 binds loopback unless you pass
 `--allow-remote` (intended for a trusted LAN/VPN), remote ref updates are
-fast-forward-only, and peer-triggered command execution requires
-`--allow-remote-run`. Design notes: [docs/distributed.md](docs/distributed.md)
+fast-forward-only, and peer-triggered runtime control — running a command *or*
+signalling a process — requires both `--allow-remote-run` and a `deploy` peer. Design notes: [docs/distributed.md](docs/distributed.md)
 and [docs/push-to-deploy.md](docs/push-to-deploy.md).
 
 **Push-to-deploy.** A node with a `[deploy]` table and `hako serve
