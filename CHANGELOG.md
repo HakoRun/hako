@@ -7,6 +7,15 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches a release.
 ## [Unreleased]
 
 ### Changed
+- **The `hako serve` daemon is now concurrent (`--features cluster`):** one
+  handler thread per connection (bounded by a semaphore, so a peer flood can't
+  exhaust the node), replacing the serial accept loop where one connected — or
+  stalled — peer monopolized the node up to the per-frame timeout. Daemon-side
+  mutations serialize through a process-global mutex layered over the workspace
+  flock (the flock guards other processes + `gc`; the mutex guards the daemon's
+  own threads), while reads (status, fetch) run concurrently — so a slow push no
+  longer blocks a ping. Verified: with a stalled connection held open, a
+  concurrent `peer ping` still returns in ~20 ms.
 - **Detached workloads (`hako run -d`) are now launched by fork + exec**, not a
   bare fork: the spawn creates the instance state, then re-execs the hako binary
   (a hidden `__run-detached <id>`) which reconstructs the run from the instance's
