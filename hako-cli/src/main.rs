@@ -265,7 +265,11 @@ fn run() -> io::Result<ExitCode> {
                 name,
                 address,
                 pubkey,
-            } => cmd::peers::add(&ctx, name, address, pubkey),
+                role,
+            } => {
+                let role = cmd::peers::Role::parse(&role)?;
+                cmd::peers::add(&ctx, name, address, pubkey, role)
+            }
             PeerCmd::List => cmd::peers::list(&ctx),
             PeerCmd::Remove { name } => cmd::peers::remove(&ctx, name),
             PeerCmd::Ping { name } => cmd::serve::ping(&ctx, &name),

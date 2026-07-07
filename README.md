@@ -174,7 +174,7 @@ over a Noise-encrypted, mutually-authenticated channel:
 
 ```sh
 hako serve                        # on the node: run the daemon (loopback by default)
-hako peer add prod 10.0.0.5:7777 <pubkey>
+hako peer add prod 10.0.0.5:7777 <pubkey> --role deploy   # read | sync | deploy
 hako peer ping prod               # reachability + identity check
 hako peer push prod main          # replicate a branch (only missing chunks travel)
 hako peer fetch prod main         # ...and the pull half
@@ -184,7 +184,9 @@ hako cat /peers/prod/containers/app/proc/1/status   # …and inspect one
 hako write /peers/prod/containers/app/ctl "commit -m nightly"   # remote control verb
 ```
 
-Trust is deliberately conservative: `serve` binds loopback unless you pass
+Trust is deliberately conservative: each peer holds a **capability** (`read` <
+`sync` < `deploy`, per `--role`), the daemon gates every request by it, `serve`
+binds loopback unless you pass
 `--allow-remote` (intended for a trusted LAN/VPN), remote ref updates are
 fast-forward-only, and peer-triggered command execution requires
 `--allow-remote-run`. Design notes: [docs/distributed.md](docs/distributed.md)

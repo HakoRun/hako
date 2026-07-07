@@ -47,6 +47,13 @@ pub(crate) enum PeerCmd {
         name: String,
         address: String,
         pubkey: String,
+        /// Capability granted to THIS peer when it connects to us: `read`
+        /// (observe: status/proc/fetch), `sync` (default — also push/replicate +
+        /// the version-control ctl verbs), or `deploy` (also run code: `ctl run`
+        /// and the push-to-deploy hook, which still need the node's
+        /// `--allow-remote-run`/`--allow-deploy` too).
+        #[arg(long, value_parser = ["read", "sync", "deploy"], default_value = "sync")]
+        role: String,
     },
     /// List configured peers
     List,

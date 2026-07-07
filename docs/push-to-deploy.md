@@ -313,6 +313,19 @@ for its own sake, or a FUSE `/peers/` mount (see Traps).
 
 ### P2-1 — Per-peer capabilities & ref-mutation gating
 
+> **Landed (core):** each `peers.toml` peer has a `role` — `read` < `sync` <
+> `deploy` (`hako peer add … --role`). The handshake returns the connecting
+> peer's role and `handle_peer` gates every request by it: `read` = status/proc/
+> fetch, `sync` = + push/ref-moves + VC ctl, `deploy` = + `ctl run` and the
+> push-to-deploy hook (both still ALSO requiring the node's
+> `--allow-remote-run`/`--allow-deploy` master switch). A no-`role` peer defaults
+> to `sync` (prior behaviour), so `run`/deploy now need an explicit `deploy`
+> grant. **Remaining:** per-container/branch scoping (a peer that may deploy
+> `app` but not `db`), deploy targets holding refs passively (a `sync` peer's
+> `ctl commit` writing a box-local branch, never the tracked one), and revocation
+> UX beyond editing the file. Those unlock relaxing the remote `cmdline` withhold
+> and the remote stop/log verbs (P1-3 remainder).
+
 **Problem.** Trust is flat: any registered peer can push objects, move refs (FF),
 **commit/branch/tag on your node ungated** (only `run` is gated, node-wide via
 `--allow-remote-run`), and read any status. A remote `ctl commit` on a deploy
