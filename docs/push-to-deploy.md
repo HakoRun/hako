@@ -182,18 +182,26 @@ notes already flag this). Ref-mutating work must serialize; reads must not.
 
 ### P1-1 — The deploy hook (a remote that runs)
 
-> **Landed (core).** `hako serve --allow-deploy` reconciles on a `[deploy]`-
-> matched ref advance: stop the old instance (graceful, then SIGKILL after
-> `grace_secs`), start the new at the just-pushed tree, supervised
-> (`restart = always`); the run shape (`run`/network/volumes) is receiver-
-> declared, and the deploy log rides back in the push response
-> (`serve/deploy.rs`). Gated on `--allow-deploy` **and** a `[deploy]` table. A
-> `[deploy]`-only `hako.toml` no longer requires an `image`. **Remaining:** the
-> health-gate + auto-rollback (item 4 below), `-p` port publishing (a
-> `network = "host"` deploy serves on host ports meanwhile), and reconcile
-> collapse-to-latest (a single global deploy mutex serializes for now). Note: a
-> deploy target's branch should be **created by the first push** (a fresh prod
-> node has no divergent history), not pre-seeded locally.
+> **Landed.** `hako serve --allow-deploy` reconciles on a `[deploy]`-matched ref
+> advance (a no-op re-push does not redeploy): stop the old instance (graceful,
+> then SIGKILL after `grace_secs`), start the new at the just-pushed tree,
+> supervised (`restart = always`); the run shape (`run`/network/volumes) is
+> receiver-declared, and the deploy log rides back in the push response
+> (`serve/deploy.rs`). **Item 4 (health-gate + auto-rollback) done:** the new
+> workload is watched for `grace_secs`; if it crash-loops, the deploy re-launches
+> the previous commit's tree (`run_container_detached_at`, the still-immutable
+> old root) so the service keeps serving the last-known-good while the ref stays
+> at the new tip. Gated on `--allow-deploy` **and** a `[deploy]` table; a
+> `[deploy]`-only `hako.toml` needs no `image`. **Remaining:** `-p` port
+> publishing (a `network = "host"` deploy serves on host ports meanwhile) and
+> reconcile collapse-to-latest (a single global deploy mutex serializes for now).
+> Notes: a deploy target's branch should be **created by the first push** (a fresh
+> prod node has no divergent history), not pre-seeded locally; and the reconcile
+> (drain + health-gate, up to 2×`grace_secs`) runs on the push's response path, so
+> keep `grace_secs` well under the ~30s wire timeout — a larger value still
+> deploys but the push may report a read timeout (observe via `status`). The
+> health-gate window is floored to a few seconds so a too-small `grace_secs`
+> can't pass a crash-looping deploy as healthy.
 
 **Problem.** Today you can `push` and remotely `run`, but nothing ties a ref
 advance to the running workload.

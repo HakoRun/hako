@@ -119,7 +119,11 @@ pub struct DeployConfig {
     /// on it. `None` launches the container's default shell (rarely what a
     /// service wants; set `run` for a real deploy).
     pub run: Option<RunSpec>,
-    /// Graceful-stop drain + health-gate window, seconds.
+    /// Graceful-stop drain + health-gate window, seconds (default 10). The
+    /// reconcile runs on the push's response path and can take up to *twice* this
+    /// (drain the old + health-gate the new), so keep it well under the ~30s wire
+    /// timeout — a larger value still deploys, but `hako peer push` may report a
+    /// read timeout while the deploy completes server-side (check `status`).
     pub grace_secs: u64,
     /// Networking for the workload (matches `run --network`); `None` = isolated.
     pub network: Option<String>,

@@ -233,8 +233,10 @@ fn handle_peer(
         }
         // `ref_advanced` distinguishes a real branch advance from a no-op re-push
         // (same tip) so the deploy hook doesn't restart a healthy workload for a
-        // duplicate/retry push.
+        // duplicate/retry push; `ref_prev` is the pre-push commit — the deploy's
+        // rollback target if the new tree fails to boot.
         let mut ref_advanced = false;
+        let mut ref_prev: Option<Hash> = None;
         let mut result: io::Result<Vec<u8>> = match tag {
             TAG_META_READ => std::str::from_utf8(payload)
                 .map_err(|_| invalid("request path is not UTF-8"))
@@ -242,9 +244,10 @@ fn handle_peer(
             TAG_META_WRITE => meta_write(ctx, payload, allow_remote_run),
             TAG_SYNC_HAVE => sync_have(ctx, payload),
             TAG_SYNC_PUT => sync_put(ctx, payload),
-            TAG_SYNC_REF => sync_ref(ctx, payload).map(|(advanced, msg)| {
-                ref_advanced = advanced;
-                msg
+            TAG_SYNC_REF => sync_ref(ctx, payload).map(|u| {
+                ref_advanced = u.advanced;
+                ref_prev = u.prev;
+                u.message
             }),
             // Fetch (pull): reads only. The objects served are reachable from a
             // ref, which `gc` preserves, so no session lock is needed.
@@ -265,7 +268,7 @@ fn handle_peer(
                 if let (Ok(bytes), Some(deploy)) = (&mut result, &ctx.cfg.deploy) {
                     if let Ok((container, branch)) = parse_ref_target(payload) {
                         if super::deploy::matches(deploy, container, branch) {
-                            let log = super::deploy::reconcile(ctx, deploy);
+                            let log = super::deploy::reconcile(ctx, deploy, ref_prev);
                             bytes.extend_from_slice(log.as_bytes());
                         }
                     }
@@ -475,11 +478,21 @@ fn parse_ref_target(payload: &[u8]) -> io::Result<(&str, &str)> {
     Ok((container, branch))
 }
 
+/// Outcome of a `sync_ref`: whether the ref moved, the commit it pointed at
+/// BEFORE (the push-to-deploy rollback target), and the human message.
+#[derive(Debug)]
+struct RefUpdate {
+    /// False for a no-op re-push of the current tip — the deploy hook skips it.
+    advanced: bool,
+    /// The pre-update commit, if the branch existed. On a health-gate failure the
+    /// deploy re-launches this commit's tree (the last-known-good).
+    prev: Option<Hash>,
+    message: Vec<u8>,
+}
+
 /// Data plane: point a container's branch at a (now-present) commit, creating
-/// the container if the node doesn't have it yet. Returns `(advanced, message)`
-/// — `advanced` is false for a no-op re-push of the current tip, so the caller
-/// can skip the deploy hook when nothing actually changed.
-fn sync_ref(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<(bool, Vec<u8>)> {
+/// the container if the node doesn't have it yet.
+fn sync_ref(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<RefUpdate> {
     let (container, rest) = take_lenprefixed_str(payload)?;
     let (branch, rest) = take_lenprefixed_str(rest)?;
     let commit =
@@ -541,10 +554,11 @@ fn sync_ref(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<(bool, Vec<u8>)> {
         ));
     }
     repo.write_ref(branch, commit)?;
-    Ok((
+    Ok(RefUpdate {
         advanced,
-        format!("updated {container}:{branch} -> {}", &hex(&commit.0)[..12]).into_bytes(),
-    ))
+        prev: existing,
+        message: format!("updated {container}:{branch} -> {}", &hex(&commit.0)[..12]).into_bytes(),
+    })
 }
 
 #[cfg(test)]
@@ -702,16 +716,17 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(tip(), Some(base), "ref must not move on a rejected update");
 
-        // A genuine fast-forward is accepted, advances the ref, and reports
-        // `advanced = true` (so the deploy hook fires).
-        let (advanced, _) = sync_ref(&ctx, &enc(ff)).unwrap();
-        assert!(advanced, "a real fast-forward must report advanced");
+        // A genuine fast-forward is accepted, advances the ref, reports the
+        // PREVIOUS tip (the rollback target), and `advanced = true`.
+        let u = sync_ref(&ctx, &enc(ff)).unwrap();
+        assert!(u.advanced, "a real fast-forward must report advanced");
+        assert_eq!(u.prev, Some(base), "prev must be the pre-push tip");
         assert_eq!(tip(), Some(ff));
 
         // A no-op re-push of the current tip succeeds but reports `advanced =
         // false`, so a duplicate/retry push does NOT trigger a redeploy.
-        let (advanced, _) = sync_ref(&ctx, &enc(ff)).unwrap();
-        assert!(!advanced, "a no-op re-push must not report advanced");
+        let u = sync_ref(&ctx, &enc(ff)).unwrap();
+        assert!(!u.advanced, "a no-op re-push must not report advanced");
         assert_eq!(tip(), Some(ff));
     }
 
