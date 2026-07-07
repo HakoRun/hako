@@ -9,6 +9,24 @@ use hako::{ChunkStore, Hash, WorkspaceLock};
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
+use std::sync::{Condvar, Mutex, MutexGuard};
+
+/// Ceiling on concurrent connection handlers. A bound is the point of P0-3's
+/// threading: a peer flood must not spawn unbounded threads and OOM the node.
+/// The accept loop applies backpressure at the cap (new connections wait in the
+/// kernel backlog), rather than accepting work it can't bound.
+const MAX_CONNECTIONS: usize = 64;
+
+/// Process-global serialization for daemon-side workspace **mutations**. The
+/// `WorkspaceLock` flock serializes against other *processes* (the local CLI,
+/// `gc`); this mutex serializes the daemon's own connection threads against each
+/// other. Relying on flock's same-process, cross-fd behaviour for that would be
+/// a footgun (#75), so intra-daemon serialization is made explicit: a thread
+/// takes this mutex *then* the flock (always that order — no deadlock), so at
+/// most one thread ever contends the flock. Held for a mutation's whole span (a
+/// push cycle, #71; a single `ctl` verb). Reads never take it — the concurrency
+/// win is that a slow push no longer blocks pings/status/fetch.
+static DAEMON_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 
 /// Reject binding a routable (non-loopback) address unless the operator opts in.
 /// The channel is now encrypted and mutually authenticated (Noise IK), so this is
@@ -62,17 +80,86 @@ pub fn serve(
              execute commands in a container on this node."
         );
     }
-    for conn in listener.incoming() {
-        match conn {
-            Ok(stream) => {
-                if let Err(e) = handle_peer(stream, &id, ctx, allow_remote_run) {
-                    crate::diag!("serve: connection error: {e}");
+    // One handler thread per connection so a slow or stalled peer can't block the
+    // others (previously the serial accept loop let one connected peer monopolize
+    // the node up to IO_TIMEOUT per frame). `thread::scope` lets the handlers
+    // borrow `id`/`ctx` directly — no `'static`/Arc restructuring — and joins any
+    // still-running handlers if the loop ever exits. A semaphore bounds the fan-out.
+    let slots = Semaphore::new(MAX_CONNECTIONS);
+    std::thread::scope(|scope| {
+        for conn in listener.incoming() {
+            match conn {
+                Ok(stream) => {
+                    // Backpressure at the cap: block before accepting more work.
+                    let permit = slots.acquire();
+                    scope.spawn(|| {
+                        // Released when this handler returns (or unwinds).
+                        let _permit = permit;
+                        // Contain a handler panic to its own connection: catch and
+                        // log rather than let it unwind. The scope never joins (the
+                        // accept loop is infinite), so an uncaught panic would just
+                        // be dropped silently — and one malformed request must not
+                        // take down the whole daemon. The permit still releases (its
+                        // drop runs during unwind); the mutation mutex is
+                        // poison-tolerant (see `lock_daemon`).
+                        let outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                handle_peer(stream, &id, ctx, allow_remote_run)
+                            }));
+                        match outcome {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => crate::diag!("serve: connection error: {e}"),
+                            Err(_) => crate::diag!("serve: connection handler panicked"),
+                        }
+                    });
                 }
+                Err(e) => crate::diag!("serve: accept error: {e}"),
             }
-            Err(e) => crate::diag!("serve: accept error: {e}"),
+        }
+    });
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A minimal counting semaphore (std has none) bounding concurrent connection
+/// handlers. `acquire` blocks the accept loop when no permit is free, so excess
+/// connections wait in the kernel backlog instead of spawning threads.
+struct Semaphore {
+    permits: Mutex<usize>,
+    available: Condvar,
+}
+
+impl Semaphore {
+    fn new(n: usize) -> Self {
+        Semaphore {
+            permits: Mutex::new(n),
+            available: Condvar::new(),
         }
     }
-    Ok(ExitCode::SUCCESS)
+
+    fn acquire(&self) -> SemaphorePermit<'_> {
+        let mut permits = self.permits.lock().unwrap_or_else(|e| e.into_inner());
+        while *permits == 0 {
+            permits = self
+                .available
+                .wait(permits)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        *permits -= 1;
+        SemaphorePermit { sem: self }
+    }
+}
+
+/// Releases its permit back to the semaphore on drop (when a handler finishes).
+struct SemaphorePermit<'a> {
+    sem: &'a Semaphore,
+}
+
+impl Drop for SemaphorePermit<'_> {
+    fn drop(&mut self) {
+        let mut permits = self.sem.permits.lock().unwrap_or_else(|e| e.into_inner());
+        *permits += 1;
+        self.sem.available.notify_one();
+    }
 }
 
 fn handle_peer(
@@ -89,15 +176,16 @@ fn handle_peer(
             .map(|ks| ks.contains(x))
             .unwrap_or(false)
     })?;
-    // A push (SYNC_HAVE -> PUT... -> REF) holds the workspace lock across the whole
-    // unit, so a concurrent `gc` can't sweep objects between the HAVE that vouches
-    // they are present and the REF that makes them reachable — the HAVE reply is a
+    // A push (SYNC_HAVE -> PUT... -> REF) holds the daemon mutation lock (in-process
+    // mutex + workspace flock, see `lock_daemon`) across the whole unit, so a
+    // concurrent `gc` can't sweep objects between the HAVE that vouches they are
+    // present and the REF that makes them reachable — the HAVE reply is a
     // reachability claim gc would otherwise be free to invalidate (#71). Acquired on
     // the first request of a push and released at the terminal REF, so a peer that
     // keeps the connection open between pushes doesn't hold the lock idle and starve
-    // local commands. Read-only reads never lock; ctl meta-writes lock themselves,
+    // other work. Read-only reads never lock; ctl meta-writes lock themselves,
     // scoped per-verb (see `meta_write`), so a long remote `run` doesn't hold it.
-    let mut session_lock: Option<WorkspaceLock> = None;
+    let mut session_lock: Option<DaemonLock> = None;
     loop {
         let req = match ch.recv() {
             Ok(f) => f,
@@ -107,8 +195,22 @@ fn handle_peer(
         let Some((&tag, payload)) = req.split_first() else {
             return Ok(());
         };
+        // While a push session holds the mutation lock, only that push's own
+        // frames (HAVE/PUT/REF) are legal. Any other frame is a protocol
+        // violation — and a `META_WRITE` ctl verb here would re-enter
+        // `lock_daemon` on THIS thread and self-deadlock the non-reentrant global
+        // mutation mutex, wedging every connection's mutations. Refuse the
+        // interleave and close (dropping `session_lock` releases the locks). A
+        // well-behaved client never interleaves; the push and ctl planes are
+        // separate connections.
+        if session_lock.is_some() && !matches!(tag, TAG_SYNC_HAVE | TAG_SYNC_PUT | TAG_SYNC_REF) {
+            let mut r = vec![RESP_ERR];
+            r.extend_from_slice(b"illegal request interleaved with an in-progress push");
+            let _ = ch.send(&r);
+            return Ok(());
+        }
         if session_lock.is_none() && matches!(tag, TAG_SYNC_HAVE | TAG_SYNC_PUT | TAG_SYNC_REF) {
-            session_lock = Some(lock_workspace(ctx)?);
+            session_lock = Some(lock_daemon(ctx)?);
         }
         let result: io::Result<Vec<u8>> = match tag {
             TAG_META_READ => std::str::from_utf8(payload)
@@ -173,18 +275,33 @@ fn meta_read(ctx: &Ctx<'_>, path: &str) -> io::Result<Vec<u8>> {
     }
 }
 
-/// Acquire the workspace lock, so a daemon-side mutation serializes against
-/// concurrent *local* commands (which hold the same lock) and a concurrent `gc`.
+/// A held daemon mutation lock: the in-process [`DAEMON_MUTATION_LOCK`] AND the
+/// workspace flock, together. Dropping it releases the flock first, then the
+/// mutex (reverse of acquire order).
+struct DaemonLock {
+    _flock: WorkspaceLock,
+    _mutex: MutexGuard<'static, ()>,
+}
+
+/// Acquire the daemon mutation lock: the process-global mutex FIRST (serializes
+/// the daemon's own connection threads), then the workspace flock (serializes
+/// against local commands + `gc`). Always this order so the two locks can't
+/// deadlock; the mutex ensures at most one thread contends the flock.
 ///
-/// Two callers hold the returned guard: `handle_peer` for a whole push cycle
-/// (SYNC_HAVE..REF), so the object closure a push depends on can't be swept
-/// between the HAVE and the REF (#71); and `meta_write` for a single ref-mutating
-/// ctl verb (commit/branch/tag), but NOT across `run` (#78). A connection is a
-/// push XOR a ctl, so these never nest — and `WorkspaceLock` is a fresh flock per
-/// acquire that would hang against itself, so do not add a nested acquire on any
-/// path reachable while one is already held.
-fn lock_workspace(ctx: &Ctx<'_>) -> io::Result<WorkspaceLock> {
-    WorkspaceLock::acquire(&ctx.workdir.join(crate::DOT_HAKO))
+/// Two callers hold it: `handle_peer` for a whole push cycle (SYNC_HAVE..REF), so
+/// the object closure a push depends on can't be swept between the HAVE and the
+/// REF (#71); and `meta_write` for a single ref-mutating ctl verb
+/// (commit/branch/tag), but NOT across `run` (#78). A connection is a push XOR a
+/// ctl, so these never nest — do not add a nested acquire on any path reachable
+/// while one is already held (it would self-deadlock on the mutex).
+fn lock_daemon(ctx: &Ctx<'_>) -> io::Result<DaemonLock> {
+    // Poison-tolerant: a handler that panicked mid-mutation must not wedge the
+    // whole daemon (the flock + on-disk state stay consistent either way).
+    let _mutex = DAEMON_MUTATION_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _flock = WorkspaceLock::acquire(&ctx.workdir.join(crate::DOT_HAKO))?;
+    Ok(DaemonLock { _flock, _mutex })
 }
 
 /// Serve a meta-fs write. Payload is `[path_len: u32 BE][path][body]`. For now:
@@ -219,15 +336,16 @@ fn meta_write(ctx: &Ctx<'_>, payload: &[u8], allow_remote_run: bool) -> io::Resu
                 ));
             }
             // Serialize ref-mutating verbs (commit/branch/tag) against local
-            // commands with the workspace lock, but do NOT hold it across `run`:
-            // that spawns a possibly-long container, and holding the lock for its
-            // lifetime would block every local mutator (#78). `run` doesn't touch
+            // commands and other daemon threads with the daemon mutation lock, but
+            // do NOT hold it across `run`: that spawns a possibly-long container,
+            // and holding the lock for its lifetime would block every mutator
+            // (#78). `run` doesn't touch
             // refs, and `gc` already refuses while an instance is live.
             let mut buf = Vec::new();
             if verb == "run" {
                 crate::cmd::files::dispatch_ctl(ctx, &name, body, &mut buf)?;
             } else {
-                let _lock = lock_workspace(ctx)?;
+                let _lock = lock_daemon(ctx)?;
                 crate::cmd::files::dispatch_ctl(ctx, &name, body, &mut buf)?;
             }
             Ok(buf)
@@ -316,9 +434,10 @@ fn sync_ref(ctx: &Ctx<'_>, payload: &[u8]) -> io::Result<Vec<u8>> {
     let (branch, rest) = take_lenprefixed_str(rest)?;
     let commit =
         Hash(<[u8; HASH_LEN]>::try_from(rest).map_err(|_| invalid("malformed ref request"))?);
-    // The workspace lock is held by the caller (`handle_peer`) for the whole
-    // push session, so the create-container + ref update here is serialized
-    // against local commands and a concurrent `gc` without re-locking (#71).
+    // The daemon mutation lock (mutex + flock) is held by the caller
+    // (`handle_peer`) for the whole push session, so the create-container + ref
+    // update here is serialized against local commands, other daemon threads, and
+    // a concurrent `gc` without re-locking (#71).
     if !ctx.state.list_containers()?.iter().any(|c| c == container) {
         ctx.state.create_container(container)?;
     }
@@ -391,6 +510,51 @@ mod tests {
         assert!(check_bind_safety("192.168.1.5:7777", false).is_err());
         // ...and allowed (reported as remote-exposing) with it
         assert!(check_bind_safety("0.0.0.0:7777", true).unwrap());
+    }
+
+    #[test]
+    fn semaphore_bounds_concurrency_and_releases() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        // Two permits: the third acquire must block until one is released.
+        let sem = Semaphore::new(2);
+        let p1 = sem.acquire();
+        let _p2 = sem.acquire();
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _p3 = sem.acquire(); // blocks at the cap
+                tx.send(()).unwrap();
+            });
+            // At the cap, the third acquire has not completed.
+            assert!(
+                rx.recv_timeout(Duration::from_millis(150)).is_err(),
+                "third acquire should block while the semaphore is at its cap"
+            );
+            // Freeing a permit lets it through.
+            drop(p1);
+            assert!(
+                rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+                "third acquire should proceed once a permit is released"
+            );
+        });
+    }
+
+    #[test]
+    fn daemon_lock_acquires_and_releases() {
+        use hako::{Config, Session};
+        // The mutation lock must acquire, release on drop, and be re-acquirable
+        // (no self-deadlock, no leaked flock). The two-node tests exercise it
+        // under real push/ctl traffic; this pins the release contract directly.
+        let (dir, state, _id) = setup_node();
+        let (sess, cfg) = (Session::default(), Config::default());
+        let c = ctx(&state, &sess, &cfg, "hako", dir.path());
+        {
+            let _l = lock_daemon(&c).expect("first acquire");
+        }
+        {
+            let _l = lock_daemon(&c).expect("re-acquire after release");
+        }
     }
 
     #[test]
@@ -789,6 +953,65 @@ mod tests {
                 msg.contains("disabled") || msg.contains("allow-remote-run"),
                 "unexpected refusal message: {msg}"
             );
+            server.join().unwrap().expect("server handled the peer");
+        });
+    }
+
+    #[test]
+    fn interleaving_a_ctl_write_into_a_push_is_refused_not_deadlocked() {
+        use hako::{Config, Session};
+
+        // A peer that opens a push (taking the daemon mutation lock) and then
+        // interleaves a `ctl` write on the SAME connection must be refused — the
+        // ctl path re-enters `lock_daemon`, and before this guard that
+        // self-deadlocked the non-reentrant global mutex, wedging every
+        // connection's mutations daemon-wide. The response must come back (a fast
+        // error), not hang until the connection times out.
+        let (a_dir, a_state, a_id) = setup_node(); // server
+        let (b_dir, b_state, b_id) = setup_node(); // client
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let (a_sess, a_cfg) = (Session::default(), Config::default());
+        let a_ctx = ctx(&a_state, &a_sess, &a_cfg, "hako", a_dir.path());
+        let (b_sess, b_cfg) = (Session::default(), Config::default());
+        let b_ctx = ctx(&b_state, &b_sess, &b_cfg, "hako", b_dir.path());
+
+        peers::add(&a_ctx, "client".into(), "unused".into(), b_id.node_id()).unwrap();
+        peers::add(&b_ctx, "server".into(), addr, a_id.node_id()).unwrap();
+
+        std::thread::scope(|s| {
+            let server = s.spawn(|| {
+                let (stream, _) = listener.accept().unwrap();
+                handle_peer(stream, &a_id, &a_ctx, false)
+            });
+            let peer = peers::lookup(&b_ctx, "server")
+                .unwrap()
+                .expect("registered");
+            let mut ch = connect_and_handshake(&b_ctx, &peer).unwrap();
+
+            // Open a push session: an empty HAVE takes the mutation lock (the lock
+            // is acquired before dispatch, regardless of the HAVE's own result).
+            ch.send(&[TAG_SYNC_HAVE]).unwrap();
+            let _ = ch.recv().unwrap(); // drain the HAVE reply
+
+            // Now illegally interleave a ctl commit on the same connection.
+            let path = b"/containers/hako/ctl";
+            let mut w = vec![TAG_META_WRITE];
+            w.extend_from_slice(&(path.len() as u32).to_be_bytes());
+            w.extend_from_slice(path);
+            w.extend_from_slice(b"commit x");
+            ch.send(&w).unwrap();
+
+            // The server refuses and closes — a returned error frame, not a hang.
+            let resp = ch.recv().unwrap();
+            assert_eq!(
+                resp.first().copied(),
+                Some(RESP_ERR),
+                "interleaving a ctl write into a push must be refused"
+            );
+            drop(ch);
             server.join().unwrap().expect("server handled the peer");
         });
     }
